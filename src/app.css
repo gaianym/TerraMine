@@ -1,0 +1,167 @@
+@import "tailwindcss";
+@import "ag-grid-community/styles/ag-grid.css";
+@import "ag-grid-community/styles/ag-theme-quartz.css";
+
+:root {
+  --tm-bg: #09090b; /* zinc-950 */
+  --tm-surface: #18181b; /* zinc-900 */
+  --tm-surface-2: #27272a; /* zinc-800 */
+  --tm-border: #27272a; /* zinc-800 */
+  --tm-text: #f4f4f5; /* zinc-100 */
+  --tm-text-muted: #a1a1aa; /* zinc-400 */
+  --tm-accent: #34d399; /* emerald-400 */
+}
+
+html,
+body {
+  @apply h-full antialiased;
+  background-color: var(--tm-bg);
+  color: var(--tm-text);
+}
+
+/* Keep AG Grid aligned with the app's dark zinc + emerald palette. */
+.ag-theme-quartz-dark {
+  --ag-background-color: var(--tm-bg);
+  --ag-data-background-color: var(--tm-bg);
+  --ag-foreground-color: var(--tm-text);
+  --ag-data-color: var(--tm-text);
+  --ag-header-background-color: var(--tm-surface);
+  --ag-header-foreground-color: var(--tm-text-muted);
+  --ag-row-border-color: rgba(39, 39, 42, 0.7);
+  --ag-column-border-color: rgba(39, 39, 42, 0.45);
+  --ag-odd-row-background-color: #111114;
+  --ag-row-hover-color: #1d1d22;
+  --ag-border-color: rgba(39, 39, 42, 0.8);
+  --ag-secondary-border-color: rgba(39, 39, 42, 0.55);
+  --ag-header-column-separator-color: rgba(39, 39, 42, 0.6);
+  --ag-input-border-color: var(--tm-border);
+  --ag-input-background-color: var(--tm-bg);
+  --ag-input-focus-border-color: var(--tm-accent);
+  --ag-selected-row-background-color: rgba(52, 211, 153, 0.16);
+  --ag-range-selection-border-color: rgba(52, 211, 153, 0.75);
+  --ag-checkbox-checked-color: var(--tm-accent);
+  --ag-font-size: 12px;
+  --ag-font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --ag-scrollbar-size: 8px;
+}
+
+.ag-theme-quartz-dark,
+.ag-theme-quartz-dark .ag-root-wrapper,
+.ag-theme-quartz-dark .ag-root,
+.ag-theme-quartz-dark .ag-root-wrapper-body,
+.ag-theme-quartz-dark .ag-header,
+.ag-theme-quartz-dark .ag-header-viewport,
+.ag-theme-quartz-dark .ag-center-cols-viewport,
+.ag-theme-quartz-dark .ag-body-viewport,
+.ag-theme-quartz-dark .ag-center-cols-container,
+.ag-theme-quartz-dark .ag-pinned-left-cols-container,
+.ag-theme-quartz-dark .ag-pinned-right-cols-container {
+  background-color: var(--tm-bg);
+}
+
+/* Keep AG Grid's internal normal-layout body from collapsing in flex containers. */
+.ag-theme-quartz-dark .ag-root,
+.ag-theme-quartz-dark .ag-root-wrapper,
+.ag-theme-quartz-dark .ag-root-wrapper-body {
+  height: 100%;
+  min-height: 0;
+}
+
+.ag-theme-quartz-dark .ag-root-wrapper-body {
+  flex: 1 1 auto;
+}
+
+.ag-theme-quartz-dark .ag-body-viewport,
+.ag-theme-quartz-dark .ag-center-cols-viewport,
+.ag-theme-quartz-dark .ag-center-cols-container {
+  min-height: 100%;
+}
+
+.ag-theme-quartz-dark .ag-overlay,
+.ag-theme-quartz-dark .ag-overlay-panel,
+.ag-theme-quartz-dark .ag-overlay-wrapper {
+  height: 100%;
+}
+
+.ag-theme-quartz-dark .ag-header-cell-label {
+  color: var(--tm-text-muted);
+}
+
+.ag-theme-quartz-dark .ag-row {
+  background-color: var(--tm-bg);
+}
+
+.ag-theme-quartz-dark .ag-row-odd {
+  background-color: #101014;
+}
+
+.ag-theme-quartz-dark .ag-row-hover,
+.ag-theme-quartz-dark .ag-row-hover.ag-row-odd {
+  background-color: #1b1b21;
+}
+
+.ag-theme-quartz-dark .ag-cell {
+  color: var(--tm-text-muted);
+  background-color: transparent;
+  border: 0 !important;
+}
+
+.ag-theme-quartz-dark .ag-row,
+.ag-theme-quartz-dark .ag-cell {
+  border-color: transparent !important;
+}
+
+.ag-theme-quartz-dark .ag-row {
+  border: 0 !important;
+}
+
+.ag-theme-quartz-dark .ag-cell-focus,
+.ag-theme-quartz-dark .ag-cell-range-selected,
+.ag-theme-quartz-dark .ag-cell-inline-editing {
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.ag-theme-quartz-dark .ag-overlay-no-rows-center {
+  background: transparent;
+  color: var(--tm-text-muted);
+  border: 0;
+}
+
+/* Keep horizontal scrollbar muted without overriding AG Grid layout sizing. */
+.ag-theme-quartz-dark .ag-body-horizontal-scroll,
+.ag-theme-quartz-dark .ag-body-horizontal-scroll-container,
+.ag-theme-quartz-dark .ag-horizontal-left-spacer,
+.ag-theme-quartz-dark .ag-horizontal-right-spacer,
+.ag-theme-quartz-dark .ag-horizontal-right-spacer-border {
+  background-color: #232329 !important;
+}
+
+.ag-theme-quartz-dark .ag-body-horizontal-scroll {
+  display: flex;
+  align-items: center;
+}
+
+.ag-theme-quartz-dark .ag-body-horizontal-scroll-viewport {
+  margin-block: auto;
+}
+
+.ag-theme-quartz-dark .ag-body-horizontal-scroll.ag-apple-scrollbar {
+  color-scheme: dark;
+  scrollbar-width: thin;
+  scrollbar-color: #2b2d34 #232329 !important;
+}
+
+.ag-theme-quartz-dark .ag-body-horizontal-scroll.ag-apple-scrollbar::-webkit-scrollbar-track,
+.ag-theme-quartz-dark .ag-body-horizontal-scroll.ag-apple-scrollbar::-webkit-scrollbar-corner {
+  background-color: #232329;
+}
+
+.ag-theme-quartz-dark .ag-body-horizontal-scroll.ag-apple-scrollbar::-webkit-scrollbar-thumb {
+  background-color: #2b2d34;
+  border-radius: 9999px;
+}
+
+.ag-theme-quartz-dark .ag-body-horizontal-scroll.ag-apple-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: #343843;
+}
