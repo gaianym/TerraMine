@@ -1,0 +1,32 @@
+[package]
+name = "terra-mine"
+version = "0.1.0"
+description = "Terra-Mine — LAN ASIC discovery desktop app"
+authors = ["Terra-Mine contributors"]
+license = "GPL-3.0"
+edition = "2021"
+repository = "https://github.com/moonbootspleb/terra-mine"
+
+[lib]
+name = "terra_mine_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+asic-rs = "0.4.2"
+asic-rs-core = "0.4.2"
+anyhow = "1"
+futures = "0.3"
+ipnet = "2"
+rand = "0.9"
+log = "0.4"
+env_logger = "0.11"
+uuid = { version = "1", features = ["v4"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "rt-multi-thread"] }
+tokio-util = { version = "0.7", features = [] }

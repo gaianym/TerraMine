@@ -1,0 +1,6 @@
+Terra Mine — third-party components
+
+- asic-rs / asic-rs-core: Apache-2.0 (https://crates.io/crates/asic-rs)
+- Tauri and webview stack: MIT or Apache-2.0 per upstream
+
+The combined application is licensed under GPL-3.0-only (see LICENSE).
