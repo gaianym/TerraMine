@@ -10,8 +10,9 @@
   } from "ag-grid-community";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { onDestroy, onMount } from "svelte";
-  import { Settings } from "lucide-svelte";
+  import { fade, fly } from "svelte/transition";
+  import { onDestroy, onMount, untrack } from "svelte";
+  import { Settings, X } from "lucide-svelte";
   import {
     defaultDiscoverySettings,
     type DiscoveryProgress,
@@ -20,9 +21,11 @@
   } from "$lib/discoveryDefaults";
   import {
     clearKnownDevices,
+    DEFAULT_PROFILE_ID,
     loadDiscoverySettings,
     loadKnownDevices,
     loadTargetProfiles,
+    normalizeTargetProfiles,
     saveKnownDevices,
     saveTargetProfiles,
     type KnownDevice,
@@ -48,8 +51,20 @@
   let progress = $state<DiscoveryProgress>({ ...emptyProgress });
   let rows = $state<Map<string, DiscoveryRowEvent>>(new Map());
   let targetProfiles = $state<TargetProfile[]>([]);
-  let selectedProfileId = $state("");
+  let selectedProfileId = $state(DEFAULT_PROFILE_ID);
+  let profileDrawerOpen = $state(false);
+  /** `null` = new profile in drawer; otherwise id of profile being edited */
+  let profileDrawerEditingId = $state<string | null>(null);
+  let drawerProfileName = $state("");
+  let drawerProfileTargets = $state("");
+  let profileDrawerError = $state<string | null>(null);
+  /** Tauri/WebKit often breaks `confirm()`; confirm deletes in-drawer instead. */
+  let profileDeleteConfirmPending = $state(false);
+  /** Header "Clear devices" avoids `window.confirm`. */
+  let clearDevicesConfirmPending = $state(false);
   let knownDevices = $state<KnownDevice[]>([]);
+  /** Blocks LocalStorage saves until persisted lists are hydrated (avoids wiping with initial []). */
+  let discoveryListsPersistAllowed = $state(false);
 
   let unlistenFns: UnlistenFn[] = [];
   let coalesceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -59,6 +74,8 @@
   let gridApi: GridApi<GridRow> | null = null;
   let autoDiscoverTimer: ReturnType<typeof setInterval> | null = null;
   let autoEnrichTimer: ReturnType<typeof setInterval> | null = null;
+  /** Bumped when the active target profile/spec changes so auto-discover/enrich timers reset their interval clocks. */
+  let autoLoopRestartEpoch = $state(0);
   let movementByCell = $state<Map<string, { direction: "up" | "down"; deltaText: string }>>(new Map());
 
   type GridRow = {
@@ -383,35 +400,205 @@
     }
   }
 
-  function applyTargetProfile(profileId: string) {
-    selectedProfileId = profileId;
-    const profile = targetProfiles.find((p) => p.id === profileId);
+  function bumpAutoLoopsForProfileScopeChange() {
+    autoLoopRestartEpoch += 1;
+  }
+
+  /** Stop any in-flight discover/enrich run and detach listeners after backend cancel (profile switch). */
+  async function interruptAllDiscoveryRunsForUi() {
+    try {
+      await invoke<number>("stop_all_discovery_runs");
+    } catch {
+      // ignore
+    }
+    for (const u of unlistenFns) void u();
+    unlistenFns = [];
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    coalesceTimer = null;
+    pendingRows.clear();
+    busy = false;
+    runId = null;
+    activeRunKind = null;
+    flushRows();
+  }
+
+  async function pruneStateToCurrentTargetsSpec() {
+    const spec = targets.trim();
+    if (!spec) return;
+
+    const candidates = new Set<string>();
+    for (const d of knownDevices) {
+      const ip = d.ip.trim();
+      if (ip) candidates.add(ip);
+    }
+    for (const ev of rows.values()) {
+      const ip = typeof ev.row?.ip === "string" ? ev.row.ip.trim() : "";
+      if (ip) candidates.add(ip);
+    }
+    const list = [...candidates];
+    if (list.length === 0) return;
+
+    try {
+      const kept = await invoke<string[]>("filter_ips_matching_targets", {
+        ips: list,
+        targets: spec,
+      });
+      const keptSet = new Set(kept.map((s) => s.trim()));
+
+      knownDevices = knownDevices.filter((d) => keptSet.has(d.ip.trim()));
+
+      const nextRows = new Map(rows);
+      for (const [k, ev] of rows) {
+        const ip = typeof ev.row?.ip === "string" ? ev.row.ip.trim() : "";
+        if (ip && !keptSet.has(ip)) nextRows.delete(k);
+      }
+      rows = nextRows;
+
+      for (const k of [...pendingRows.keys()]) {
+        if (!keptSet.has(k)) pendingRows.delete(k);
+      }
+
+      const nextMiss = new Map(missStreakByRow);
+      for (const rk of [...nextMiss.keys()]) {
+        if (!keptSet.has(rk)) nextMiss.delete(rk);
+      }
+      missStreakByRow = nextMiss;
+
+      const nextMovement = new Map(movementByCell);
+      for (const key of [...nextMovement.keys()]) {
+        const idx = key.lastIndexOf(":");
+        const rowId = idx > 0 ? key.slice(0, idx) : "";
+        if (rowId && !keptSet.has(rowId)) nextMovement.delete(key);
+      }
+      movementByCell = nextMovement;
+    } catch (e) {
+      console.warn("prune targets: filter_ips_matching_targets failed", e);
+    }
+  }
+
+  /** After profile/target scope changes: cancel runs, prune, reset auto-interval clocks, optionally start discover immediately. */
+  async function handleProfileTargetsScopeChanged() {
+    await interruptAllDiscoveryRunsForUi();
+    bumpAutoLoopsForProfileScopeChange();
+    await pruneStateToCurrentTargetsSpec();
+    if (settings.autoDiscoverEnabled && targets.trim()) {
+      queueMicrotask(() => void startRun());
+    }
+  }
+
+  async function applyTargetProfile(profileId: string) {
+    const id = profileId || DEFAULT_PROFILE_ID;
+    selectedProfileId = id;
+    const profile = targetProfiles.find((p) => p.id === id);
     if (profile) {
       targets = profile.targets;
     }
+    await handleProfileTargetsScopeChanged();
   }
 
-  function saveTargetProfile() {
-    const value = targets.trim();
-    if (!value) return;
-    const existing = targetProfiles.find((p) => p.id === selectedProfileId);
-    if (existing) {
-      existing.targets = value;
-      targetProfiles = [...targetProfiles];
+  function closeProfileDrawer() {
+    profileDrawerOpen = false;
+    profileDrawerError = null;
+    profileDrawerEditingId = null;
+    profileDeleteConfirmPending = false;
+  }
+
+  function openProfileDrawerNew() {
+    profileDrawerEditingId = null;
+    drawerProfileName = "";
+    drawerProfileTargets = targets.trim();
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileDrawerOpen = true;
+  }
+
+  function openProfileDrawerEdit() {
+    const p = targetProfiles.find((x) => x.id === selectedProfileId);
+    if (!p) return;
+    profileDrawerEditingId = p.id;
+    drawerProfileName = p.name;
+    drawerProfileTargets = p.targets;
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileDrawerOpen = true;
+  }
+
+  function startProfileDeleteConfirmation() {
+    const id = profileDrawerEditingId;
+    if (!id || id === DEFAULT_PROFILE_ID) return;
+    profileDrawerError = null;
+    profileDeleteConfirmPending = true;
+  }
+
+  function cancelProfileDeleteConfirmation() {
+    profileDeleteConfirmPending = false;
+  }
+
+  function normalizeProfileNameKey(name: string) {
+    return name.trim().toLowerCase();
+  }
+
+  function profileNameTakenByOther(
+    ignoringId: string | null,
+    name: string,
+  ): string | null {
+    const nk = normalizeProfileNameKey(name);
+    for (const p of targetProfiles) {
+      if (ignoringId && p.id === ignoringId) continue;
+      if (normalizeProfileNameKey(p.name) === nk) return "Another profile already uses this name.";
+    }
+    return null;
+  }
+
+  async function saveProfileFromDrawer() {
+    profileDrawerError = null;
+    const name = drawerProfileName.trim();
+    const t = drawerProfileTargets.trim();
+    if (!name) {
+      profileDrawerError = "Enter a profile name.";
       return;
     }
-
-    const name = window.prompt("Profile name", `Targets ${targetProfiles.length + 1}`)?.trim();
-    if (!name) return;
-    const id = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`;
-    targetProfiles = [...targetProfiles, { id, name, targets: value }];
-    selectedProfileId = id;
+    if (!t) {
+      profileDrawerError = "Enter at least one target (CIDR, IP, or range).";
+      return;
+    }
+    const dup = profileNameTakenByOther(profileDrawerEditingId, name);
+    if (dup) {
+      profileDrawerError = dup;
+      return;
+    }
+    const editingId = profileDrawerEditingId;
+    if (editingId) {
+      targetProfiles = normalizeTargetProfiles(
+        targetProfiles.map((p) =>
+          p.id === editingId ? { ...p, name, targets: t } : p,
+        ),
+      );
+      if (selectedProfileId === editingId) {
+        targets = t;
+      }
+    } else {
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`;
+      targetProfiles = normalizeTargetProfiles([...targetProfiles, { id, name, targets: t }]);
+      selectedProfileId = id;
+      targets = t;
+    }
+    await handleProfileTargetsScopeChanged();
+    closeProfileDrawer();
   }
 
-  function deleteTargetProfile() {
-    if (!selectedProfileId) return;
-    targetProfiles = targetProfiles.filter((p) => p.id !== selectedProfileId);
-    selectedProfileId = "";
+  function confirmDeleteProfileFromDrawer() {
+    const id = profileDrawerEditingId;
+    if (!id || id === DEFAULT_PROFILE_ID) return;
+    targetProfiles = normalizeTargetProfiles(targetProfiles.filter((p) => p.id !== id));
+    if (selectedProfileId === id) {
+      selectedProfileId = DEFAULT_PROFILE_ID;
+      const def = targetProfiles.find((p) => p.id === DEFAULT_PROFILE_ID);
+      if (def) targets = def.targets;
+    }
+    profileDeleteConfirmPending = false;
+    closeProfileDrawer();
   }
 
   function normalizeKnownDevices(devices: KnownDevice[]) {
@@ -429,12 +616,24 @@
     return [...byIp.values()].sort((a, b) => a.ip.localeCompare(b.ip));
   }
 
-  function clearKnownDevicesAction() {
-    if (typeof window !== "undefined" && !window.confirm("Clear all persisted known devices?")) {
-      return;
-    }
+  function executeClearKnownDevices() {
     knownDevices = [];
     clearKnownDevices();
+    pendingRows.clear();
+    rows = new Map();
+    missStreakByRow = new Map();
+    movementByCell = new Map();
+    progress = { ...emptyProgress };
+    clearDevicesConfirmPending = false;
+  }
+
+  function cancelClearKnownDevicesConfirm() {
+    clearDevicesConfirmPending = false;
+  }
+
+  function startClearKnownDevicesConfirm() {
+    if (knownDevices.length === 0) return;
+    clearDevicesConfirmPending = true;
   }
 
   function flushRows() {
@@ -764,9 +963,15 @@
 
   onMount(() => {
     settings = loadDiscoverySettings();
-    targetProfiles = loadTargetProfiles();
+    targetProfiles = normalizeTargetProfiles(loadTargetProfiles());
+    const def = targetProfiles.find((p) => p.id === DEFAULT_PROFILE_ID);
+    if (def) {
+      targets = def.targets;
+      selectedProfileId = DEFAULT_PROFILE_ID;
+    }
     knownDevices = loadKnownDevices();
     rememberedColumnKeys = loadGridColumnKeys();
+    discoveryListsPersistAllowed = true;
     if (!gridHost) return;
     const gridOptions: GridOptions<GridRow> = {
       rowModelType: "clientSide",
@@ -788,11 +993,34 @@
   });
 
   $effect(() => {
+    if (!discoveryListsPersistAllowed) return;
     saveTargetProfiles(targetProfiles);
   });
 
+  /** Keep the selected profile's stored targets in sync with the main textarea (avoids losing edits on Default). */
   $effect(() => {
+    if (!discoveryListsPersistAllowed) return;
+    const id = selectedProfileId;
+    const t = targets;
+    untrack(() => {
+      const cur = targetProfiles.find((p) => p.id === id);
+      if (!cur || cur.targets === t) return;
+      targetProfiles = targetProfiles.map((p) => (p.id === id ? { ...p, targets: t } : p));
+    });
+  });
+
+  $effect(() => {
+    if (!discoveryListsPersistAllowed) return;
     saveKnownDevices(knownDevices);
+  });
+
+  $effect(() => {
+    if (!profileDrawerOpen || typeof window === "undefined") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeProfileDrawer();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   });
 
   $effect(() => {
@@ -842,6 +1070,7 @@
   });
 
   $effect(() => {
+    autoLoopRestartEpoch;
     if (autoDiscoverTimer) {
       clearInterval(autoDiscoverTimer);
       autoDiscoverTimer = null;
@@ -861,6 +1090,7 @@
   });
 
   $effect(() => {
+    autoLoopRestartEpoch;
     if (autoEnrichTimer) {
       clearInterval(autoEnrichTimer);
       autoEnrichTimer = null;
@@ -917,41 +1147,58 @@
           placeholder="192.168.1.0/24 or 10.0.0.1, 10.0.0.5-10"
         ></textarea>
       </div>
-      <div class="flex flex-wrap gap-2">
+      <div class="flex flex-wrap items-end gap-2">
         <select
-          class="h-10 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-300"
+          class="h-10 min-w-[10rem] rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-300"
           value={selectedProfileId}
-          onchange={(e) => applyTargetProfile((e.currentTarget as HTMLSelectElement).value)}
+          onchange={(e) => void applyTargetProfile((e.currentTarget as HTMLSelectElement).value)}
         >
-          <option value="">Custom targets</option>
           {#each targetProfiles as profile}
             <option value={profile.id}>{profile.name}</option>
           {/each}
         </select>
         <button
           type="button"
+          class="h-10 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+          onclick={openProfileDrawerNew}
+        >
+          + Profile
+        </button>
+        <button
+          type="button"
           class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
-          onclick={saveTargetProfile}
+          onclick={openProfileDrawerEdit}
+          title="Edit the selected profile"
         >
-          {selectedProfileId ? "Update profile" : "Save profile"}
+          Edit
         </button>
-        <button
-          type="button"
-          class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-40"
-          disabled={!selectedProfileId}
-          onclick={deleteTargetProfile}
-        >
-          Delete
-        </button>
-        <button
-          type="button"
-          class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-40"
-          disabled={knownDevices.length === 0}
-          onclick={clearKnownDevicesAction}
-          title="Clear persisted known devices"
-        >
-          Clear devices ({knownDevices.length})
-        </button>
+        {#if clearDevicesConfirmPending}
+          <span class="self-center text-xs text-amber-300/95">Clear saved devices &amp; table?</span>
+          <button
+            type="button"
+            class="h-10 shrink-0 rounded-lg border border-zinc-600 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+            onclick={cancelClearKnownDevicesConfirm}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="h-10 shrink-0 rounded-lg border border-red-800 bg-red-900/55 px-2 py-1 text-xs text-red-100 hover:bg-red-900/80"
+            onclick={executeClearKnownDevices}
+          >
+            Confirm clear
+          </button>
+        {:else}
+          <button
+            type="button"
+            class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-40"
+            disabled={knownDevices.length === 0}
+            onclick={startClearKnownDevicesConfirm}
+            title="Clear persisted known devices and remove rows from Results"
+          >
+            Clear devices ({knownDevices.length})
+          </button>
+        {/if}
       </div>
       <a
         href="/settings"
@@ -1012,4 +1259,122 @@
       ></div>
     </div>
   </div>
+
+  {#if profileDrawerOpen}
+    <div
+      class="fixed inset-0 z-[100] bg-black/60"
+      role="presentation"
+      aria-hidden="true"
+      onclick={closeProfileDrawer}
+      transition:fade={{ duration: 150 }}
+    ></div>
+    <div
+      class="fixed top-0 right-0 z-[101] flex h-full w-full max-w-md flex-col border-l border-zinc-800 bg-zinc-950 shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="profile-drawer-title"
+      transition:fly={{ x: 400, duration: 220, opacity: 1 }}
+    >
+      <div class="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+        <h2 id="profile-drawer-title" class="text-base font-semibold text-zinc-100">
+          {profileDrawerEditingId ? "Edit profile" : "New profile"}
+        </h2>
+        <button
+          type="button"
+          class="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+          onclick={closeProfileDrawer}
+          aria-label="Close profile panel"
+        >
+          <X class="h-5 w-5" aria-hidden="true" />
+        </button>
+      </div>
+      <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-4">
+        <div class="flex flex-col gap-1.5">
+          <label class="text-xs font-medium text-zinc-500" for="drawer-profile-name">Name</label>
+          <input
+            id="drawer-profile-name"
+            type="text"
+            bind:value={drawerProfileName}
+            class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+            placeholder="e.g. Home LAN"
+            oninput={() => {
+              profileDrawerError = null;
+              profileDeleteConfirmPending = false;
+            }}
+          />
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-1.5">
+          <label class="text-xs font-medium text-zinc-500" for="drawer-profile-targets">Targets</label>
+          <textarea
+            id="drawer-profile-targets"
+            bind:value={drawerProfileTargets}
+            class="min-h-[8rem] flex-1 resize-y rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 font-mono text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+            placeholder="192.168.1.0/24 or 10.0.0.1, 10.0.0.5-10"
+            rows="8"
+            oninput={() => {
+              profileDrawerError = null;
+              profileDeleteConfirmPending = false;
+            }}
+          ></textarea>
+        </div>
+        {#if profileDrawerError}
+          <p class="text-xs text-red-400" role="alert">{profileDrawerError}</p>
+        {/if}
+      </div>
+      <div class="mt-auto flex w-full flex-col gap-3 border-t border-zinc-800 px-4 py-3">
+        {#if profileDrawerEditingId && profileDrawerEditingId !== DEFAULT_PROFILE_ID && profileDeleteConfirmPending}
+          <div class="rounded-lg border border-red-900/60 bg-red-950/35 px-3 py-2 text-xs">
+            <p class="font-medium text-red-200">Delete this profile?</p>
+            <p class="mt-1 text-red-300/90">You cannot undo this.</p>
+          </div>
+        {/if}
+        <div class="flex w-full flex-wrap items-center gap-2">
+          <div class="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+            {#if profileDrawerEditingId && profileDrawerEditingId !== DEFAULT_PROFILE_ID}
+              {#if profileDeleteConfirmPending}
+                <button
+                  type="button"
+                  class="h-10 shrink-0 rounded-lg border border-zinc-600 px-3 text-xs text-zinc-200 hover:bg-zinc-800"
+                  onclick={cancelProfileDeleteConfirmation}
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  class="h-10 shrink-0 rounded-lg border border-red-800 bg-red-900/70 px-3 text-xs text-red-100 hover:bg-red-900"
+                  onclick={confirmDeleteProfileFromDrawer}
+                >
+                  Delete permanently
+                </button>
+              {:else}
+                <button
+                  type="button"
+                  class="h-10 shrink-0 rounded-lg border border-red-900/80 bg-red-950/40 px-3 text-xs text-red-300 hover:bg-red-950/70"
+                  onclick={startProfileDeleteConfirmation}
+                >
+                  Delete profile
+                </button>
+              {/if}
+            {/if}
+          </div>
+          <div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
+            <button
+              type="button"
+              class="h-10 rounded-lg border border-zinc-600 px-3 text-xs text-zinc-300 hover:bg-zinc-800"
+              onclick={closeProfileDrawer}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              class="h-10 rounded-lg px-4 text-xs font-medium text-black tm-accent-bg hover:text-black"
+              onclick={() => void saveProfileFromDrawer()}
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>

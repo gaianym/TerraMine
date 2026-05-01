@@ -20,6 +20,11 @@ pub use types::DiscoverySettings;
 use limits::{MAX_ACTIVE_RUNS, MAX_TARGETS_LEN_BYTES};
 
 #[tauri::command]
+pub fn filter_ips_matching_targets(ips: Vec<String>, targets: String) -> Result<Vec<String>, String> {
+    targets::filter_ips_matching_targets(&ips, &targets)
+}
+
+#[tauri::command]
 pub async fn start_discovery_run(
     app: AppHandle,
     state: State<'_, AppState>,
