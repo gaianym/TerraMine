@@ -74,6 +74,10 @@
   let autoEnrichTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped when the active target profile/spec changes so auto-discover/enrich timers reset their interval clocks. */
   let autoLoopRestartEpoch = $state(0);
+  /** When the auto-discover `setInterval` was (re)registered; aligns UI countdown with real tick schedule. */
+  let autoDiscoverCadenceAnchorMs = $state<number>(Date.now());
+  /** Drives countdown refresh while auto-discover is enabled. */
+  let autoDiscoverUiTick = $state(0);
 
   /** Custom profile picker (replacing native select styling in Tauri/WebKit). */
   let profileMenuOpen = $state(false);
@@ -1042,6 +1046,27 @@
   });
   const discoverInProgress = $derived(activeRunKind === "discover");
 
+  function formatCountdownMmSs(totalSec: number): string {
+    const s = Math.max(0, Math.ceil(totalSec));
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  }
+
+  const autoDiscoverNextInSec = $derived.by(() => {
+    autoDiscoverUiTick;
+    autoDiscoverCadenceAnchorMs;
+    autoLoopRestartEpoch;
+    if (!settings.autoDiscoverEnabled) return null;
+    const iv = Math.max(5, settings.autoDiscoverIntervalSec) * 1000;
+    const now = Date.now();
+    const anchor = autoDiscoverCadenceAnchorMs || now;
+    const elapsed = Math.max(0, now - anchor);
+    const n = Math.floor(elapsed / iv) + 1;
+    const nextMs = anchor + n * iv;
+    return Math.max(0, (nextMs - now) / 1000);
+  });
+
   onMount(() => {
     settings = loadDiscoverySettings();
     targetProfiles = normalizeTargetProfiles(loadTargetProfiles());
@@ -1211,6 +1236,17 @@
     }
   });
 
+  /** Keep Discover button countdown synced with roughly 250 ms resolution. */
+  $effect(() => {
+    if (!settings.autoDiscoverEnabled || typeof window === "undefined") return;
+    settings.autoDiscoverIntervalSec;
+    autoDiscoverUiTick = Date.now();
+    const id = window.setInterval(() => {
+      autoDiscoverUiTick = Date.now();
+    }, 250);
+    return () => window.clearInterval(id);
+  });
+
   $effect(() => {
     autoLoopRestartEpoch;
     if (autoDiscoverTimer) {
@@ -1219,6 +1255,8 @@
     }
     if (!settings.autoDiscoverEnabled) return;
     const intervalMs = Math.max(5, settings.autoDiscoverIntervalSec) * 1000;
+    autoDiscoverCadenceAnchorMs = Date.now();
+    autoDiscoverUiTick = Date.now();
     autoDiscoverTimer = setInterval(() => {
       if (busy) return;
       void startRun();
@@ -1393,11 +1431,23 @@
       </a>
       <button
         type="button"
-        class="h-10 rounded-lg tm-accent-bg px-4 py-2 text-sm font-medium text-black hover:text-black disabled:opacity-40"
+        class="h-10 min-w-[10.5rem] whitespace-nowrap rounded-lg tm-accent-bg px-3 py-2 text-sm font-medium text-black hover:text-black disabled:opacity-40"
         disabled={discoverInProgress}
         onclick={startRun}
+        title={discoverInProgress
+          ? ""
+          : settings.autoDiscoverEnabled
+            ? `Start a probe run manually. Next auto-discovery in ~${formatCountdownMmSs(autoDiscoverNextInSec ?? 0)}.`
+            : "Scan targets for reachable hosts"}
       >
-        Discover
+        {#if settings.autoDiscoverEnabled}
+          <span class="flex items-center justify-center gap-2 tracking-tight">
+            <span>Auto-Discover</span>
+            <span class="font-mono text-xs tabular-nums opacity-95">{formatCountdownMmSs(autoDiscoverNextInSec ?? 0)}</span>
+          </span>
+        {:else}
+          Discover
+        {/if}
       </button>
       <button
         type="button"
