@@ -12,7 +12,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { fade, fly } from "svelte/transition";
   import { onDestroy, onMount, untrack } from "svelte";
-  import { Settings, X } from "lucide-svelte";
+  import { ArrowLeft, Check, ChevronDown, Settings, X } from "lucide-svelte";
   import {
     defaultDiscoverySettings,
     type DiscoveryProgress,
@@ -56,6 +56,10 @@
   let profileDrawerError = $state<string | null>(null);
   /** Tauri/WebKit often breaks `confirm()`; confirm deletes in-drawer instead. */
   let profileDeleteConfirmPending = $state(false);
+  /** List of profiles vs name/targets editor. */
+  let profileDrawerPane = $state<"list" | "form">("list");
+  /** Row in list awaiting delete confirmation. */
+  let profileListDeletePendingId = $state<string | null>(null);
   /** Header "Clear devices" avoids `window.confirm`. */
   let clearDevicesConfirmPending = $state(false);
   let knownDevices = $state<KnownDevice[]>([]);
@@ -70,6 +74,10 @@
   let autoEnrichTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped when the active target profile/spec changes so auto-discover/enrich timers reset their interval clocks. */
   let autoLoopRestartEpoch = $state(0);
+
+  /** Custom profile picker (replacing native select styling in Tauri/WebKit). */
+  let profileMenuOpen = $state(false);
+  let profileMenuHost: HTMLDivElement | null = null;
 
   type GridRow = {
     id: string;
@@ -491,29 +499,108 @@
 
   function closeProfileDrawer() {
     profileDrawerOpen = false;
-    profileDrawerError = null;
+    profileDrawerPane = "list";
     profileDrawerEditingId = null;
+    drawerProfileName = "";
+    drawerProfileTargets = "";
+    profileDrawerError = null;
     profileDeleteConfirmPending = false;
+    profileListDeletePendingId = null;
   }
 
-  function openProfileDrawerNew() {
+  function openProfilesDrawer() {
+    profileMenuOpen = false;
+    profileDrawerPane = "list";
+    profileDrawerEditingId = null;
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileListDeletePendingId = null;
+    profileDrawerOpen = true;
+  }
+
+  async function pickProfileFromMenu(profileId: string) {
+    profileMenuOpen = false;
+    await applyTargetProfile(profileId);
+  }
+
+  function backToProfilesListFromForm() {
+    profileDrawerPane = "list";
+    profileDrawerEditingId = null;
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileListDeletePendingId = null;
+  }
+
+  function navigateToProfileFormNew() {
+    profileDrawerPane = "form";
     profileDrawerEditingId = null;
     drawerProfileName = "";
     drawerProfileTargets = targets.trim();
     profileDrawerError = null;
     profileDeleteConfirmPending = false;
-    profileDrawerOpen = true;
+    profileListDeletePendingId = null;
   }
 
-  function openProfileDrawerEdit() {
-    const p = targetProfiles.find((x) => x.id === selectedProfileId);
+  function navigateToProfileFormEdit(profileId: string) {
+    const p = targetProfiles.find((x) => x.id === profileId);
     if (!p) return;
+    profileDrawerPane = "form";
     profileDrawerEditingId = p.id;
     drawerProfileName = p.name;
     drawerProfileTargets = p.targets;
     profileDrawerError = null;
     profileDeleteConfirmPending = false;
-    profileDrawerOpen = true;
+    profileListDeletePendingId = null;
+  }
+
+  function ellipsisTargets(spec: string, maxLen = 72) {
+    const t = spec.replace(/\s+/g, " ").trim();
+    if (t.length <= maxLen) return t;
+    return `${t.slice(0, Math.max(0, maxLen - 3))}...`;
+  }
+
+  function startProfileListDelete(profileId: string) {
+    if (profileId === DEFAULT_PROFILE_ID) return;
+    profileDrawerError = null;
+    profileListDeletePendingId = profileId;
+  }
+
+  function cancelProfileListDelete() {
+    profileListDeletePendingId = null;
+  }
+
+  async function confirmProfileListDelete() {
+    const id = profileListDeletePendingId;
+    if (!id || id === DEFAULT_PROFILE_ID) return;
+    targetProfiles = normalizeTargetProfiles(targetProfiles.filter((p) => p.id !== id));
+    if (selectedProfileId === id) {
+      selectedProfileId = DEFAULT_PROFILE_ID;
+      const def = targetProfiles.find((p) => p.id === DEFAULT_PROFILE_ID);
+      if (def) targets = def.targets;
+    }
+    profileListDeletePendingId = null;
+    await handleProfileTargetsScopeChanged();
+  }
+
+  /**
+   * Overwrites the built-in Default profile (reserved id) with this profile's name/targets,
+   * selects Default, and applies discovery scope — used for session/fallback when no saved selection.
+   */
+  async function setBuiltinDefaultFromProfile(profileId: string) {
+    if (profileId === DEFAULT_PROFILE_ID) return;
+    const src = targetProfiles.find((x) => x.id === profileId);
+    if (!src) return;
+    const name = src.name.trim() || "Default";
+    const t = src.targets.trim();
+    if (!t) return;
+    targetProfiles = normalizeTargetProfiles(
+      targetProfiles.map((prof) =>
+        prof.id === DEFAULT_PROFILE_ID ? { ...prof, name, targets: t } : prof,
+      ),
+    );
+    selectedProfileId = DEFAULT_PROFILE_ID;
+    targets = t;
+    await handleProfileTargetsScopeChanged();
   }
 
   function startProfileDeleteConfirmation() {
@@ -578,10 +665,10 @@
       targets = t;
     }
     await handleProfileTargetsScopeChanged();
-    closeProfileDrawer();
+    backToProfilesListFromForm();
   }
 
-  function confirmDeleteProfileFromDrawer() {
+  async function confirmDeleteProfileFromDrawer() {
     const id = profileDrawerEditingId;
     if (!id || id === DEFAULT_PROFILE_ID) return;
     targetProfiles = normalizeTargetProfiles(targetProfiles.filter((p) => p.id !== id));
@@ -591,7 +678,8 @@
       if (def) targets = def.targets;
     }
     profileDeleteConfirmPending = false;
-    closeProfileDrawer();
+    await handleProfileTargetsScopeChanged();
+    backToProfilesListFromForm();
   }
 
   function normalizeKnownDevices(devices: KnownDevice[]) {
@@ -1046,10 +1134,35 @@
   $effect(() => {
     if (!profileDrawerOpen || typeof window === "undefined") return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeProfileDrawer();
+      if (e.key !== "Escape") return;
+      if (profileDrawerPane === "form") {
+        e.preventDefault();
+        backToProfilesListFromForm();
+        return;
+      }
+      closeProfileDrawer();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  });
+
+  $effect(() => {
+    if (!profileMenuOpen || typeof window === "undefined") return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target;
+      if (!(t instanceof Node)) return;
+      if (profileMenuHost?.contains(t)) return;
+      profileMenuOpen = false;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") profileMenuOpen = false;
+    };
+    document.addEventListener("mousedown", onDoc, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc, true);
+      window.removeEventListener("keydown", onKey);
+    };
   });
 
   $effect(() => {
@@ -1177,29 +1290,70 @@
         ></textarea>
       </div>
       <div class="flex flex-wrap items-end gap-2">
-        <select
-          class="h-10 min-w-[10rem] rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-300"
-          value={selectedProfileId}
-          onchange={(e) => void applyTargetProfile((e.currentTarget as HTMLSelectElement).value)}
-        >
-          {#each targetProfiles as profile}
-            <option value={profile.id}>{profile.name}</option>
-          {/each}
-        </select>
+        <div class="flex flex-col gap-1">
+          <label
+            id="profile-menu-label"
+            class="text-xs font-medium text-zinc-500"
+            for="profile-menu-trigger"
+          >
+            Profile
+          </label>
+          <div class="relative min-w-[11rem]" bind:this={profileMenuHost}>
+            <button
+              type="button"
+              id="profile-menu-trigger"
+              class="flex h-10 w-full min-w-[11rem] items-center justify-between gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-left text-xs text-zinc-200 hover:border-zinc-600 hover:bg-zinc-800/80 focus:border-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+              aria-haspopup="listbox"
+              aria-expanded={profileMenuOpen}
+              onclick={() => (profileMenuOpen = !profileMenuOpen)}
+            >
+              <span class="truncate">
+                {targetProfiles.find((p) => p.id === selectedProfileId)?.name ?? "Profile"}
+              </span>
+              <ChevronDown
+                class="h-4 w-4 shrink-0 text-zinc-500 transition-transform duration-200 {profileMenuOpen
+                  ? 'rotate-180'
+                  : ''}"
+                aria-hidden="true"
+              />
+            </button>
+            {#if profileMenuOpen}
+              <div
+                class="absolute left-0 top-full z-50 mt-1 max-h-[min(18rem,calc(100vh-8rem))] w-full overflow-auto rounded-lg border border-zinc-700 bg-zinc-950 py-1 shadow-xl ring-1 ring-black/40"
+                role="listbox"
+                aria-labelledby="profile-menu-label"
+              >
+                {#each targetProfiles as profile}
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={profile.id === selectedProfileId}
+                    class="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-200 hover:bg-zinc-800/90 {profile.id === selectedProfileId
+                      ? 'bg-zinc-900/80'
+                      : ''}"
+                    onclick={() => void pickProfileFromMenu(profile.id)}
+                  >
+                    <span class="flex w-4 shrink-0 items-center justify-center" aria-hidden="true">
+                      {#if profile.id === selectedProfileId}
+                        <Check class="h-3.5 w-3.5 tm-accent-text" />
+                      {:else}
+                        <span class="block h-3.5 w-3.5"></span>
+                      {/if}
+                    </span>
+                    <span class="min-w-0 flex-1 truncate">{profile.name}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
         <button
           type="button"
           class="h-10 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
-          onclick={openProfileDrawerNew}
+          onclick={openProfilesDrawer}
+          title="View and manage target profiles"
         >
-          + Profile
-        </button>
-        <button
-          type="button"
-          class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
-          onclick={openProfileDrawerEdit}
-          title="Edit the selected profile"
-        >
-          Edit
+          Profiles
         </button>
         {#if clearDevicesConfirmPending}
           <span class="self-center text-xs text-amber-300/95">Clear saved devices &amp; table?</span>
@@ -1306,106 +1460,220 @@
       aria-labelledby="profile-drawer-title"
       transition:fly={{ x: 400, duration: 220, opacity: 1 }}
     >
-      <div class="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
-        <h2 id="profile-drawer-title" class="text-base font-semibold text-zinc-100">
-          {profileDrawerEditingId ? "Edit profile" : "New profile"}
-        </h2>
-        <button
-          type="button"
-          class="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
-          onclick={closeProfileDrawer}
-          aria-label="Close profile panel"
-        >
-          <X class="h-5 w-5" aria-hidden="true" />
-        </button>
-      </div>
-      <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-4">
-        <div class="flex flex-col gap-1.5">
-          <label class="text-xs font-medium text-zinc-500" for="drawer-profile-name">Name</label>
-          <input
-            id="drawer-profile-name"
-            type="text"
-            bind:value={drawerProfileName}
-            class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
-            placeholder="e.g. Home LAN"
-            oninput={() => {
-              profileDrawerError = null;
-              profileDeleteConfirmPending = false;
-            }}
-          />
+      {#if profileDrawerPane === "list"}
+        <div class="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+          <h2 id="profile-drawer-title" class="text-base font-semibold text-zinc-100">Profiles</h2>
+          <button
+            type="button"
+            class="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            onclick={closeProfileDrawer}
+            aria-label="Close profiles panel"
+          >
+            <X class="h-5 w-5" aria-hidden="true" />
+          </button>
         </div>
-        <div class="flex min-h-0 flex-1 flex-col gap-1.5">
-          <label class="text-xs font-medium text-zinc-500" for="drawer-profile-targets">Targets</label>
-          <textarea
-            id="drawer-profile-targets"
-            bind:value={drawerProfileTargets}
-            class="min-h-[8rem] flex-1 resize-y rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 font-mono text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
-            placeholder="192.168.1.0/24 or 10.0.0.1, 10.0.0.5-10"
-            rows="8"
-            oninput={() => {
-              profileDrawerError = null;
-              profileDeleteConfirmPending = false;
-            }}
-          ></textarea>
-        </div>
-        {#if profileDrawerError}
-          <p class="text-xs text-red-400" role="alert">{profileDrawerError}</p>
-        {/if}
-      </div>
-      <div class="mt-auto flex w-full flex-col gap-3 border-t border-zinc-800 px-4 py-3">
-        {#if profileDrawerEditingId && profileDrawerEditingId !== DEFAULT_PROFILE_ID && profileDeleteConfirmPending}
-          <div class="rounded-lg border border-red-900/60 bg-red-950/35 px-3 py-2 text-xs">
-            <p class="font-medium text-red-200">Delete this profile?</p>
-            <p class="mt-1 text-red-300/90">You cannot undo this.</p>
+        <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div class="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
+            {#each targetProfiles as p (p.id)}
+              <div
+                class="space-y-2 rounded-lg border bg-zinc-900/35 p-3 {p.id === selectedProfileId
+                  ? 'border-emerald-800/65 ring-1 ring-emerald-900/55'
+                  : 'border-zinc-800'}"
+              >
+                <div class="flex flex-wrap items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <p class="truncate text-sm font-medium text-zinc-100">{p.name}</p>
+                    {#if p.id === selectedProfileId}
+                      <p class="mt-0.5 text-[10px] font-medium uppercase tracking-wide tm-accent-text">Active</p>
+                    {/if}
+                  </div>
+                </div>
+                <p class="break-all font-mono text-xs leading-snug text-zinc-500" title={p.targets.trim()}>
+                  {ellipsisTargets(p.targets)}
+                </p>
+                {#if profileListDeletePendingId === p.id && p.id !== DEFAULT_PROFILE_ID}
+                  <div class="rounded-lg border border-red-900/60 bg-red-950/35 px-3 py-2 text-xs">
+                    <p class="font-medium text-red-200">Delete “{p.name}”?</p>
+                    <p class="mt-1 text-red-300/90">You cannot undo this.</p>
+                    <div class="mt-2 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        class="rounded-lg border border-zinc-600 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-900"
+                        onclick={cancelProfileListDelete}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        class="rounded-lg border border-red-800 bg-red-900/70 px-2 py-1 text-[11px] text-red-100 hover:bg-red-900"
+                        onclick={() => void confirmProfileListDelete()}
+                      >
+                        Delete permanently
+                      </button>
+                    </div>
+                  </div>
+                {:else}
+                  <div class="flex flex-wrap gap-2">
+                    {#if p.id !== selectedProfileId}
+                      <button
+                        type="button"
+                        class="rounded-lg border border-zinc-600 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-900"
+                        onclick={() => void applyTargetProfile(p.id)}
+                      >
+                        Use profile
+                      </button>
+                    {/if}
+                    {#if p.id !== DEFAULT_PROFILE_ID && p.targets.trim()}
+                      <button
+                        type="button"
+                        class="rounded-lg border border-emerald-900/65 px-2 py-1 text-[11px] text-emerald-200/95 hover:bg-emerald-950/45"
+                        title="Replace the Default profile with this one's name and targets, and select Default"
+                        onclick={() => void setBuiltinDefaultFromProfile(p.id)}
+                      >
+                        Set as Default
+                      </button>
+                    {/if}
+                    <button
+                      type="button"
+                      class="rounded-lg border border-zinc-600 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-900"
+                      onclick={() => navigateToProfileFormEdit(p.id)}
+                    >
+                      Edit
+                    </button>
+                    {#if p.id !== DEFAULT_PROFILE_ID}
+                      <button
+                        type="button"
+                        class="rounded-lg border border-red-900/80 bg-red-950/40 px-2 py-1 text-[11px] text-red-300 hover:bg-red-950/70"
+                        onclick={() => startProfileListDelete(p.id)}
+                      >
+                        Delete
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/each}
           </div>
-        {/if}
-        <div class="flex w-full flex-wrap items-center gap-2">
-          <div class="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-            {#if profileDrawerEditingId && profileDrawerEditingId !== DEFAULT_PROFILE_ID}
-              {#if profileDeleteConfirmPending}
-                <button
-                  type="button"
-                  class="h-10 shrink-0 rounded-lg border border-zinc-600 px-3 text-xs text-zinc-200 hover:bg-zinc-800"
-                  onclick={cancelProfileDeleteConfirmation}
-                >
-                  Back
-                </button>
-                <button
-                  type="button"
-                  class="h-10 shrink-0 rounded-lg border border-red-800 bg-red-900/70 px-3 text-xs text-red-100 hover:bg-red-900"
-                  onclick={confirmDeleteProfileFromDrawer}
-                >
-                  Delete permanently
-                </button>
-              {:else}
-                <button
-                  type="button"
-                  class="h-10 shrink-0 rounded-lg border border-red-900/80 bg-red-950/40 px-3 text-xs text-red-300 hover:bg-red-950/70"
-                  onclick={startProfileDeleteConfirmation}
-                >
-                  Delete profile
-                </button>
+          <div class="shrink-0 border-t border-zinc-800 px-4 py-3">
+            <button
+              type="button"
+              class="h-10 w-full rounded-lg border border-zinc-600 px-3 text-xs font-medium text-zinc-200 hover:bg-zinc-900"
+              onclick={navigateToProfileFormNew}
+            >
+              + Add profile
+            </button>
+          </div>
+        </div>
+      {:else}
+        <div class="flex items-center gap-2 border-b border-zinc-800 px-2 py-2 pr-4">
+          <button
+            type="button"
+            class="rounded-lg p-2 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            onclick={backToProfilesListFromForm}
+            aria-label="Back to profiles list"
+          >
+            <ArrowLeft class="h-5 w-5" aria-hidden="true" />
+          </button>
+          <h2 id="profile-drawer-title" class="flex-1 text-base font-semibold text-zinc-100">
+            {profileDrawerEditingId ? "Edit profile" : "New profile"}
+          </h2>
+          <button
+            type="button"
+            class="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            onclick={closeProfileDrawer}
+            aria-label="Close profile panel"
+          >
+            <X class="h-5 w-5" aria-hidden="true" />
+          </button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-4">
+          <div class="flex flex-col gap-1.5">
+            <label class="text-xs font-medium text-zinc-500" for="drawer-profile-name">Name</label>
+            <input
+              id="drawer-profile-name"
+              type="text"
+              bind:value={drawerProfileName}
+              class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+              placeholder="e.g. Home LAN"
+              oninput={() => {
+                profileDrawerError = null;
+                profileDeleteConfirmPending = false;
+              }}
+            />
+          </div>
+          <div class="flex min-h-0 flex-1 flex-col gap-1.5">
+            <label class="text-xs font-medium text-zinc-500" for="drawer-profile-targets">Targets</label>
+            <textarea
+              id="drawer-profile-targets"
+              bind:value={drawerProfileTargets}
+              class="min-h-[8rem] flex-1 resize-y rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 font-mono text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+              placeholder="192.168.1.0/24 or 10.0.0.1, 10.0.0.5-10"
+              rows="8"
+              oninput={() => {
+                profileDrawerError = null;
+                profileDeleteConfirmPending = false;
+              }}
+            ></textarea>
+          </div>
+          {#if profileDrawerError}
+            <p class="text-xs text-red-400" role="alert">{profileDrawerError}</p>
+          {/if}
+        </div>
+        <div class="mt-auto flex w-full flex-col gap-3 border-t border-zinc-800 px-4 py-3">
+          {#if profileDrawerEditingId && profileDrawerEditingId !== DEFAULT_PROFILE_ID && profileDeleteConfirmPending}
+            <div class="rounded-lg border border-red-900/60 bg-red-950/35 px-3 py-2 text-xs">
+              <p class="font-medium text-red-200">Delete this profile?</p>
+              <p class="mt-1 text-red-300/90">You cannot undo this.</p>
+            </div>
+          {/if}
+          <div class="flex w-full flex-wrap items-center gap-2">
+            <div class="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+              {#if profileDrawerEditingId && profileDrawerEditingId !== DEFAULT_PROFILE_ID}
+                {#if profileDeleteConfirmPending}
+                  <button
+                    type="button"
+                    class="h-10 shrink-0 rounded-lg border border-zinc-600 px-3 text-xs text-zinc-200 hover:bg-zinc-800"
+                    onclick={cancelProfileDeleteConfirmation}
+                  >
+                    Back
+                  </button>
+                  <button
+                    type="button"
+                    class="h-10 shrink-0 rounded-lg border border-red-800 bg-red-900/70 px-3 text-xs text-red-100 hover:bg-red-900"
+                    onclick={() => void confirmDeleteProfileFromDrawer()}
+                  >
+                    Delete permanently
+                  </button>
+                {:else}
+                  <button
+                    type="button"
+                    class="h-10 shrink-0 rounded-lg border border-red-900/80 bg-red-950/40 px-3 text-xs text-red-300 hover:bg-red-950/70"
+                    onclick={startProfileDeleteConfirmation}
+                  >
+                    Delete profile
+                  </button>
+                {/if}
               {/if}
-            {/if}
-          </div>
-          <div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
-            <button
-              type="button"
-              class="h-10 rounded-lg border border-zinc-600 px-3 text-xs text-zinc-300 hover:bg-zinc-800"
-              onclick={closeProfileDrawer}
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              class="h-10 rounded-lg px-4 text-xs font-medium text-black tm-accent-bg hover:text-black"
-              onclick={() => void saveProfileFromDrawer()}
-            >
-              Save
-            </button>
+            </div>
+            <div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                class="h-10 rounded-lg border border-zinc-600 px-3 text-xs text-zinc-300 hover:bg-zinc-800"
+                onclick={backToProfilesListFromForm}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="h-10 rounded-lg px-4 text-xs font-medium text-black tm-accent-bg hover:text-black"
+                onclick={() => void saveProfileFromDrawer()}
+              >
+                Save
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      {/if}
     </div>
   {/if}
 </div>
