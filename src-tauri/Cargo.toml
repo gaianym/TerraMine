@@ -1,8 +1,8 @@
 [package]
 name = "terra-mine"
 version = "0.1.0"
-description = "Terra-Mine — LAN ASIC discovery desktop app"
-authors = ["Terra-Mine contributors"]
+description = "TerraMine — LAN ASIC discovery desktop app"
+authors = ["TerraMine contributors"]
 license = "GPL-3.0"
 edition = "2021"
 repository = "https://github.com/moonbootspleb/terra-mine"

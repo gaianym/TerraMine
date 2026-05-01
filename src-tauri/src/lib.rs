@@ -9,6 +9,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             discovery::start_discovery_run,
+            discovery::enrich_known_devices_run,
             discovery::stop_discovery_run,
             discovery::stop_all_discovery_runs,
         ])

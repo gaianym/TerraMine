@@ -6,6 +6,10 @@ export type DiscoverySettings = {
   enrichTimeoutSec: number;
   enrichConcurrency: number;
   enrichRateLimitPerSec: number;
+  autoDiscoverEnabled: boolean;
+  autoDiscoverIntervalSec: number;
+  autoEnrichEnabled: boolean;
+  autoEnrichIntervalSec: number;
   retryJitterMs: number;
   probeQueueCap: number;
   enrichQueueCap: number;
@@ -19,6 +23,10 @@ export const defaultDiscoverySettings: DiscoverySettings = {
   enrichTimeoutSec: 20,
   enrichConcurrency: 24,
   enrichRateLimitPerSec: 0,
+  autoDiscoverEnabled: false,
+  autoDiscoverIntervalSec: 60,
+  autoEnrichEnabled: false,
+  autoEnrichIntervalSec: 60,
   retryJitterMs: 250,
   probeQueueCap: 800,
   enrichQueueCap: 800,
