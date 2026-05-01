@@ -16,6 +16,10 @@ pub struct DiscoverySettings {
     pub enrich_concurrency: usize,
     #[serde(default)]
     pub enrich_rate_limit_per_sec: u64,
+    #[serde(default = "default_poll_interval_sec")]
+    pub auto_discover_interval_sec: u64,
+    #[serde(default = "default_poll_interval_sec")]
+    pub auto_enrich_interval_sec: u64,
     #[serde(default = "default_retry_jitter_ms")]
     pub retry_jitter_ms: u64,
     pub probe_queue_cap: usize,
@@ -49,6 +53,18 @@ impl DiscoverySettings {
             self.enrich_rate_limit_per_sec,
             MAX_ENRICH_RATE_LIMIT_PER_SEC,
         )?;
+        validate_u64_range(
+            "auto_discover_interval_sec",
+            self.auto_discover_interval_sec,
+            MIN_POLL_INTERVAL_SEC,
+            MAX_POLL_INTERVAL_SEC,
+        )?;
+        validate_u64_range(
+            "auto_enrich_interval_sec",
+            self.auto_enrich_interval_sec,
+            MIN_POLL_INTERVAL_SEC,
+            MAX_POLL_INTERVAL_SEC,
+        )?;
         validate_usize_range("probe_queue_cap", self.probe_queue_cap, 1, MAX_QUEUE_CAP)?;
         validate_usize_range(
             "enrich_queue_cap",
@@ -69,6 +85,8 @@ impl DiscoverySettings {
 
 const MIN_TIMEOUT_SEC: f64 = 0.001;
 const MAX_TIMEOUT_SEC: f64 = 3600.0;
+const MIN_POLL_INTERVAL_SEC: u64 = 5;
+const MAX_POLL_INTERVAL_SEC: u64 = 86_400;
 
 fn validate_positive_finite(field: &str, value: f64) -> Result<(), String> {
     if !value.is_finite() || !(MIN_TIMEOUT_SEC..=MAX_TIMEOUT_SEC).contains(&value) {
@@ -102,6 +120,10 @@ fn validate_u64_max(field: &str, value: u64, max: u64) -> Result<(), String> {
 
 fn default_retry_jitter_ms() -> u64 {
     250
+}
+
+fn default_poll_interval_sec() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize)]

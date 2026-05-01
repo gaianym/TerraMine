@@ -19,9 +19,13 @@
     type DiscoverySettings,
   } from "$lib/discoveryDefaults";
   import {
+    clearKnownDevices,
     loadDiscoverySettings,
+    loadKnownDevices,
     loadTargetProfiles,
+    saveKnownDevices,
     saveTargetProfiles,
+    type KnownDevice,
     type TargetProfile,
   } from "$lib/discoverySettingsStorage";
 
@@ -30,6 +34,7 @@
   let runId = $state<string | null>(null);
   let busy = $state(false);
   let errorMsg = $state<string | null>(null);
+  let activeRunKind = $state<"discover" | "enrich" | null>(null);
 
   const emptyProgress: DiscoveryProgress = {
     totalTargets: 0,
@@ -44,24 +49,34 @@
   let rows = $state<Map<string, DiscoveryRowEvent>>(new Map());
   let targetProfiles = $state<TargetProfile[]>([]);
   let selectedProfileId = $state("");
+  let knownDevices = $state<KnownDevice[]>([]);
 
   let unlistenFns: UnlistenFn[] = [];
   let coalesceTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingRows = new Map<string, DiscoveryRowEvent>();
-  let removeWindowErrorListeners: (() => void) | null = null;
+  let missStreakByRow = $state<Map<string, number>>(new Map());
   let gridHost: HTMLDivElement | null = null;
   let gridApi: GridApi<GridRow> | null = null;
+  let autoDiscoverTimer: ReturnType<typeof setInterval> | null = null;
+  let autoEnrichTimer: ReturnType<typeof setInterval> | null = null;
+  let movementByCell = $state<Map<string, { direction: "up" | "down"; deltaText: string }>>(new Map());
 
   type GridRow = {
     id: string;
     status: DiscoveryRowEvent["status"];
     [key: string]: unknown;
   };
+  const MOVEMENT_COLUMNS = new Set(["hashrate", "average_temperature", "efficiency", "wattage"]);
   const GRID_COLUMN_KEYS_STORAGE_KEY = "tm:discovery:grid-column-keys:v1";
   const BASELINE_COLUMN_KEYS = ["ip", "discovery"];
 
   function isFinalStatus(status: DiscoveryRowEvent["status"]) {
     return status === "Enriched" || status === "Partial";
+  }
+
+  function rowKeyForEvent(ev: DiscoveryRowEvent) {
+    const ip = typeof ev.row?.ip === "string" ? ev.row.ip.trim() : "";
+    return ip || ev.id;
   }
 
   function loadGridColumnKeys(): string[] {
@@ -89,80 +104,72 @@
 
   ModuleRegistry.registerModules([ClientSideRowModelModule]);
 
-  function formatGridValue(value: unknown) {
-    if (value === undefined) return "\u2014";
-    if (typeof value === "string") return value;
-    return JSON.stringify(value);
+  const HASH_RATE_UNIT_TIERS = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"] as const;
+
+  const HASH_RATE_UNIT_MAP: Record<string, string> = {
+    hash: "H/s",
+    h: "H/s",
+    hs: "H/s",
+    "h/s": "H/s",
+    kilohash: "KH/s",
+    khash: "KH/s",
+    kh: "KH/s",
+    khs: "KH/s",
+    "kh/s": "KH/s",
+    megahash: "MH/s",
+    mhash: "MH/s",
+    mh: "MH/s",
+    mhs: "MH/s",
+    "mh/s": "MH/s",
+    gigahash: "GH/s",
+    ghash: "GH/s",
+    gh: "GH/s",
+    ghs: "GH/s",
+    "gh/s": "GH/s",
+    terahash: "TH/s",
+    thash: "TH/s",
+    th: "TH/s",
+    ths: "TH/s",
+    "th/s": "TH/s",
+    petahash: "PH/s",
+    phash: "PH/s",
+    ph: "PH/s",
+    phs: "PH/s",
+    "ph/s": "PH/s",
+    exahash: "EH/s",
+    ehash: "EH/s",
+    eh: "EH/s",
+    ehs: "EH/s",
+    "eh/s": "EH/s",
+    zettahash: "ZH/s",
+    zhash: "ZH/s",
+    zh: "ZH/s",
+    zhs: "ZH/s",
+    "zh/s": "ZH/s",
+  };
+
+  /** Same tier logic as displayed hashrate cells; used for primary value and delta-in-that-unit. */
+  function scaleHashRateToDisplayTier(amount: number, unit: string) {
+    const unitTiers = HASH_RATE_UNIT_TIERS;
+    let idx = unitTiers.indexOf(unit as (typeof unitTiers)[number]);
+    if (idx < 0) return { amount, unit };
+    if (amount <= 0) {
+      return { amount: 0, unit: "H/s" as const };
+    }
+    while (amount >= 1000 && idx < unitTiers.length - 1) {
+      amount /= 1000;
+      idx += 1;
+    }
+    while (amount < 1 && idx > 0) {
+      amount *= 1000;
+      idx -= 1;
+    }
+    return { amount, unit: unitTiers[idx] };
   }
 
-  function formatHashRateValue(value: unknown) {
-    if (value === undefined || value === null) return "\u2014";
-    const unitTiers = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"] as const;
-    const normalizeHashRate = (amount: number, unit: string) => {
-      let idx = unitTiers.indexOf(unit as (typeof unitTiers)[number]);
-      if (idx < 0) return { amount, unit };
-      if (amount <= 0) {
-        return { amount: 0, unit: "H/s" as const };
-      }
-      while (amount >= 1000 && idx < unitTiers.length - 1) {
-        amount /= 1000;
-        idx += 1;
-      }
-      while (amount < 1 && idx > 0) {
-        amount *= 1000;
-        idx -= 1;
-      }
-      return { amount, unit: unitTiers[idx] };
-    };
-    const unitMap: Record<string, string> = {
-      hash: "H/s",
-      h: "H/s",
-      hs: "H/s",
-      "h/s": "H/s",
-      kilohash: "KH/s",
-      khash: "KH/s",
-      kh: "KH/s",
-      khs: "KH/s",
-      "kh/s": "KH/s",
-      megahash: "MH/s",
-      mhash: "MH/s",
-      mh: "MH/s",
-      mhs: "MH/s",
-      "mh/s": "MH/s",
-      gigahash: "GH/s",
-      ghash: "GH/s",
-      gh: "GH/s",
-      ghs: "GH/s",
-      "gh/s": "GH/s",
-      terahash: "TH/s",
-      thash: "TH/s",
-      th: "TH/s",
-      ths: "TH/s",
-      "th/s": "TH/s",
-      petahash: "PH/s",
-      phash: "PH/s",
-      ph: "PH/s",
-      phs: "PH/s",
-      "ph/s": "PH/s",
-      exahash: "EH/s",
-      ehash: "EH/s",
-      eh: "EH/s",
-      ehs: "EH/s",
-      "eh/s": "EH/s",
-      zettahash: "ZH/s",
-      zhash: "ZH/s",
-      zh: "ZH/s",
-      zhs: "ZH/s",
-      "zh/s": "ZH/s",
-    };
-    const formatAmount = (amount: number, unit?: string) => {
-      if (!Number.isFinite(amount)) return "\u2014";
-      if (unit) {
-        const scaled = normalizeHashRate(amount, unit);
-        return `${scaled.amount.toFixed(2)} ${scaled.unit}`;
-      }
-      return `${Math.max(0, amount).toFixed(2)} H/s`;
-    };
+  /** Parsed display tier for a cell value (matches `formatHashRateValue`). */
+  function getNormalizedHashRateDisplay(value: unknown): { amount: number; unit: string } | null {
+    if (value === undefined || value === null) return null;
     if (typeof value === "object") {
       const record = value as Record<string, unknown>;
       const rawAmount = record.value;
@@ -173,29 +180,180 @@
           : typeof rawAmount === "string"
             ? Number.parseFloat(rawAmount)
             : Number.NaN;
-      const formattedAmount = formatAmount(amount);
-      if (formattedAmount !== null) {
-        const unitKey =
-          typeof rawUnit === "string" ? rawUnit.trim().toLowerCase().replace(/\s+/g, "") : "";
-        const unit = unitMap[unitKey] ?? (typeof rawUnit === "string" ? rawUnit.trim() : "");
-        return unit ? formatAmount(amount, unit) : formattedAmount;
-      }
+      if (!Number.isFinite(amount)) return null;
+      const unitKey =
+        typeof rawUnit === "string" ? rawUnit.trim().toLowerCase().replace(/\s+/g, "") : "";
+      const unit = HASH_RATE_UNIT_MAP[unitKey] ?? (typeof rawUnit === "string" ? rawUnit.trim() : "");
+      if (!unit) return scaleHashRateToDisplayTier(Math.max(0, amount), "H/s");
+      return scaleHashRateToDisplayTier(amount, unit);
     }
     if (typeof value === "number" && Number.isFinite(value)) {
-      return value.toFixed(2);
+      return scaleHashRateToDisplayTier(value, "H/s");
     }
     if (typeof value === "string") {
       const trimmed = value.trim();
       const match = trimmed.match(/^(-?\d+(?:\.\d+)?)(.*)$/);
-      if (!match) return trimmed;
+      if (!match) return null;
       const amount = Number.parseFloat(match[1]);
-      if (!Number.isFinite(amount)) return trimmed;
+      if (!Number.isFinite(amount)) return null;
       const rawUnit = match[2].trim();
       const unitKey = rawUnit.toLowerCase().replace(/\s+/g, "");
-      const unit = unitMap[unitKey] ?? rawUnit;
-      return formatAmount(amount, unit);
+      const unit = HASH_RATE_UNIT_MAP[unitKey] ?? rawUnit;
+      return scaleHashRateToDisplayTier(amount, unit);
+    }
+    return null;
+  }
+
+  /** Delta is in H/s; scale to same magnitude as the reference cell (no unit label in the indicator). */
+  function formatHashRateDeltaHs(absDeltaHs: number, referenceValue: unknown): string {
+    if (!Number.isFinite(absDeltaHs)) return "\u2014";
+    const refDisplay = getNormalizedHashRateDisplay(referenceValue);
+    if (!refDisplay) {
+      const scaled = scaleHashRateToDisplayTier(absDeltaHs, "H/s");
+      return scaled.amount.toFixed(2);
+    }
+    const idx = HASH_RATE_UNIT_TIERS.indexOf(refDisplay.unit as (typeof HASH_RATE_UNIT_TIERS)[number]);
+    if (idx < 0) {
+      const scaled = scaleHashRateToDisplayTier(absDeltaHs, "H/s");
+      return scaled.amount.toFixed(2);
+    }
+    const factor = 1000 ** idx;
+    return (absDeltaHs / factor).toFixed(2);
+  }
+
+  function parseHashRateToHs(value: unknown): number | null {
+    if (value === undefined || value === null) return null;
+    const unitFactor: Record<string, number> = {
+      "h/s": 1,
+      hs: 1,
+      h: 1,
+      hash: 1,
+      khs: 1e3,
+      "kh/s": 1e3,
+      kh: 1e3,
+      kilohash: 1e3,
+      mhs: 1e6,
+      "mh/s": 1e6,
+      mh: 1e6,
+      megahash: 1e6,
+      ghs: 1e9,
+      "gh/s": 1e9,
+      gh: 1e9,
+      gigahash: 1e9,
+      ths: 1e12,
+      "th/s": 1e12,
+      th: 1e12,
+      terahash: 1e12,
+      phs: 1e15,
+      "ph/s": 1e15,
+      ph: 1e15,
+      petahash: 1e15,
+      ehs: 1e18,
+      "eh/s": 1e18,
+      eh: 1e18,
+      exahash: 1e18,
+      zhs: 1e21,
+      "zh/s": 1e21,
+      zh: 1e21,
+      zettahash: 1e21,
+    };
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      const match = trimmed.match(/^(-?\d+(?:\.\d+)?)(.*)$/);
+      if (!match) return null;
+      const amount = Number.parseFloat(match[1]);
+      if (!Number.isFinite(amount)) return null;
+      const unit = match[2].trim().toLowerCase().replace(/\s+/g, "");
+      const factor = unitFactor[unit] ?? 1;
+      return amount * factor;
+    }
+    if (typeof value === "object") {
+      const record = value as Record<string, unknown>;
+      const rawAmount = record.value;
+      const amount =
+        typeof rawAmount === "number"
+          ? rawAmount
+          : typeof rawAmount === "string"
+            ? Number.parseFloat(rawAmount)
+            : Number.NaN;
+      if (!Number.isFinite(amount)) return null;
+      const rawUnit = typeof record.unit === "string" ? record.unit.trim().toLowerCase().replace(/\s+/g, "") : "";
+      const factor = unitFactor[rawUnit] ?? 1;
+      return amount * factor;
+    }
+    return null;
+  }
+
+  function parseMetricValue(col: string, value: unknown): number | null {
+    if (!MOVEMENT_COLUMNS.has(col)) return null;
+    if (col === "hashrate") return parseHashRateToHs(value);
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const parsed = Number.parseFloat(value.trim());
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+  }
+
+  function formatColumnValue(col: string, value: unknown): string {
+    if (col === "hashrate") return formatHashRateValue(value);
+    if (col === "average_temperature") {
+      if (value === undefined || value === null) return "\u2014";
+      if (typeof value === "number" && Number.isFinite(value)) return `${Math.round(value)} \u00B0C`;
+      if (typeof value === "string") {
+        const trimmed = value.trim();
+        const parsed = Number.parseFloat(trimmed);
+        if (Number.isFinite(parsed)) return `${Math.round(parsed)} \u00B0C`;
+        return trimmed;
+      }
+      return formatGridValue(value);
+    }
+    if (col === "efficiency") {
+      if (value === undefined || value === null) return "null";
+      if (typeof value === "number" && Number.isFinite(value)) return `${value.toFixed(2)} J/TH`;
+      if (typeof value === "string") {
+        const parsed = Number.parseFloat(value.trim());
+        if (!Number.isFinite(parsed)) return "null";
+        return `${parsed.toFixed(2)} J/TH`;
+      }
+      return "null";
+    }
+    if (col === "wattage") {
+      if (value === undefined || value === null) return "\u2014";
+      if (typeof value === "number" && Number.isFinite(value)) return `${value.toFixed(2)} W`;
+      if (typeof value === "string") {
+        const parsed = Number.parseFloat(value.trim());
+        if (Number.isFinite(parsed)) return `${parsed.toFixed(2)} W`;
+        return value;
+      }
+      return formatGridValue(value);
     }
     return formatGridValue(value);
+  }
+
+  function formatDelta(col: string, absDelta: number): string {
+    if (col === "average_temperature") return String(Math.round(absDelta));
+    if (col === "efficiency") return absDelta.toFixed(2);
+    if (col === "wattage") return absDelta.toFixed(2);
+    return absDelta.toFixed(2);
+  }
+
+  function movementKey(rowId: string, col: string) {
+    return `${rowId}:${col}`;
+  }
+
+  function formatGridValue(value: unknown) {
+    if (value === undefined) return "\u2014";
+    if (typeof value === "string") return value;
+    return JSON.stringify(value);
+  }
+
+  function formatHashRateValue(value: unknown) {
+    if (value === undefined || value === null) return "\u2014";
+    const scaled = getNormalizedHashRateDisplay(value);
+    if (!scaled) return formatGridValue(value);
+    return `${scaled.amount.toFixed(2)} ${scaled.unit}`;
   }
 
   function formatColumnHeader(col: string) {
@@ -256,6 +414,29 @@
     selectedProfileId = "";
   }
 
+  function normalizeKnownDevices(devices: KnownDevice[]) {
+    const byIp = new Map<string, KnownDevice>();
+    for (const device of devices) {
+      const ip = device.ip.trim();
+      if (!ip) continue;
+      const existing = byIp.get(ip);
+      byIp.set(ip, {
+        ip,
+        mac: device.mac?.trim() || existing?.mac,
+        lastSeenAt: Math.max(existing?.lastSeenAt ?? 0, device.lastSeenAt),
+      });
+    }
+    return [...byIp.values()].sort((a, b) => a.ip.localeCompare(b.ip));
+  }
+
+  function clearKnownDevicesAction() {
+    if (typeof window !== "undefined" && !window.confirm("Clear all persisted known devices?")) {
+      return;
+    }
+    knownDevices = [];
+    clearKnownDevices();
+  }
+
   function flushRows() {
     if (pendingRows.size === 0) return;
     const next = new Map(rows);
@@ -282,15 +463,69 @@
   }
 
   function applyRow(ev: DiscoveryRowEvent) {
-    if (isFinalStatus(ev.status)) {
-      // Show finalized discovery rows immediately when enrichment completes.
-      pendingRows.delete(ev.id);
-      rows = new Map(rows).set(ev.id, ev);
+    const key = rowKeyForEvent(ev);
+    const normalizedEvent = key === ev.id ? ev : { ...ev, id: key };
+    if (activeRunKind === "discover" && normalizedEvent.status === "Miss") {
+      const nextStreak = (missStreakByRow.get(key) ?? 0) + 1;
+      const nextMissStreak = new Map(missStreakByRow);
+      nextMissStreak.set(key, nextStreak);
+      missStreakByRow = nextMissStreak;
+      if (nextStreak >= 3) {
+        pendingRows.delete(key);
+        const nextRows = new Map(rows);
+        nextRows.delete(key);
+        rows = nextRows;
+        const nextMovement = new Map(movementByCell);
+        for (const col of MOVEMENT_COLUMNS) {
+          nextMovement.delete(movementKey(key, col));
+        }
+        movementByCell = nextMovement;
+        const resetMissStreak = new Map(missStreakByRow);
+        resetMissStreak.delete(key);
+        missStreakByRow = resetMissStreak;
+      }
       return;
     }
-    const existing = rows.get(ev.id);
+    if (isFinalStatus(ev.status)) {
+      // Show finalized discovery rows immediately when enrichment completes.
+      pendingRows.delete(key);
+      const previous = rows.get(key);
+      rows = new Map(rows).set(key, normalizedEvent);
+      if (missStreakByRow.has(key)) {
+        const nextMissStreak = new Map(missStreakByRow);
+        nextMissStreak.delete(key);
+        missStreakByRow = nextMissStreak;
+      }
+      const currentRow = normalizedEvent.row ?? {};
+      const previousRow = previous?.row ?? {};
+      const nextMovement = new Map(movementByCell);
+      for (const col of MOVEMENT_COLUMNS) {
+        const prevMetric = parseMetricValue(col, previousRow[col]);
+        const nextMetric = parseMetricValue(col, currentRow[col]);
+        const keyForCell = movementKey(key, col);
+        if (prevMetric === null || nextMetric === null) {
+          nextMovement.delete(keyForCell);
+          continue;
+        }
+        const delta = nextMetric - prevMetric;
+        if (!Number.isFinite(delta) || Math.abs(delta) < 0.000001) {
+          nextMovement.delete(keyForCell);
+          continue;
+        }
+        nextMovement.set(keyForCell, {
+          direction: delta > 0 ? "up" : "down",
+          deltaText:
+            col === "hashrate"
+              ? formatHashRateDeltaHs(Math.abs(delta), currentRow[col])
+              : formatDelta(col, Math.abs(delta)),
+        });
+      }
+      movementByCell = nextMovement;
+      return;
+    }
+    const existing = rows.get(key);
     if (existing && isFinalStatus(existing.status)) return;
-    pendingRows.set(ev.id, ev);
+    pendingRows.set(key, normalizedEvent);
     scheduleCoalesce();
   }
 
@@ -313,6 +548,7 @@
       );
       unlistenFns.push(
         await listen<DiscoveryProgress>(progEv, (e) => {
+          if (activeRunKind !== "discover") return;
           progress = e.payload;
         }),
       );
@@ -320,6 +556,7 @@
         await listen(doneEv, () => {
           busy = false;
           runId = null;
+          activeRunKind = null;
           flushRows();
         }),
       );
@@ -327,6 +564,7 @@
         await listen<{ code: string; message: string }>(errEv, (e) => {
           errorMsg = `${e.payload.code}: ${e.payload.message}`;
           busy = false;
+          activeRunKind = null;
         }),
       );
     } catch (e) {
@@ -335,11 +573,12 @@
   }
 
   async function startRun() {
+    if (activeRunKind) return;
     errorMsg = null;
-    rows = new Map();
     progress = { ...emptyProgress };
     pendingRows.clear();
     busy = true;
+    activeRunKind = "discover";
     const id =
       typeof crypto !== "undefined" && "randomUUID" in crypto
         ? crypto.randomUUID()
@@ -354,6 +593,32 @@
       runId = id;
     } catch (e) {
       busy = false;
+      activeRunKind = null;
+      errorMsg = String(e);
+    }
+  }
+
+  async function startKnownDeviceEnrichRun() {
+    if (busy || knownDevices.length === 0) return;
+    errorMsg = null;
+    pendingRows.clear();
+    busy = true;
+    activeRunKind = "enrich";
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    try {
+      await wireEvents(id);
+      await invoke<string>("enrich_known_devices_run", {
+        runId: id,
+        devices: knownDevices.map((d) => d.ip),
+        settings,
+      });
+      runId = id;
+    } catch (e) {
+      busy = false;
+      activeRunKind = null;
       errorMsg = String(e);
     }
   }
@@ -363,6 +628,7 @@
       try {
         await invoke<number>("stop_all_discovery_runs");
         busy = false;
+        activeRunKind = null;
         return;
       } catch (e) {
         throw e;
@@ -401,7 +667,7 @@
     const merged = new Set<string>([...BASELINE_COLUMN_KEYS, ...rememberedColumnKeys, ...discoveredColumnKeys]);
     const sorted = [...merged].sort();
     const preferredPinned = ["ip", "mac"];
-    const preferredUnpinnedLeft = ["hashrate", "average_temperature", "efficiency"];
+    const preferredUnpinnedLeft = ["hashrate", "average_temperature", "efficiency", "wattage"];
     const pinned = preferredPinned.filter((key) => sorted.includes(key));
     const remaining = sorted.filter((key) => !preferredPinned.includes(key));
     const leftUnpinned = preferredUnpinnedLeft.filter((key) => remaining.includes(key));
@@ -426,7 +692,7 @@
           hide: true,
           width: 110,
           cellClass: (params) => {
-            if (params.value === "Enriched") return "text-emerald-400 font-medium";
+            if (params.value === "Enriched") return "tm-accent-text font-medium";
             if (params.value === "Partial") return "text-amber-400 font-medium";
             return "";
           },
@@ -437,33 +703,48 @@
         field: col,
         headerName: formatColumnHeader(col),
         pinned: col === "ip" || col === "mac" ? "left" : undefined,
-        valueFormatter: (params: ValueFormatterParams<GridRow>) => {
-          if (col === "hashrate") return formatHashRateValue(params.value);
+        valueFormatter: (params: ValueFormatterParams<GridRow>) => formatColumnValue(col, params.value),
+        cellRenderer: (params: ValueFormatterParams<GridRow>) => {
+          const formatted = formatColumnValue(col, params.value);
+          if (!MOVEMENT_COLUMNS.has(col)) return formatted;
+          const rowId = typeof params.data?.id === "string" ? params.data.id : "";
+          if (!rowId) return formatted;
+          const movement = movementByCell.get(movementKey(rowId, col));
+          if (!movement) return formatted;
+          const wrapper = document.createElement("span");
+          wrapper.className = "tm-move-cell";
+          const valueEl = document.createElement("span");
+          valueEl.className = "tm-move-value";
+          valueEl.textContent = formatted;
+          const indicator = document.createElement("span");
+          // average_temperature: up = bad (orange), down = good (ice blue).
+          // efficiency: lower J/TH is better — invert green/red (up = bad, down = good).
+          let colorClass: string;
           if (col === "average_temperature") {
-            const value = params.value;
-            if (value === undefined || value === null) return "\u2014";
-            if (typeof value === "number" && Number.isFinite(value)) return `${Math.round(value)} \u00B0C`;
-            if (typeof value === "string") {
-              const trimmed = value.trim();
-              const parsed = Number.parseFloat(trimmed);
-              if (Number.isFinite(parsed)) return `${Math.round(parsed)} \u00B0C`;
-              return trimmed;
-            }
-            return formatGridValue(value);
+            colorClass = movement.direction === "up" ? "tm-move-temp-up" : "tm-move-temp-down";
+          } else if (col === "efficiency") {
+            colorClass =
+              movement.direction === "up"
+                ? "tm-move-down"
+                : "tm-move-up";
+          } else {
+            colorClass = movement.direction === "up" ? "tm-move-up" : "tm-move-down";
           }
-          if (col === "efficiency") {
-            const value = params.value;
-            if (value === undefined || value === null) return "null";
-            if (typeof value === "number" && Number.isFinite(value)) return `${value.toFixed(2)} J/TH`;
-            if (typeof value === "string") {
-              const trimmed = value.trim();
-              const parsed = Number.parseFloat(trimmed);
-              if (!Number.isFinite(parsed)) return "null";
-              return `${parsed.toFixed(2)} J/TH`;
-            }
-            return "null";
+          indicator.className = `tm-move-indicator ${colorClass}`;
+          indicator.textContent = `${movement.direction === "up" ? "↑" : "↓"} ${movement.direction === "up" ? "+" : "-"}${movement.deltaText}`;
+          wrapper.append(valueEl, indicator);
+          return wrapper;
+        },
+        comparator: (valueA, valueB) => {
+          if (MOVEMENT_COLUMNS.has(col)) {
+            const a = parseMetricValue(col, valueA);
+            const b = parseMetricValue(col, valueB);
+            if (a === null && b === null) return 0;
+            if (a === null) return -1;
+            if (b === null) return 1;
+            return a - b;
           }
-          return formatGridValue(params.value);
+          return String(valueA ?? "").localeCompare(String(valueB ?? ""));
         },
       };
     }),
@@ -476,13 +757,15 @@
   };
 
   const probeProgressPercent = $derived.by(() => {
-    if (progress.totalTargets <= 0) return busy ? 0 : 100;
+    if (progress.totalTargets <= 0) return activeRunKind === "discover" ? 0 : 100;
     return Math.min(100, Math.max(0, (progress.probed / progress.totalTargets) * 100));
   });
+  const discoverInProgress = $derived(activeRunKind === "discover");
 
   onMount(() => {
     settings = loadDiscoverySettings();
     targetProfiles = loadTargetProfiles();
+    knownDevices = loadKnownDevices();
     rememberedColumnKeys = loadGridColumnKeys();
     if (!gridHost) return;
     const gridOptions: GridOptions<GridRow> = {
@@ -491,6 +774,10 @@
       animateRows: true,
       columnDefs: gridColumnDefs,
       rowData: gridRowData,
+      onModelUpdated: () => {
+        if (!gridApi) return;
+        refreshGridLayout();
+      },
       localeText: {
         noRowsToShow: "No responding IPs yet",
       },
@@ -502,6 +789,10 @@
 
   $effect(() => {
     saveTargetProfiles(targetProfiles);
+  });
+
+  $effect(() => {
+    saveKnownDevices(knownDevices);
   });
 
   $effect(() => {
@@ -517,15 +808,93 @@
   });
 
   $effect(() => {
+    if (visibleRowList.length === 0) return;
+    const next = [...knownDevices];
+    let changed = false;
+    for (const row of visibleRowList) {
+      const ip = typeof row.row?.ip === "string" ? row.row.ip.trim() : "";
+      if (!ip) continue;
+      const mac = typeof row.row?.mac === "string" ? row.row.mac.trim() : undefined;
+      const existingIdx = next.findIndex((d) => d.ip === ip);
+      if (existingIdx >= 0) {
+        const existing = next[existingIdx];
+        const resolvedMac = mac || existing.mac;
+        if (resolvedMac !== existing.mac) {
+          next[existingIdx] = {
+            ...existing,
+            mac: resolvedMac,
+            lastSeenAt: Date.now(),
+          };
+          changed = true;
+        }
+      } else {
+        next.push({
+          ip,
+          mac,
+          lastSeenAt: Date.now(),
+        });
+        changed = true;
+      }
+    }
+    if (changed) {
+      knownDevices = normalizeKnownDevices(next);
+    }
+  });
+
+  $effect(() => {
+    if (autoDiscoverTimer) {
+      clearInterval(autoDiscoverTimer);
+      autoDiscoverTimer = null;
+    }
+    if (!settings.autoDiscoverEnabled) return;
+    const intervalMs = Math.max(5, settings.autoDiscoverIntervalSec) * 1000;
+    autoDiscoverTimer = setInterval(() => {
+      if (busy) return;
+      void startRun();
+    }, intervalMs);
+    return () => {
+      if (autoDiscoverTimer) {
+        clearInterval(autoDiscoverTimer);
+        autoDiscoverTimer = null;
+      }
+    };
+  });
+
+  $effect(() => {
+    if (autoEnrichTimer) {
+      clearInterval(autoEnrichTimer);
+      autoEnrichTimer = null;
+    }
+    if (!settings.autoEnrichEnabled) return;
+    const intervalMs = Math.max(5, settings.autoEnrichIntervalSec) * 1000;
+    autoEnrichTimer = setInterval(() => {
+      if (busy || knownDevices.length === 0) return;
+      void startKnownDeviceEnrichRun();
+    }, intervalMs);
+    return () => {
+      if (autoEnrichTimer) {
+        clearInterval(autoEnrichTimer);
+        autoEnrichTimer = null;
+      }
+    };
+  });
+
+  $effect(() => {
     if (!gridApi) return;
-    gridApi.setGridOption("columnDefs", gridColumnDefs);
-    gridApi.setGridOption("rowData", gridRowData);
-    requestAnimationFrame(() => refreshGridLayout());
+    const api = gridApi;
+    api.setGridOption("columnDefs", gridColumnDefs);
+    api.setGridOption("rowData", gridRowData);
+    requestAnimationFrame(() => {
+      if (gridApi !== api) return;
+      refreshGridLayout();
+    });
   });
 
   onDestroy(() => {
     for (const u of unlistenFns) void u();
     if (coalesceTimer) clearTimeout(coalesceTimer);
+    if (autoDiscoverTimer) clearInterval(autoDiscoverTimer);
+    if (autoEnrichTimer) clearInterval(autoEnrichTimer);
     gridApi?.destroy();
     gridApi = null;
   });
@@ -533,8 +902,9 @@
 
 <div class="flex h-dvh w-full flex-col gap-3 p-4">
   <header class="flex flex-wrap items-end justify-between gap-3 pb-4">
-    <div>
-      <h1 class="text-xl font-semibold tracking-tight text-emerald-400">Terra Mine</h1>
+    <div class="flex items-center gap-2">
+      <img src="/terra-mine-logo.png" alt="TerraMine logo" class="h-7 w-7 object-contain" />
+      <h1 class="text-lg font-semibold tracking-tight tm-accent-text">TerraMine</h1>
     </div>
     <div class="flex flex-wrap items-end gap-2">
       <div class="flex flex-col gap-1">
@@ -573,6 +943,15 @@
         >
           Delete
         </button>
+        <button
+          type="button"
+          class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-40"
+          disabled={knownDevices.length === 0}
+          onclick={clearKnownDevicesAction}
+          title="Clear persisted known devices"
+        >
+          Clear devices ({knownDevices.length})
+        </button>
       </div>
       <a
         href="/settings"
@@ -584,8 +963,8 @@
       </a>
       <button
         type="button"
-        class="h-10 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
-        disabled={busy}
+        class="h-10 rounded-lg tm-accent-bg px-4 py-2 text-sm font-medium text-black hover:text-black disabled:opacity-40"
+        disabled={discoverInProgress}
         onclick={startRun}
       >
         Discover

@@ -27,6 +27,39 @@ pub async fn start_discovery_run(
     targets: String,
     settings: DiscoverySettings,
 ) -> Result<String, String> {
+    start_discovery_run_internal(app, state, run_id, targets, settings).await
+}
+
+#[tauri::command]
+pub async fn enrich_known_devices_run(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: Option<String>,
+    devices: Vec<String>,
+    settings: DiscoverySettings,
+) -> Result<String, String> {
+    if devices.is_empty() {
+        return Err("devices must not be empty".to_string());
+    }
+    let targets = devices
+        .into_iter()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if targets.is_empty() {
+        return Err("devices must not be empty".to_string());
+    }
+    start_discovery_run_internal(app, state, run_id, targets, settings).await
+}
+
+async fn start_discovery_run_internal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    run_id: Option<String>,
+    targets: String,
+    settings: DiscoverySettings,
+) -> Result<String, String> {
     let targets = targets.trim().to_string();
     if targets.is_empty() {
         return Err("targets must not be empty".to_string());

@@ -9,7 +9,8 @@
   --tm-border: #27272a; /* zinc-800 */
   --tm-text: #f4f4f5; /* zinc-100 */
   --tm-text-muted: #a1a1aa; /* zinc-400 */
-  --tm-accent: #34d399; /* emerald-400 */
+  --tm-accent: #47823e; /* TerraMine logo green */
+  --tm-accent-hover: #3f7337; /* slightly deeper hover accent */
 }
 
 html,
@@ -19,7 +20,7 @@ body {
   color: var(--tm-text);
 }
 
-/* Keep AG Grid aligned with the app's dark zinc + emerald palette. */
+/* Keep AG Grid aligned with the app's dark zinc + TerraMine accent palette. */
 .ag-theme-quartz-dark {
   --ag-background-color: var(--tm-bg);
   --ag-data-background-color: var(--tm-bg);
@@ -37,8 +38,8 @@ body {
   --ag-input-border-color: var(--tm-border);
   --ag-input-background-color: var(--tm-bg);
   --ag-input-focus-border-color: var(--tm-accent);
-  --ag-selected-row-background-color: rgba(52, 211, 153, 0.16);
-  --ag-range-selection-border-color: rgba(52, 211, 153, 0.75);
+  --ag-selected-row-background-color: rgba(71, 130, 62, 0.16);
+  --ag-range-selection-border-color: rgba(71, 130, 62, 0.75);
   --ag-checkbox-checked-color: var(--tm-accent);
   --ag-font-size: 12px;
   --ag-font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -120,6 +121,56 @@ body {
 .ag-theme-quartz-dark .ag-cell-inline-editing {
   box-shadow: none !important;
   outline: none !important;
+}
+
+.tm-accent-text {
+  color: var(--tm-accent);
+}
+
+/* Ensure AG Grid cell text utility wins theme defaults. */
+.ag-theme-quartz-dark .tm-accent-text {
+  color: var(--tm-accent) !important;
+}
+
+.tm-accent-bg {
+  background-color: var(--tm-accent);
+}
+
+.tm-accent-bg:hover {
+  background-color: var(--tm-accent-hover);
+}
+
+.tm-move-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.tm-move-value {
+  color: inherit;
+}
+
+.tm-move-indicator {
+  font-size: 0.78em;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.tm-move-up {
+  color: var(--tm-accent);
+}
+
+.tm-move-down {
+  color: #f43f5e;
+}
+
+/* Avg temp: higher °C is worse (heat), lower is better (cool). */
+.tm-move-temp-up {
+  color: #fb923c;
+}
+
+.tm-move-temp-down {
+  color: #7dd3fc;
 }
 
 .ag-theme-quartz-dark .ag-overlay-no-rows-center {
