@@ -31,6 +31,13 @@
     type KnownDevice,
     type TargetProfile,
   } from "$lib/discoverySettingsStorage";
+  import {
+    discoveryWorkbench,
+    emptyWorkbenchProgress,
+    workbenchPendingRows,
+  } from "$lib/discoveryWorkbenchRuntime.svelte";
+
+  const MAIN_UI_SESSION_KEY = "tm.discovery:mainUiSession:v1";
 
   let targets = $state("192.168.1.0/24");
   let settings = $state<DiscoverySettings>({ ...defaultDiscoverySettings });
@@ -39,17 +46,6 @@
   let errorMsg = $state<string | null>(null);
   let activeRunKind = $state<"discover" | "enrich" | null>(null);
 
-  const emptyProgress: DiscoveryProgress = {
-    totalTargets: 0,
-    probed: 0,
-    alive: 0,
-    missed: 0,
-    enriched: 0,
-    partial: 0,
-    cancelled: 0,
-  };
-  let progress = $state<DiscoveryProgress>({ ...emptyProgress });
-  let rows = $state<Map<string, DiscoveryRowEvent>>(new Map());
   let targetProfiles = $state<TargetProfile[]>([]);
   let selectedProfileId = $state(DEFAULT_PROFILE_ID);
   let profileDrawerOpen = $state(false);
@@ -68,15 +64,12 @@
 
   let unlistenFns: UnlistenFn[] = [];
   let coalesceTimer: ReturnType<typeof setTimeout> | null = null;
-  let pendingRows = new Map<string, DiscoveryRowEvent>();
-  let missStreakByRow = $state<Map<string, number>>(new Map());
   let gridHost: HTMLDivElement | null = null;
   let gridApi: GridApi<GridRow> | null = null;
   let autoDiscoverTimer: ReturnType<typeof setInterval> | null = null;
   let autoEnrichTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped when the active target profile/spec changes so auto-discover/enrich timers reset their interval clocks. */
   let autoLoopRestartEpoch = $state(0);
-  let movementByCell = $state<Map<string, { direction: "up" | "down"; deltaText: string }>>(new Map());
 
   type GridRow = {
     id: string;
@@ -415,7 +408,7 @@
     unlistenFns = [];
     if (coalesceTimer) clearTimeout(coalesceTimer);
     coalesceTimer = null;
-    pendingRows.clear();
+    workbenchPendingRows.clear();
     busy = false;
     runId = null;
     activeRunKind = null;
@@ -431,7 +424,7 @@
       const ip = d.ip.trim();
       if (ip) candidates.add(ip);
     }
-    for (const ev of rows.values()) {
+    for (const ev of discoveryWorkbench.rows.values()) {
       const ip = typeof ev.row?.ip === "string" ? ev.row.ip.trim() : "";
       if (ip) candidates.add(ip);
     }
@@ -447,30 +440,30 @@
 
       knownDevices = knownDevices.filter((d) => keptSet.has(d.ip.trim()));
 
-      const nextRows = new Map(rows);
-      for (const [k, ev] of rows) {
+      const nextRows = new Map(discoveryWorkbench.rows);
+      for (const [k, ev] of discoveryWorkbench.rows) {
         const ip = typeof ev.row?.ip === "string" ? ev.row.ip.trim() : "";
         if (ip && !keptSet.has(ip)) nextRows.delete(k);
       }
-      rows = nextRows;
+      discoveryWorkbench.rows = nextRows;
 
-      for (const k of [...pendingRows.keys()]) {
-        if (!keptSet.has(k)) pendingRows.delete(k);
+      for (const k of [...workbenchPendingRows.keys()]) {
+        if (!keptSet.has(k)) workbenchPendingRows.delete(k);
       }
 
-      const nextMiss = new Map(missStreakByRow);
+      const nextMiss = new Map(discoveryWorkbench.missStreakByRow);
       for (const rk of [...nextMiss.keys()]) {
         if (!keptSet.has(rk)) nextMiss.delete(rk);
       }
-      missStreakByRow = nextMiss;
+      discoveryWorkbench.missStreakByRow = nextMiss;
 
-      const nextMovement = new Map(movementByCell);
+      const nextMovement = new Map(discoveryWorkbench.movementByCell);
       for (const key of [...nextMovement.keys()]) {
         const idx = key.lastIndexOf(":");
         const rowId = idx > 0 ? key.slice(0, idx) : "";
         if (rowId && !keptSet.has(rowId)) nextMovement.delete(key);
       }
-      movementByCell = nextMovement;
+      discoveryWorkbench.movementByCell = nextMovement;
     } catch (e) {
       console.warn("prune targets: filter_ips_matching_targets failed", e);
     }
@@ -619,11 +612,11 @@
   function executeClearKnownDevices() {
     knownDevices = [];
     clearKnownDevices();
-    pendingRows.clear();
-    rows = new Map();
-    missStreakByRow = new Map();
-    movementByCell = new Map();
-    progress = { ...emptyProgress };
+    workbenchPendingRows.clear();
+    discoveryWorkbench.rows = new Map();
+    discoveryWorkbench.missStreakByRow = new Map();
+    discoveryWorkbench.movementByCell = new Map();
+    discoveryWorkbench.progress = { ...emptyWorkbenchProgress() };
     clearDevicesConfirmPending = false;
   }
 
@@ -637,15 +630,15 @@
   }
 
   function flushRows() {
-    if (pendingRows.size === 0) return;
-    const next = new Map(rows);
-    for (const [k, v] of pendingRows) {
+    if (workbenchPendingRows.size === 0) return;
+    const next = new Map(discoveryWorkbench.rows);
+    for (const [k, v] of workbenchPendingRows) {
       const existing = next.get(k);
       if (existing && isFinalStatus(existing.status) && !isFinalStatus(v.status)) continue;
       next.set(k, v);
     }
-    pendingRows.clear();
-    rows = next;
+    workbenchPendingRows.clear();
+    discoveryWorkbench.rows = next;
   }
 
   function scheduleCoalesce() {
@@ -665,39 +658,39 @@
     const key = rowKeyForEvent(ev);
     const normalizedEvent = key === ev.id ? ev : { ...ev, id: key };
     if (activeRunKind === "discover" && normalizedEvent.status === "Miss") {
-      const nextStreak = (missStreakByRow.get(key) ?? 0) + 1;
-      const nextMissStreak = new Map(missStreakByRow);
+      const nextStreak = (discoveryWorkbench.missStreakByRow.get(key) ?? 0) + 1;
+      const nextMissStreak = new Map(discoveryWorkbench.missStreakByRow);
       nextMissStreak.set(key, nextStreak);
-      missStreakByRow = nextMissStreak;
+      discoveryWorkbench.missStreakByRow = nextMissStreak;
       if (nextStreak >= 3) {
-        pendingRows.delete(key);
-        const nextRows = new Map(rows);
+        workbenchPendingRows.delete(key);
+        const nextRows = new Map(discoveryWorkbench.rows);
         nextRows.delete(key);
-        rows = nextRows;
-        const nextMovement = new Map(movementByCell);
+        discoveryWorkbench.rows = nextRows;
+        const nextMovement = new Map(discoveryWorkbench.movementByCell);
         for (const col of MOVEMENT_COLUMNS) {
           nextMovement.delete(movementKey(key, col));
         }
-        movementByCell = nextMovement;
-        const resetMissStreak = new Map(missStreakByRow);
+        discoveryWorkbench.movementByCell = nextMovement;
+        const resetMissStreak = new Map(discoveryWorkbench.missStreakByRow);
         resetMissStreak.delete(key);
-        missStreakByRow = resetMissStreak;
+        discoveryWorkbench.missStreakByRow = resetMissStreak;
       }
       return;
     }
     if (isFinalStatus(ev.status)) {
       // Show finalized discovery rows immediately when enrichment completes.
-      pendingRows.delete(key);
-      const previous = rows.get(key);
-      rows = new Map(rows).set(key, normalizedEvent);
-      if (missStreakByRow.has(key)) {
-        const nextMissStreak = new Map(missStreakByRow);
+      workbenchPendingRows.delete(key);
+      const previous = discoveryWorkbench.rows.get(key);
+      discoveryWorkbench.rows = new Map(discoveryWorkbench.rows).set(key, normalizedEvent);
+      if (discoveryWorkbench.missStreakByRow.has(key)) {
+        const nextMissStreak = new Map(discoveryWorkbench.missStreakByRow);
         nextMissStreak.delete(key);
-        missStreakByRow = nextMissStreak;
+        discoveryWorkbench.missStreakByRow = nextMissStreak;
       }
       const currentRow = normalizedEvent.row ?? {};
       const previousRow = previous?.row ?? {};
-      const nextMovement = new Map(movementByCell);
+      const nextMovement = new Map(discoveryWorkbench.movementByCell);
       for (const col of MOVEMENT_COLUMNS) {
         const prevMetric = parseMetricValue(col, previousRow[col]);
         const nextMetric = parseMetricValue(col, currentRow[col]);
@@ -719,12 +712,12 @@
               : formatDelta(col, Math.abs(delta)),
         });
       }
-      movementByCell = nextMovement;
+      discoveryWorkbench.movementByCell = nextMovement;
       return;
     }
-    const existing = rows.get(key);
+    const existing = discoveryWorkbench.rows.get(key);
     if (existing && isFinalStatus(existing.status)) return;
-    pendingRows.set(key, normalizedEvent);
+    workbenchPendingRows.set(key, normalizedEvent);
     scheduleCoalesce();
   }
 
@@ -748,7 +741,7 @@
       unlistenFns.push(
         await listen<DiscoveryProgress>(progEv, (e) => {
           if (activeRunKind !== "discover") return;
-          progress = e.payload;
+          discoveryWorkbench.progress = e.payload;
         }),
       );
       unlistenFns.push(
@@ -774,8 +767,8 @@
   async function startRun() {
     if (activeRunKind) return;
     errorMsg = null;
-    progress = { ...emptyProgress };
-    pendingRows.clear();
+    discoveryWorkbench.progress = { ...emptyWorkbenchProgress() };
+    workbenchPendingRows.clear();
     busy = true;
     activeRunKind = "discover";
     const id =
@@ -800,7 +793,7 @@
   async function startKnownDeviceEnrichRun() {
     if (busy || knownDevices.length === 0) return;
     errorMsg = null;
-    pendingRows.clear();
+    workbenchPendingRows.clear();
     busy = true;
     activeRunKind = "enrich";
     const id =
@@ -841,7 +834,7 @@
   }
 
   const rowList = $derived(
-    [...rows.values()].sort((a, b) => a.id.localeCompare(b.id)),
+    [...discoveryWorkbench.rows.values()].sort((a, b) => a.id.localeCompare(b.id)),
   );
 
   const visibleRowList = $derived(
@@ -908,7 +901,7 @@
           if (!MOVEMENT_COLUMNS.has(col)) return formatted;
           const rowId = typeof params.data?.id === "string" ? params.data.id : "";
           if (!rowId) return formatted;
-          const movement = movementByCell.get(movementKey(rowId, col));
+          const movement = discoveryWorkbench.movementByCell.get(movementKey(rowId, col));
           if (!movement) return formatted;
           const wrapper = document.createElement("span");
           wrapper.className = "tm-move-cell";
@@ -956,18 +949,38 @@
   };
 
   const probeProgressPercent = $derived.by(() => {
-    if (progress.totalTargets <= 0) return activeRunKind === "discover" ? 0 : 100;
-    return Math.min(100, Math.max(0, (progress.probed / progress.totalTargets) * 100));
+    if (discoveryWorkbench.progress.totalTargets <= 0) return activeRunKind === "discover" ? 0 : 100;
+    return Math.min(100, Math.max(0, (discoveryWorkbench.progress.probed / discoveryWorkbench.progress.totalTargets) * 100));
   });
   const discoverInProgress = $derived(activeRunKind === "discover");
 
   onMount(() => {
     settings = loadDiscoverySettings();
     targetProfiles = normalizeTargetProfiles(loadTargetProfiles());
-    const def = targetProfiles.find((p) => p.id === DEFAULT_PROFILE_ID);
-    if (def) {
-      targets = def.targets;
-      selectedProfileId = DEFAULT_PROFILE_ID;
+    let restoredSession = false;
+    if (typeof window !== "undefined") {
+      try {
+        const raw = window.sessionStorage.getItem(MAIN_UI_SESSION_KEY);
+        if (raw) {
+          const o = JSON.parse(raw) as { selectedProfileId?: unknown; targets?: unknown };
+          const sid = typeof o.selectedProfileId === "string" ? o.selectedProfileId : "";
+          const t = typeof o.targets === "string" ? o.targets : "";
+          if (sid && targetProfiles.some((p) => p.id === sid)) {
+            selectedProfileId = sid;
+            targets = t;
+            restoredSession = true;
+          }
+        }
+      } catch {
+        // ignore malformed session blob
+      }
+    }
+    if (!restoredSession) {
+      const def = targetProfiles.find((p) => p.id === DEFAULT_PROFILE_ID);
+      if (def) {
+        targets = def.targets;
+        selectedProfileId = DEFAULT_PROFILE_ID;
+      }
     }
     knownDevices = loadKnownDevices();
     rememberedColumnKeys = loadGridColumnKeys();
@@ -1012,6 +1025,22 @@
   $effect(() => {
     if (!discoveryListsPersistAllowed) return;
     saveKnownDevices(knownDevices);
+  });
+
+  $effect(() => {
+    if (typeof window === "undefined" || !discoveryListsPersistAllowed) return;
+    const sid = selectedProfileId;
+    const t = targets;
+    queueMicrotask(() => {
+      try {
+        window.sessionStorage.setItem(
+          MAIN_UI_SESSION_KEY,
+          JSON.stringify({ selectedProfileId: sid, targets: t }),
+        );
+      } catch {
+        // ignore quota / private mode
+      }
+    });
   });
 
   $effect(() => {
@@ -1218,8 +1247,10 @@
       </button>
       <button
         type="button"
-        class="h-10 rounded-lg border border-zinc-600 px-4 py-2 text-sm hover:bg-zinc-900"
+        class="h-10 rounded-lg border border-zinc-600 px-4 py-2 text-sm hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-40"
+        disabled={!discoverInProgress}
         onclick={stopRun}
+        title={discoverInProgress ? "" : "Only available while Discover is running"}
       >
         Stop
       </button>
@@ -1240,13 +1271,13 @@
       ></div>
     </div>
     <div class="flex flex-wrap gap-3 text-xs text-zinc-400">
-      <span>Total {progress.totalTargets}</span>
-      <span>Probed {progress.probed}</span>
-      <span>Alive {progress.alive}</span>
-      <span>Miss {progress.missed}</span>
-      <span>Enriched {progress.enriched}</span>
-      <span>Partial {progress.partial}</span>
-      <span>Cancelled {progress.cancelled}</span>
+      <span>Total {discoveryWorkbench.progress.totalTargets}</span>
+      <span>Probed {discoveryWorkbench.progress.probed}</span>
+      <span>Alive {discoveryWorkbench.progress.alive}</span>
+      <span>Miss {discoveryWorkbench.progress.missed}</span>
+      <span>Enriched {discoveryWorkbench.progress.enriched}</span>
+      <span>Partial {discoveryWorkbench.progress.partial}</span>
+      <span>Cancelled {discoveryWorkbench.progress.cancelled}</span>
     </div>
   </div>
 
