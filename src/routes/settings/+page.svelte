@@ -1,101 +1,202 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { defaultDiscoverySettings, type DiscoverySettings } from "$lib/discoveryDefaults";
+  import { goto } from "$app/navigation";
+  import {
+    cloneDiscoverySettings,
+    defaultDiscoverySettings,
+    finalizeDiscoverySettingsForSave,
+    type DiscoverySettings,
+  } from "$lib/discoveryDefaults";
   import { loadDiscoverySettings, saveDiscoverySettings } from "$lib/discoverySettingsStorage";
+  import DiscoveryUIntField from "$lib/DiscoveryUIntField.svelte";
 
-  let settings = $state<DiscoverySettings>({ ...defaultDiscoverySettings });
+  /** Stable key order so fingerprints match across load/save and dirty checks. */
+  function fingerprintFromSettings(s: DiscoverySettings): string {
+    return JSON.stringify({
+      probeTimeoutSec: s.probeTimeoutSec,
+      probeConcurrency: s.probeConcurrency,
+      probeRateLimitPerSec: s.probeRateLimitPerSec,
+      enrichTimeoutSec: s.enrichTimeoutSec,
+      enrichConcurrency: s.enrichConcurrency,
+      enrichRateLimitPerSec: s.enrichRateLimitPerSec,
+      autoDiscoverEnabled: s.autoDiscoverEnabled,
+      autoDiscoverIntervalSec: s.autoDiscoverIntervalSec,
+      autoEnrichEnabled: s.autoEnrichEnabled,
+      autoEnrichIntervalSec: s.autoEnrichIntervalSec,
+      retryJitterMs: s.retryJitterMs,
+      probeQueueCap: s.probeQueueCap,
+      enrichQueueCap: s.enrichQueueCap,
+      uiCoalesceMs: s.uiCoalesceMs,
+    });
+  }
+
+  let draft = $state<DiscoverySettings>(cloneDiscoverySettings(defaultDiscoverySettings));
+  /** Last saved copy (deep-compared via JSON for dirty detection). */
+  let savedFingerprint = $state("");
+
+  /** Explicit field reads so nested `draft.*` edits invalidate dirty state reliably. */
+  const draftFingerprint = $derived.by(() => fingerprintFromSettings(draft));
+
+  const dirty = $derived(savedFingerprint !== "" && savedFingerprint !== draftFingerprint);
+
+  let navigateAwayPending = $state(false);
 
   onMount(() => {
-    settings = loadDiscoverySettings();
+    const loaded = loadDiscoverySettings();
+    draft = cloneDiscoverySettings(loaded);
+    savedFingerprint = fingerprintFromSettings(draft);
   });
 
-  $effect(() => {
-    settings.autoDiscoverIntervalSec = Math.max(5, Math.round(settings.autoDiscoverIntervalSec || 0));
-    settings.autoEnrichIntervalSec = Math.max(5, Math.round(settings.autoEnrichIntervalSec || 0));
-  });
+  function persistDraftFromUi() {
+    draft = finalizeDiscoverySettingsForSave(draft);
+    saveDiscoverySettings(draft);
+    savedFingerprint = fingerprintFromSettings(draft);
+  }
 
-  $effect(() => {
-    saveDiscoverySettings(settings);
-  });
+  function saveClick() {
+    persistDraftFromUi();
+    navigateAwayPending = false;
+  }
+
+  function revertClick() {
+    if (!savedFingerprint) {
+      draft = cloneDiscoverySettings(defaultDiscoverySettings);
+      navigateAwayPending = false;
+      return;
+    }
+    const parsed = JSON.parse(savedFingerprint) as DiscoverySettings;
+    draft = cloneDiscoverySettings(parsed);
+    navigateAwayPending = false;
+  }
+
+  function goHome() {
+    void goto("/");
+  }
+
+  function backClick() {
+    if (!dirty) {
+      goHome();
+      return;
+    }
+    navigateAwayPending = true;
+  }
+
+  function discardAndLeave() {
+    navigateAwayPending = false;
+    goHome();
+  }
+
+  function saveAndLeave() {
+    persistDraftFromUi();
+    navigateAwayPending = false;
+    goHome();
+  }
+
+  function cancelNavigateAway() {
+    navigateAwayPending = false;
+  }
 </script>
 
 <div class="mx-auto flex min-h-full w-full max-w-3xl flex-col gap-4 p-4">
-  <header class="flex items-center justify-between border-b border-zinc-800 pb-3">
+  <header class="flex flex-wrap items-start justify-between gap-3 border-b border-zinc-800 pb-3">
     <div>
       <h1 class="text-xl font-semibold tracking-tight tm-accent-text">Run settings</h1>
       <p class="text-sm text-zinc-500">Discovery probe/enrichment configuration</p>
+      {#if dirty}
+        <p class="mt-2 text-xs text-amber-400/95">You have unsaved changes. Save applies to the main discovery view.</p>
+      {/if}
     </div>
-    <a href="/" class="rounded-lg border border-zinc-600 px-3 py-1.5 text-sm hover:bg-zinc-900">Back</a>
+    <div class="flex flex-wrap items-center gap-2">
+      <button
+        type="button"
+        class="rounded-lg border border-zinc-600 px-3 py-1.5 text-sm hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-40"
+        onclick={revertClick}
+        disabled={!dirty}
+      >
+        Revert
+      </button>
+      <button
+        type="button"
+        class="rounded-lg border border-green-900/70 bg-green-900/55 px-3 py-1.5 text-sm text-green-100 hover:bg-green-900/85 disabled:cursor-not-allowed disabled:opacity-40"
+        onclick={saveClick}
+        disabled={!dirty}
+      >
+        Save
+      </button>
+      <button
+        type="button"
+        class="rounded-lg border border-zinc-600 px-3 py-1.5 text-sm hover:bg-zinc-900"
+        onclick={backClick}
+      >
+        Back
+      </button>
+    </div>
   </header>
 
-  <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
-    <div class="grid grid-cols-2 gap-2 text-xs">
-      <label class="col-span-2 flex flex-col gap-1">
-        <span class="text-zinc-500">Probe timeout (s)</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.probeTimeoutSec} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Probe conc.</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.probeConcurrency} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Enrich conc.</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.enrichConcurrency} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Enrich timeout (s)</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.enrichTimeoutSec} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Probe rate/s (0=off)</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.probeRateLimitPerSec} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Enrich rate/s (0=off)</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.enrichRateLimitPerSec} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Retry jitter (ms)</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.retryJitterMs} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">UI coalesce (ms)</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.uiCoalesceMs} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Queue cap</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.probeQueueCap} />
-      </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Enrich cap</span>
-        <input class="rounded bg-zinc-950 px-2 py-1" type="number" bind:value={settings.enrichQueueCap} />
-      </label>
+  {#if navigateAwayPending}
+    <div
+      class="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-900/60 bg-amber-950/40 px-3 py-2 text-sm text-amber-100"
+      role="status"
+    >
+      <span>Save settings before returning? Unsaved edits are not loaded on the main page.</span>
+      <div class="flex flex-wrap gap-2">
+        <button
+          type="button"
+          class="rounded-lg border border-zinc-600 px-2 py-1 text-xs hover:bg-zinc-900"
+          onclick={cancelNavigateAway}
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          class="rounded-lg border border-red-900/70 bg-red-950/55 px-2 py-1 text-xs text-red-100 hover:bg-red-950/85"
+          onclick={discardAndLeave}
+        >
+          Discard
+        </button>
+        <button
+          type="button"
+          class="rounded-lg border border-green-900/70 bg-green-900/55 px-2 py-1 text-xs text-green-100 hover:bg-green-900/85"
+          onclick={saveAndLeave}
+        >
+          Save &amp; Back
+        </button>
+      </div>
+    </div>
+  {/if}
+
+  <section class="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 text-xs">
+    <div class="grid grid-cols-2 gap-2">
+      <DiscoveryUIntField label="Probe timeout (s)" class="col-span-2" bind:value={draft.probeTimeoutSec} min={1} />
+      <DiscoveryUIntField label="Probe conc." bind:value={draft.probeConcurrency} min={1} />
+      <DiscoveryUIntField label="Enrich conc." bind:value={draft.enrichConcurrency} min={1} />
+      <DiscoveryUIntField label="Enrich timeout (s)" bind:value={draft.enrichTimeoutSec} min={1} />
+      <DiscoveryUIntField label="Probe rate/s (0=off)" bind:value={draft.probeRateLimitPerSec} min={0} />
+      <DiscoveryUIntField label="Enrich rate/s (0=off)" bind:value={draft.enrichRateLimitPerSec} min={0} />
+      <DiscoveryUIntField label="Retry jitter (ms)" bind:value={draft.retryJitterMs} min={0} />
+      <DiscoveryUIntField label="UI coalesce (ms)" bind:value={draft.uiCoalesceMs} min={0} />
+      <DiscoveryUIntField label="Queue cap" bind:value={draft.probeQueueCap} min={1} />
+      <DiscoveryUIntField label="Enrich cap" bind:value={draft.enrichQueueCap} min={1} />
       <label class="col-span-2 flex items-center gap-2">
-        <input type="checkbox" bind:checked={settings.autoDiscoverEnabled} />
+        <input type="checkbox" bind:checked={draft.autoDiscoverEnabled} />
         <span class="text-zinc-500">Enable auto-discover loop</span>
       </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Auto-discover interval (s)</span>
-        <input
-          class="rounded bg-zinc-950 px-2 py-1"
-          type="number"
-          min="5"
-          bind:value={settings.autoDiscoverIntervalSec}
-        />
-      </label>
+      <DiscoveryUIntField
+        label="Auto-discover interval (s)"
+        class="col-span-2"
+        bind:value={draft.autoDiscoverIntervalSec}
+        min={5}
+      />
       <label class="col-span-2 flex items-center gap-2">
-        <input type="checkbox" bind:checked={settings.autoEnrichEnabled} />
+        <input type="checkbox" bind:checked={draft.autoEnrichEnabled} />
         <span class="text-zinc-500">Enable auto-enrich loop</span>
       </label>
-      <label class="flex flex-col gap-1">
-        <span class="text-zinc-500">Auto-enrich interval (s)</span>
-        <input
-          class="rounded bg-zinc-950 px-2 py-1"
-          type="number"
-          min="5"
-          bind:value={settings.autoEnrichIntervalSec}
-        />
-      </label>
+      <DiscoveryUIntField
+        label="Auto-enrich interval (s)"
+        class="col-span-2"
+        bind:value={draft.autoEnrichIntervalSec}
+        min={5}
+      />
     </div>
   </section>
 </div>
