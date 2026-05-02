@@ -6,6 +6,7 @@
     type ColDef,
     type GridApi,
     type GridOptions,
+    type ICellRendererParams,
     type ValueFormatterParams,
   } from "ag-grid-community";
   import { invoke } from "@tauri-apps/api/core";
@@ -91,6 +92,7 @@
   const MOVEMENT_COLUMNS = new Set(["hashrate", "average_temperature", "efficiency", "wattage"]);
   const GRID_COLUMN_KEYS_STORAGE_KEY = "tm:discovery:grid-column-keys:v1";
   const BASELINE_COLUMN_KEYS = ["ip", "discovery"];
+  const LEGACY_DEVICE_INFO_KEYS = new Set(["device_info", "deviceInfo", "deviceInformation"]);
 
   function isFinalStatus(status: DiscoveryRowEvent["status"]) {
     return status === "Enriched" || status === "Partial";
@@ -108,7 +110,9 @@
       if (!raw) return [...BASELINE_COLUMN_KEYS];
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [...BASELINE_COLUMN_KEYS];
-      const keys = parsed.filter((key): key is string => typeof key === "string" && key.length > 0);
+      const keys = parsed
+        .filter((key): key is string => typeof key === "string" && key.length > 0)
+        .filter((key) => !LEGACY_DEVICE_INFO_KEYS.has(key));
       return [...new Set([...BASELINE_COLUMN_KEYS, ...keys])];
     } catch {
       return [...BASELINE_COLUMN_KEYS];
@@ -307,6 +311,218 @@
     return null;
   }
 
+  /** JSON string or hashrate-shaped object → H/s (same rules as `parseHashRateToHs`). */
+  function parseJsonOrValueAsHashrateHs(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw === "string") {
+      const t = raw.trim();
+      if (!t) return null;
+      if (t.startsWith("{")) {
+        try {
+          return parseHashRateToHs(JSON.parse(t) as unknown);
+        } catch {
+          return null;
+        }
+      }
+      return parseHashRateToHs(t);
+    }
+    return parseHashRateToHs(raw);
+  }
+
+  /** Current hashrate (H/s) vs expected JSON blob, as a percentage (may exceed 100). */
+  function hashrateVersusExpectedPercentFromRow(row: GridRow | null | undefined): number | null {
+    if (!row) return null;
+    const rec = row as Record<string, unknown>;
+    const expRaw = rec.expected_hashrate ?? rec.expectedHashrate;
+    const expectedHs = parseJsonOrValueAsHashrateHs(expRaw);
+    const currentHs = parseHashRateToHs(rec.hashrate);
+    if (expectedHs === null || expectedHs <= 0 || currentHs === null || !Number.isFinite(currentHs) || currentHs < 0)
+      return null;
+    return (currentHs / expectedHs) * 100;
+  }
+
+  type CountVersusExpectedKind = "chips" | "fans" | "hashboards";
+
+  function parseNonnegInt(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return Math.trunc(value);
+    if (typeof value === "string") {
+      const parsed = Number.parseInt(value.trim(), 10);
+      if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+    }
+    return null;
+  }
+
+  /** Miner `MinerData`: expected_* vs totals / array lengths (snake_case JSON from asic-rs). */
+  function countVersusExpectedFromRow(
+    row: GridRow | null | undefined,
+    kind: CountVersusExpectedKind,
+  ): { actual: number; expected: number; pct: number } | null {
+    if (!row) return null;
+    const rec = row as Record<string, unknown>;
+    let expected: number | null = null;
+    let actual: number | null = null;
+    if (kind === "chips") {
+      expected = parseNonnegInt(rec.expected_chips ?? rec.expectedChips);
+      actual = parseNonnegInt(rec.total_chips ?? rec.totalChips);
+    } else if (kind === "fans") {
+      expected = parseNonnegInt(rec.expected_fans ?? rec.expectedFans);
+      const fans = rec.fans;
+      actual = Array.isArray(fans) ? fans.length : null;
+    } else {
+      expected = parseNonnegInt(rec.expected_hashboards ?? rec.expectedHashboards);
+      const boards = rec.hashboards;
+      actual = Array.isArray(boards) ? boards.length : null;
+    }
+    if (expected === null || expected <= 0 || actual === null || !Number.isFinite(actual)) return null;
+    return { actual, expected, pct: (actual / expected) * 100 };
+  }
+
+  /** Shared bar: fixed track = 100% nominal; fill by `pct`; over-target amber + stripes +. */
+  function appendVersusExpectedPercentVisual(
+    wrap: HTMLDivElement,
+    pct: number,
+    rightLabel: string,
+    title: string,
+  ): void {
+    wrap.style.cssText =
+      "display:flex;flex-direction:row;align-items:center;gap:8px;min-width:6.5rem;padding:2px 4px;";
+    const trackW = "4.5rem";
+    const track = document.createElement("div");
+    track.style.cssText = `position:relative;flex:0 0 ${trackW};width:${trackW};height:10px;border-radius:9999px;background:rgba(24,24,27,0.95);box-shadow:inset 0 1px 2px rgba(0,0,0,0.45);overflow:hidden;`;
+    const fill = document.createElement("div");
+    fill.style.cssText =
+      "height:100%;border-radius:9999px;transition:width 180ms ease-out,background 180ms ease;";
+    if (pct < 100) {
+      fill.style.width = `${Math.max(0, pct)}%`;
+      fill.style.background = "rgba(139,92,246,0.92)";
+    } else {
+      fill.style.width = "100%";
+      fill.style.background =
+        pct > 100 ? "rgba(245,158,11,0.9)" : "rgba(139,92,246,0.92)";
+    }
+    track.appendChild(fill);
+    const tick = document.createElement("div");
+    tick.style.cssText =
+      "position:absolute;top:0;bottom:0;left:100%;width:1px;margin-left:-1px;background:rgba(250,250,250,0.35);pointer-events:none;";
+    track.appendChild(tick);
+    if (pct > 100) {
+      const stripes = document.createElement("div");
+      stripes.style.cssText =
+        "position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:repeating-linear-gradient(135deg,rgba(255,255,255,0.14) 0 3px,transparent 3px 6px);";
+      track.appendChild(stripes);
+      const overMark = document.createElement("span");
+      overMark.textContent = "+";
+      overMark.style.cssText =
+        "position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:8px;font-weight:700;color:rgba(254,243,199,0.95);line-height:1;text-shadow:0 0 3px rgba(0,0,0,0.75);pointer-events:none;";
+      track.appendChild(overMark);
+    }
+    const label = document.createElement("span");
+    label.style.cssText =
+      "flex:0 0 auto;font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:11px;line-height:1;letter-spacing:0.02em;color:rgba(212,212,216,0.95);white-space:nowrap;";
+    label.textContent = rightLabel;
+    wrap.appendChild(track);
+    wrap.appendChild(label);
+    wrap.title = title;
+  }
+
+  const FAN_SVG_NS = "http://www.w3.org/2000/svg";
+
+  function fanRpmFromUnknown(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+    if (typeof raw === "string") {
+      const p = Number.parseFloat(raw.trim());
+      return Number.isFinite(p) ? p : null;
+    }
+    if (typeof raw === "object" && !Array.isArray(raw)) {
+      const o = raw as Record<string, unknown>;
+      const v = o.value ?? o.rpm;
+      if (v !== undefined && v !== raw) return fanRpmFromUnknown(v);
+    }
+    return null;
+  }
+
+  type ParsedFanDisplay = { position: number; rpmRounded: number | null };
+
+  function parseFansFromRow(row: GridRow | null | undefined): ParsedFanDisplay[] {
+    if (!row) return [];
+    const rec = row as Record<string, unknown>;
+    if (!Array.isArray(rec.fans)) return [];
+    const out: ParsedFanDisplay[] = [];
+    let idx = 0;
+    for (const item of rec.fans) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const r = item as Record<string, unknown>;
+      let position = idx;
+      const posRaw = r.position;
+      if (typeof posRaw === "number" && Number.isFinite(posRaw)) position = posRaw;
+      else if (typeof posRaw === "string") {
+        const p = Number.parseInt(posRaw, 10);
+        if (Number.isFinite(p)) position = p;
+      }
+      const rpmVal = fanRpmFromUnknown(r.rpm);
+      const rpmRounded = rpmVal === null ? null : Math.round(rpmVal);
+      out.push({ position, rpmRounded });
+      idx += 1;
+    }
+    out.sort((a, b) => a.position - b.position);
+    return out;
+  }
+
+  function fanSortMetricFromRow(row: GridRow | null | undefined): number | undefined {
+    const fans = parseFansFromRow(row);
+    if (fans.length === 0) return undefined;
+    const withRpm = fans
+      .map((f) => f.rpmRounded)
+      .filter((n): n is number => n !== null && Number.isFinite(n));
+    if (withRpm.length === 0) return undefined;
+    const sum = withRpm.reduce((a, b) => a + b, 0);
+    return sum / withRpm.length;
+  }
+
+  function createFanIconElement(rpmRoundedForSpeed: number | null): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = "tm-fan-svg-wrap";
+    const periodSec =
+      rpmRoundedForSpeed !== null && rpmRoundedForSpeed > 0
+        ? Math.max(0.38, Math.min(2.75, 2800 / rpmRoundedForSpeed))
+        : 1.2;
+    wrap.style.animation = `tm-fan-rotate ${periodSec}s linear infinite`;
+
+    const svg = document.createElementNS(FAN_SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", "18");
+    svg.setAttribute("height", "18");
+    svg.setAttribute("aria-hidden", "true");
+
+    const hub = document.createElementNS(FAN_SVG_NS, "circle");
+    hub.setAttribute("cx", "12");
+    hub.setAttribute("cy", "12");
+    hub.setAttribute("r", "2.6");
+    hub.setAttribute("fill", "currentColor");
+    hub.setAttribute("opacity", "0.45");
+    svg.appendChild(hub);
+    const bladeW = 5.2;
+    const bladeH = 9;
+    const bladeX = 12 - bladeW / 2;
+    const bladeY = 3;
+    const bladeRx = 2.4;
+    for (let deg = 0; deg < 360; deg += 120) {
+      const blade = document.createElementNS(FAN_SVG_NS, "rect");
+      blade.setAttribute("x", String(bladeX));
+      blade.setAttribute("y", String(bladeY));
+      blade.setAttribute("width", String(bladeW));
+      blade.setAttribute("height", String(bladeH));
+      blade.setAttribute("rx", String(bladeRx));
+      blade.setAttribute("fill", "currentColor");
+      blade.setAttribute("opacity", "0.92");
+      blade.setAttribute("transform", `rotate(${deg} 12 12)`);
+      svg.appendChild(blade);
+    }
+    wrap.appendChild(svg);
+    return wrap;
+  }
+
   function parseMetricValue(col: string, value: unknown): number | null {
     if (!MOVEMENT_COLUMNS.has(col)) return null;
     if (col === "hashrate") return parseHashRateToHs(value);
@@ -351,6 +567,23 @@
       }
       return formatGridValue(value);
     }
+    if (col === "fans") {
+      if (value === undefined || value === null) return "\u2014";
+      if (!Array.isArray(value)) return formatGridValue(value);
+      const parts: string[] = [];
+      for (const item of value) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const r = item as Record<string, unknown>;
+        const rpmVal = fanRpmFromUnknown(r.rpm);
+        parts.push(rpmVal === null ? "\u2014" : `${Math.round(rpmVal)} rpm`);
+      }
+      return parts.length > 0 ? parts.join(", ") : "\u2014";
+    }
+    if (col === "control_board_version" || col === "controlBoardVersion") {
+      const name = formatJsonNamedBlob(value);
+      if (name !== null) return name;
+      return formatGridValue(value);
+    }
     return formatGridValue(value);
   }
 
@@ -371,6 +604,89 @@
     return JSON.stringify(value);
   }
 
+  function parseDeviceInfoBlob(raw: unknown): Record<string, unknown> | null {
+    if (raw === undefined || raw === null) return null;
+    let obj: unknown;
+    if (typeof raw === "string") {
+      const t = raw.trim();
+      if (!t) return null;
+      try {
+        obj = JSON.parse(t) as unknown;
+      } catch {
+        return null;
+      }
+    } else if (typeof raw === "object" && !Array.isArray(raw)) {
+      obj = raw;
+    } else {
+      return null;
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+    return obj as Record<string, unknown>;
+  }
+
+  function pickIdentityString(v: unknown): string | undefined {
+    if (typeof v === "string") {
+      const t = v.trim();
+      return t || undefined;
+    }
+    if (typeof v === "number" && Number.isFinite(v)) return String(v);
+    return undefined;
+  }
+
+  /** Pull common identity fields from a miner device_info JSON object. */
+  function extractDeviceIdentityFields(device: Record<string, unknown>): {
+    firmware?: string;
+    make?: string;
+    model?: string;
+  } {
+    const firmware = pickIdentityString(
+      device.firmware ?? device.fw ?? device.firmware_version,
+    );
+    const make = pickIdentityString(device.make ?? device.vendor ?? device.manufacturer);
+    const model = pickIdentityString(
+      device.model ??
+        device.product ??
+        device.product_name ??
+        device.name ??
+        device.device_model,
+    );
+    const out: { firmware?: string; make?: string; model?: string } = {};
+    if (firmware) out.firmware = firmware;
+    if (make) out.make = make;
+    if (model) out.model = model;
+    return out;
+  }
+
+  /** Flatten device_info JSON into firmware/make/model columns and drop the blob key. */
+  function expandDeviceInfoInRowRecord(row: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...row };
+    for (const k of LEGACY_DEVICE_INFO_KEYS) {
+      if (!(k in out)) continue;
+      const parsed = parseDeviceInfoBlob(out[k]);
+      if (!parsed) continue;
+      const identity = extractDeviceIdentityFields(parsed);
+      delete out[k];
+      for (const [ik, iv] of Object.entries(identity)) {
+        const cur = out[ik];
+        const empty =
+          cur === undefined ||
+          cur === null ||
+          (typeof cur === "string" && !String(cur).trim());
+        if (empty && typeof iv === "string" && iv) out[ik] = iv;
+      }
+      break;
+    }
+    return out;
+  }
+
+  /** JSON object/string with a `name` field (e.g. control board `{"known":true,"name":"B602"}`). */
+  function formatJsonNamedBlob(value: unknown): string | null {
+    const rec = parseDeviceInfoBlob(value);
+    if (!rec) return null;
+    const name = pickIdentityString(rec.name);
+    return name ?? null;
+  }
+
   function formatHashRateValue(value: unknown) {
     if (value === undefined || value === null) return "\u2014";
     const scaled = getNormalizedHashRateDisplay(value);
@@ -384,6 +700,20 @@
       mac: "MAC",
       hashrate: "HashRate",
       average_temperature: "Avg Temp",
+      firmware: "Firmware",
+      make: "Make",
+      model: "Model",
+      control_board_version: "Control board",
+      controlBoardVersion: "Control board",
+      expected_hashrate: "Hashrate vs expected",
+      expectedHashrate: "Hashrate vs expected",
+      expected_chips: "Chips vs expected",
+      expectedChips: "Chips vs expected",
+      expected_fans: "Fans vs expected",
+      expectedFans: "Fans vs expected",
+      fans: "Fans",
+      expected_hashboards: "Hashboards vs expected",
+      expectedHashboards: "Hashboards vs expected",
     };
     const mapped = explicit[col];
     if (mapped) return mapped;
@@ -394,14 +724,39 @@
       .join(" ");
   }
 
+  /** Autosize often under-measures custom cell renderers; never shrink these below this width. */
+  const AUTOSIZE_MIN_WIDTH_FLOOR_PX: Record<string, number> = {
+    expected_hashrate: 188,
+    expectedHashrate: 188,
+    expected_chips: 92,
+    expectedChips: 92,
+    expected_fans: 92,
+    expectedFans: 92,
+    expected_hashboards: 92,
+    expectedHashboards: 92,
+    fans: 168,
+  };
+
   function refreshGridLayout() {
     if (!gridApi) return;
     gridApi.refreshCells({ force: true });
     gridApi.autoSizeAllColumns(false);
-    // Keep each column's minWidth aligned to its latest autosized width.
+    // Keep each column's minWidth aligned to its latest autosized width, but do not go below
+    // renderer-aware floors (otherwise minWidth gets locked too narrow on every model update).
+    const widen: { key: string; newWidth: number }[] = [];
     for (const column of gridApi.getAllDisplayedColumns()) {
-      const width = column.getActualWidth();
-      column.getColDef().minWidth = width;
+      const rawW = column.getActualWidth();
+      const width = typeof rawW === "number" ? rawW : 0;
+      const field = column.getColDef().field as string | undefined;
+      const floor = field ? (AUTOSIZE_MIN_WIDTH_FLOOR_PX[field] ?? 0) : 0;
+      const nextMin = Math.max(width, floor);
+      column.getColDef().minWidth = nextMin;
+      if (nextMin > width) {
+        widen.push({ key: column.getColId(), newWidth: nextMin });
+      }
+    }
+    if (widen.length > 0) {
+      gridApi.setColumnWidths(widen);
     }
   }
 
@@ -939,8 +1294,9 @@
     const keys = new Set<string>();
     for (const r of visibleRowList) {
       if (r.row && typeof r.row === "object") {
-        for (const k of Object.keys(r.row)) {
-          if (k !== "_truncated") keys.add(k);
+        const expanded = expandDeviceInfoInRowRecord(r.row as Record<string, unknown>);
+        for (const k of Object.keys(expanded)) {
+          if (k !== "_truncated" && !LEGACY_DEVICE_INFO_KEYS.has(k)) keys.add(k);
         }
       }
     }
@@ -948,22 +1304,44 @@
   });
 
   const columnKeys = $derived.by(() => {
-    const merged = new Set<string>([...BASELINE_COLUMN_KEYS, ...rememberedColumnKeys, ...discoveredColumnKeys]);
+    const merged = new Set<string>([
+      ...BASELINE_COLUMN_KEYS,
+      ...rememberedColumnKeys.filter((k) => !LEGACY_DEVICE_INFO_KEYS.has(k)),
+      ...discoveredColumnKeys,
+    ]);
     const sorted = [...merged].sort();
     const preferredPinned = ["ip", "mac"];
-    const preferredUnpinnedLeft = ["hashrate", "average_temperature", "efficiency", "wattage"];
+    const preferredUnpinnedLeft = [
+      "hashrate",
+      "expected_hashrate",
+      "expectedHashrate",
+      "expected_chips",
+      "expectedChips",
+      "expected_fans",
+      "expectedFans",
+      "fans",
+      "expected_hashboards",
+      "expectedHashboards",
+      "average_temperature",
+      "efficiency",
+      "wattage",
+    ];
+    const preferredIdentity = ["firmware", "make", "model"];
     const pinned = preferredPinned.filter((key) => sorted.includes(key));
     const remaining = sorted.filter((key) => !preferredPinned.includes(key));
     const leftUnpinned = preferredUnpinnedLeft.filter((key) => remaining.includes(key));
-    const rest = remaining.filter((key) => !preferredUnpinnedLeft.includes(key));
-    return ["status", ...pinned, ...leftUnpinned, ...rest];
+    const identityCols = preferredIdentity.filter((key) => remaining.includes(key));
+    const rest = remaining.filter(
+      (key) => !preferredUnpinnedLeft.includes(key) && !preferredIdentity.includes(key),
+    );
+    return ["status", ...pinned, ...leftUnpinned, ...identityCols, ...rest];
   });
 
   const gridRowData = $derived(
     visibleRowList.map((r) => ({
       id: r.id,
       status: r.status,
-      ...(r.row ?? {}),
+      ...expandDeviceInfoInRowRecord((r.row ?? {}) as Record<string, unknown>),
     })),
   );
 
@@ -983,9 +1361,197 @@
         };
       }
 
+      if (col === "expected_hashrate" || col === "expectedHashrate") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 188,
+          flex: 0.9,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => {
+            const v = hashrateVersusExpectedPercentFromRow(p.data as GridRow | undefined);
+            return v === null ? undefined : v;
+          },
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => {
+            const v = p.value;
+            if (typeof v !== "number" || !Number.isFinite(v)) return "\u2014";
+            return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)}% of expected`;
+          },
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return 1;
+            if (!Number.isFinite(nb)) return -1;
+            return na - nb;
+          },
+          cellRenderer: (params: ICellRendererParams<GridRow>) => {
+            const pct =
+              typeof params.value === "number" && Number.isFinite(params.value)
+                ? params.value
+                : hashrateVersusExpectedPercentFromRow(params.data);
+            const wrap = document.createElement("div");
+            if (pct === null || !Number.isFinite(pct)) {
+              wrap.textContent = "\u2014";
+              wrap.style.color = "rgb(161, 161, 170)";
+              wrap.style.fontSize = "12px";
+              return wrap;
+            }
+            const pctLabel = `${pct >= 100 ? pct.toFixed(0) : pct.toFixed(1)}%`;
+            const title =
+              pct > 100
+                ? `Above expected: ${pct.toFixed(1)}% of target (full bar, stripes and + mean over 100%).`
+                : pct < 100
+                  ? `Below expected: ${pct.toFixed(1)}% of target (bar length vs full track = 100% nominal).`
+                  : `On target: ${pct.toFixed(0)}% of expected hashrate.`;
+            appendVersusExpectedPercentVisual(wrap, pct, pctLabel, title);
+            return wrap;
+          },
+        };
+      }
+
+      if (
+        col === "expected_chips" ||
+        col === "expectedChips" ||
+        col === "expected_fans" ||
+        col === "expectedFans" ||
+        col === "expected_hashboards" ||
+        col === "expectedHashboards"
+      ) {
+        const kind =
+          col === "expected_chips" || col === "expectedChips"
+            ? ("chips" as const)
+            : col === "expected_fans" || col === "expectedFans"
+              ? ("fans" as const)
+              : ("hashboards" as const);
+        const noun =
+          kind === "chips" ? "chips" : kind === "fans" ? "fans" : "hashboards";
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 92,
+          flex: 0.35,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => {
+            const v = countVersusExpectedFromRow(p.data as GridRow | undefined, kind);
+            return v === null ? undefined : v.pct;
+          },
+          valueFormatter: (_p: ValueFormatterParams<GridRow>) => {
+            const m = countVersusExpectedFromRow(_p.data as GridRow | undefined, kind);
+            if (!m) return "\u2014";
+            const ok = m.actual >= m.expected;
+            return `${ok ? "OK" : "LOW"} ${m.actual}/${m.expected} ${noun}`;
+          },
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return 1;
+            if (!Number.isFinite(nb)) return -1;
+            return na - nb;
+          },
+          cellRenderer: (params: ICellRendererParams<GridRow>) => {
+            const m = countVersusExpectedFromRow(params.data, kind);
+            const wrap = document.createElement("div");
+            if (!m) {
+              wrap.textContent = "\u2014";
+              wrap.style.cssText = "color:rgb(161,161,170);font-size:12px;padding:2px 6px;";
+              return wrap;
+            }
+            const met = m.actual >= m.expected;
+            wrap.style.cssText =
+              "display:flex;flex-direction:row;align-items:center;gap:6px;padding:2px 6px;line-height:1;";
+            const icon = document.createElement("span");
+            icon.setAttribute("aria-hidden", "true");
+            icon.style.cssText =
+              "font-size:15px;font-weight:600;width:1.1em;text-align:center;flex-shrink:0;";
+            if (met) {
+              icon.textContent = "\u2714";
+              icon.style.color = "rgba(52, 211, 153, 0.95)";
+              wrap.title =
+                m.actual > m.expected
+                  ? `${m.actual} ${noun} reported, ${m.expected} expected — above nominal (still meeting minimum).`
+                  : `${m.actual} of ${m.expected} expected ${noun} — meets expectation.`;
+            } else {
+              icon.textContent = "\u2716";
+              icon.style.color = "rgba(248, 113, 113, 0.95)";
+              wrap.title = `${m.actual} of ${m.expected} expected ${noun} — below expectation.`;
+            }
+            const sub = document.createElement("span");
+            sub.style.cssText =
+              "font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:10px;color:rgba(161,161,170,0.95);white-space:nowrap;";
+            sub.textContent = `${m.actual}\u2044${m.expected}`;
+            wrap.append(icon, sub);
+            return wrap;
+          },
+        };
+      }
+
+      if (col === "fans") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 168,
+          flex: 0.85,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => fanSortMetricFromRow(p.data as GridRow | undefined),
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => {
+            const row = p.data as GridRow | undefined;
+            const raw = row ? (row as Record<string, unknown>).fans : undefined;
+            return formatColumnValue("fans", raw);
+          },
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return 1;
+            if (!Number.isFinite(nb)) return -1;
+            return na - nb;
+          },
+          cellRenderer: (params: ICellRendererParams<GridRow>) => {
+            const fans = parseFansFromRow(params.data);
+            const wrap = document.createElement("div");
+            wrap.className = "tm-fan-cell";
+            if (fans.length === 0) {
+              wrap.textContent = "\u2014";
+              wrap.style.color = "rgb(161, 161, 170)";
+              wrap.style.fontSize = "12px";
+              return wrap;
+            }
+            for (const f of fans) {
+              const slot = document.createElement("div");
+              slot.className = "tm-fan-slot";
+              const icon = createFanIconElement(f.rpmRounded);
+              const rpmEl = document.createElement("span");
+              rpmEl.className = "tm-fan-rpm";
+              if (f.rpmRounded === null) {
+                rpmEl.textContent = "\u2014";
+                rpmEl.style.color = "rgb(161, 161, 170)";
+              } else {
+                const num = document.createElement("span");
+                num.className = "tm-fan-rpm-num";
+                num.textContent = String(f.rpmRounded);
+                const unit = document.createElement("span");
+                unit.className = "tm-fan-rpm-unit";
+                unit.textContent = " rpm";
+                rpmEl.append(num, unit);
+              }
+              slot.append(icon, rpmEl);
+              wrap.appendChild(slot);
+            }
+            wrap.removeAttribute("title");
+            return wrap;
+          },
+        };
+      }
+
       return {
         field: col,
         headerName: formatColumnHeader(col),
+        hide: col === "discovery" || col === "api_version" || col === "apiVersion",
         pinned: col === "ip" || col === "mac" ? "left" : undefined,
         valueFormatter: (params: ValueFormatterParams<GridRow>) => formatColumnValue(col, params.value),
         cellRenderer: (params: ValueFormatterParams<GridRow>) => {
