@@ -28,6 +28,18 @@ body {
   --ag-data-color: var(--tm-text);
   --ag-header-background-color: var(--tm-surface);
   --ag-header-foreground-color: var(--tm-text-muted);
+  /*
+   * v33+ Theming API (default with createGrid): uses --ag-header-text-color, --ag-text-color,
+   * --ag-icon-color (+ mask-based icons). Legacy file theme used --ag-header-foreground-color
+   * / --ag-icon-font-color — override both so WKWebView doesn't leave sort arrows resolving to black.
+   */
+  --ag-text-color: var(--tm-text-muted);
+  --ag-header-text-color: var(--tm-text-muted);
+  --ag-cell-text-color: var(--tm-text-muted);
+  --ag-subtle-text-color: var(--tm-text-muted);
+  --ag-icon-color: var(--tm-text-muted);
+  --ag-icon-font-color: var(--tm-text-muted);
+  --ag-secondary-foreground-color: var(--tm-text-muted);
   --ag-row-border-color: rgba(39, 39, 42, 0.7);
   --ag-column-border-color: rgba(39, 39, 42, 0.45);
   --ag-odd-row-background-color: #111114;
@@ -85,6 +97,12 @@ body {
 }
 
 .ag-theme-quartz-dark .ag-header-cell-label {
+  color: var(--tm-text-muted);
+}
+
+/* Sort glyphs use Quartz mask-icons; reinforce color if any parent breaks inherit (e.g. custom elements). */
+.ag-theme-quartz-dark ag-sort-indicator .ag-icon,
+.ag-theme-quartz-dark .ag-sort-indicator-container .ag-icon {
   color: var(--tm-text-muted);
 }
 
@@ -171,6 +189,62 @@ body {
 
 .tm-move-temp-down {
   color: #7dd3fc;
+}
+
+@keyframes tm-fan-rotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.tm-fan-svg-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--tm-text-muted);
+}
+
+.tm-fan-cell {
+  display: flex;
+  flex-flow: row wrap;
+  align-items: center;
+  gap: 10px 14px;
+  padding: 2px 4px;
+  min-width: 0;
+}
+
+.tm-fan-slot {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 5px;
+}
+
+.tm-fan-rpm {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 0.2rem;
+  font-family: ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.tm-fan-rpm-num {
+  color: var(--tm-text);
+}
+
+.tm-fan-rpm-unit {
+  font-size: 10px;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  font-variant-numeric: normal;
+  color: var(--tm-text-muted);
+  text-transform: lowercase;
 }
 
 .ag-theme-quartz-dark .ag-overlay-no-rows-center {

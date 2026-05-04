@@ -1,17 +1,22 @@
 <script lang="ts">
   import {
     ClientSideRowModelModule,
+    ColumnApiModule,
     ModuleRegistry,
     createGrid,
     type ColDef,
+    type ColumnState,
     type GridApi,
     type GridOptions,
+    type ICellRendererParams,
     type ValueFormatterParams,
   } from "ag-grid-community";
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { onDestroy, onMount } from "svelte";
-  import { Settings } from "lucide-svelte";
+  import { fade, fly } from "svelte/transition";
+  import { beforeNavigate } from "$app/navigation";
+  import { onDestroy, onMount, untrack } from "svelte";
+  import { ArrowLeft, Check, ChevronDown, Settings, X } from "lucide-svelte";
   import {
     defaultDiscoverySettings,
     type DiscoveryProgress,
@@ -20,14 +25,23 @@
   } from "$lib/discoveryDefaults";
   import {
     clearKnownDevices,
+    DEFAULT_PROFILE_ID,
     loadDiscoverySettings,
     loadKnownDevices,
     loadTargetProfiles,
+    normalizeTargetProfiles,
     saveKnownDevices,
     saveTargetProfiles,
     type KnownDevice,
     type TargetProfile,
   } from "$lib/discoverySettingsStorage";
+  import {
+    discoveryWorkbench,
+    emptyWorkbenchProgress,
+    workbenchPendingRows,
+  } from "$lib/discoveryWorkbenchRuntime.svelte";
+
+  const MAIN_UI_SESSION_KEY = "tm.discovery:mainUiSession:v1";
 
   let targets = $state("192.168.1.0/24");
   let settings = $state<DiscoverySettings>({ ...defaultDiscoverySettings });
@@ -36,30 +50,49 @@
   let errorMsg = $state<string | null>(null);
   let activeRunKind = $state<"discover" | "enrich" | null>(null);
 
-  const emptyProgress: DiscoveryProgress = {
-    totalTargets: 0,
-    probed: 0,
-    alive: 0,
-    missed: 0,
-    enriched: 0,
-    partial: 0,
-    cancelled: 0,
-  };
-  let progress = $state<DiscoveryProgress>({ ...emptyProgress });
-  let rows = $state<Map<string, DiscoveryRowEvent>>(new Map());
   let targetProfiles = $state<TargetProfile[]>([]);
-  let selectedProfileId = $state("");
+  let selectedProfileId = $state(DEFAULT_PROFILE_ID);
+  let profileDrawerOpen = $state(false);
+  /** `null` = new profile in drawer; otherwise id of profile being edited */
+  let profileDrawerEditingId = $state<string | null>(null);
+  let drawerProfileName = $state("");
+  let drawerProfileTargets = $state("");
+  let profileDrawerError = $state<string | null>(null);
+  /** Tauri/WebKit often breaks `confirm()`; confirm deletes in-drawer instead. */
+  let profileDeleteConfirmPending = $state(false);
+  /** List of profiles vs name/targets editor. */
+  let profileDrawerPane = $state<"list" | "form">("list");
+  /** Row in list awaiting delete confirmation. */
+  let profileListDeletePendingId = $state<string | null>(null);
+  /** Header "Clear devices" avoids `window.confirm`. */
+  let clearDevicesConfirmPending = $state(false);
   let knownDevices = $state<KnownDevice[]>([]);
+  /** Blocks LocalStorage saves until persisted lists are hydrated (avoids wiping with initial []). */
+  let discoveryListsPersistAllowed = $state(false);
 
   let unlistenFns: UnlistenFn[] = [];
   let coalesceTimer: ReturnType<typeof setTimeout> | null = null;
-  let pendingRows = new Map<string, DiscoveryRowEvent>();
-  let missStreakByRow = $state<Map<string, number>>(new Map());
   let gridHost: HTMLDivElement | null = null;
   let gridApi: GridApi<GridRow> | null = null;
+  let columnLayoutPersistTimer: number | null = null;
+  /** Used to skip redundant `columnDefs` updates (row-only refreshes were resetting column order). */
+  let prevGridColumnLayoutSig = "";
+  /** Re-apply saved widths/order after `createGrid` (e.g. return from /settings), not only when the column sig changes. */
+  let lastGridApiWithPersistedLayout: GridApi<GridRow> | null = null;
+  /** Column order from last persisted grid state; drives `displayColumnKeys` so remount matches saved order without animating. */
+  let persistedColumnOrderIds = $state<string[] | null>(null);
   let autoDiscoverTimer: ReturnType<typeof setInterval> | null = null;
   let autoEnrichTimer: ReturnType<typeof setInterval> | null = null;
-  let movementByCell = $state<Map<string, { direction: "up" | "down"; deltaText: string }>>(new Map());
+  /** Bumped when the active target profile/spec changes so auto-discover/enrich timers reset their interval clocks. */
+  let autoLoopRestartEpoch = $state(0);
+  /** When the auto-discover `setInterval` was (re)registered; aligns UI countdown with real tick schedule. */
+  let autoDiscoverCadenceAnchorMs = $state<number>(Date.now());
+  /** Drives countdown refresh while auto-discover is enabled. */
+  let autoDiscoverUiTick = $state(0);
+
+  /** Custom profile picker (replacing native select styling in Tauri/WebKit). */
+  let profileMenuOpen = $state(false);
+  let profileMenuHost: HTMLDivElement | null = null;
 
   type GridRow = {
     id: string;
@@ -67,8 +100,35 @@
     [key: string]: unknown;
   };
   const MOVEMENT_COLUMNS = new Set(["hashrate", "average_temperature", "efficiency", "wattage"]);
+  /** Synthetic movement keys for split pool columns (not in MOVEMENT_COLUMNS / parseMetricValue). */
+  const POOLS_MOVEMENT_IDS = ["pools_accepted", "pools_rejected"] as const;
   const GRID_COLUMN_KEYS_STORAGE_KEY = "tm:discovery:grid-column-keys:v1";
+  const GRID_COLUMN_STATE_STORAGE_KEY = "tm:discovery:grid-column-state:v1";
+  /** Survives Vite HMR so we do not call `setColumnDefs` when only the module reloaded (that was resetting widths/order). */
+  const GRID_COLUMN_LAYOUT_SIG_SESSION_KEY = "tm:discovery:grid-layout-sig:v1";
+
+  function readGridColumnLayoutSigFromSession(): string {
+    if (typeof window === "undefined") return "";
+    try {
+      return window.sessionStorage.getItem(GRID_COLUMN_LAYOUT_SIG_SESSION_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  function writeGridColumnLayoutSigToSession(sig: string) {
+    if (typeof window === "undefined") return;
+    try {
+      window.sessionStorage.setItem(GRID_COLUMN_LAYOUT_SIG_SESSION_KEY, sig);
+    } catch {
+      // ignore quota / private mode
+    }
+  }
+
+  prevGridColumnLayoutSig = readGridColumnLayoutSigFromSession();
+
   const BASELINE_COLUMN_KEYS = ["ip", "discovery"];
+  const LEGACY_DEVICE_INFO_KEYS = new Set(["device_info", "deviceInfo", "deviceInformation"]);
 
   function isFinalStatus(status: DiscoveryRowEvent["status"]) {
     return status === "Enriched" || status === "Partial";
@@ -86,7 +146,9 @@
       if (!raw) return [...BASELINE_COLUMN_KEYS];
       const parsed = JSON.parse(raw);
       if (!Array.isArray(parsed)) return [...BASELINE_COLUMN_KEYS];
-      const keys = parsed.filter((key): key is string => typeof key === "string" && key.length > 0);
+      const keys = parsed
+        .filter((key): key is string => typeof key === "string" && key.length > 0)
+        .filter((key) => !LEGACY_DEVICE_INFO_KEYS.has(key));
       return [...new Set([...BASELINE_COLUMN_KEYS, ...keys])];
     } catch {
       return [...BASELINE_COLUMN_KEYS];
@@ -102,7 +164,143 @@
     }
   }
 
-  ModuleRegistry.registerModules([ClientSideRowModelModule]);
+  function loadGridColumnState(): ColumnState[] | null {
+    if (typeof window === "undefined") return null;
+    try {
+      const raw = window.localStorage.getItem(GRID_COLUMN_STATE_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return null;
+      const out: ColumnState[] = [];
+      for (const item of parsed) {
+        if (!item || typeof item !== "object") continue;
+        const o = item as Record<string, unknown>;
+        if (typeof o.colId !== "string" || !o.colId) continue;
+        out.push(item as ColumnState);
+      }
+      return out.length > 0 ? out : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Split legacy `pools` column id into the three synthetic pool columns. */
+  function expandPoolsColumnId(id: string): string[] {
+    if (id === "pools" || id === "Pools") {
+      return ["pools_accepted", "pools_rejected", "pools_stratum"];
+    }
+    return [id];
+  }
+
+  /** Replace `pools` / `Pools` keys with `pools_accepted`, `pools_rejected`, `pools_stratum`. */
+  function expandPoolsColumnKeys(keys: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const pushPoolTriplet = () => {
+      for (const syn of ["pools_accepted", "pools_rejected", "pools_stratum"] as const) {
+        if (seen.has(syn)) continue;
+        out.push(syn);
+        seen.add(syn);
+      }
+    };
+    for (const k of keys) {
+      if (k === "pools" || k === "Pools") {
+        pushPoolTriplet();
+      } else {
+        if (seen.has(k)) continue;
+        out.push(k);
+        seen.add(k);
+      }
+    }
+    return out;
+  }
+
+  /** Merge canonical column membership with persisted header order (AG Grid column state order). */
+  function mergeDisplayColumnOrder(canonical: string[], persistedOrder: string[] | null): string[] {
+    if (!persistedOrder?.length) return canonical;
+    const canon = new Set(canonical);
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const id of persistedOrder) {
+      for (const eid of expandPoolsColumnId(id)) {
+        if (!canon.has(eid) || seen.has(eid)) continue;
+        out.push(eid);
+        seen.add(eid);
+      }
+    }
+    for (const id of canonical) {
+      if (!seen.has(id)) out.push(id);
+    }
+    return out;
+  }
+
+  /** Stable identity for column *set* + fluid flag (order-independent so user reorder does not refresh defs). */
+  function layoutIdentitySigFromCanonical(canonical: string[], fluidAllNull: boolean): string {
+    const sorted = [...canonical].sort((a, b) => a.localeCompare(b));
+    return `${sorted.join("\u0001")}\u0002${fluidAllNull}`;
+  }
+
+  function saveGridColumnState(state: ColumnState[]) {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(GRID_COLUMN_STATE_STORAGE_KEY, JSON.stringify(state));
+    } catch {
+      // ignore storage write failures
+    }
+    if (state.length > 0) {
+      persistedColumnOrderIds = state.flatMap((c) => {
+        const id = c.colId;
+        if (typeof id !== "string" || !id.length) return [];
+        return expandPoolsColumnId(id);
+      });
+    }
+  }
+
+  function schedulePersistGridColumnLayout() {
+    if (typeof window === "undefined") return;
+    if (columnLayoutPersistTimer !== null) {
+      clearTimeout(columnLayoutPersistTimer);
+    }
+    columnLayoutPersistTimer = window.setTimeout(() => {
+      columnLayoutPersistTimer = null;
+      if (!gridApi) return;
+      const st = gridApi.getColumnState();
+      if (st.length > 0) saveGridColumnState(st);
+    }, 200);
+  }
+
+  function applyPersistedGridColumnLayout(api: GridApi<GridRow>, defs: ColDef<GridRow>[]) {
+    const saved = loadGridColumnState();
+    if (!saved?.length) return;
+    const known = new Set(
+      defs.map((d) => d.field).filter((f): f is string => typeof f === "string" && f.length > 0),
+    );
+    const filtered = saved.filter((c) => known.has(c.colId));
+    if (!filtered.length) return;
+    api.setGridOption("suppressColumnMoveAnimation", true);
+    try {
+      api.applyColumnState({ state: filtered, applyOrder: true });
+    } finally {
+      api.setGridOption("suppressColumnMoveAnimation", false);
+    }
+  }
+
+  /** Persist while the grid column model is still valid (onDestroy often sees an empty model). */
+  beforeNavigate(() => {
+    if (columnLayoutPersistTimer !== null) {
+      clearTimeout(columnLayoutPersistTimer);
+      columnLayoutPersistTimer = null;
+    }
+    if (!gridApi) return;
+    try {
+      const st = gridApi.getColumnState();
+      if (st.length > 0) saveGridColumnState(st);
+    } catch {
+      // ignore
+    }
+  });
+
+  ModuleRegistry.registerModules([ClientSideRowModelModule, ColumnApiModule]);
 
   const HASH_RATE_UNIT_TIERS = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"] as const;
 
@@ -285,6 +483,218 @@
     return null;
   }
 
+  /** JSON string or hashrate-shaped object → H/s (same rules as `parseHashRateToHs`). */
+  function parseJsonOrValueAsHashrateHs(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw === "string") {
+      const t = raw.trim();
+      if (!t) return null;
+      if (t.startsWith("{")) {
+        try {
+          return parseHashRateToHs(JSON.parse(t) as unknown);
+        } catch {
+          return null;
+        }
+      }
+      return parseHashRateToHs(t);
+    }
+    return parseHashRateToHs(raw);
+  }
+
+  /** Current hashrate (H/s) vs expected JSON blob, as a percentage (may exceed 100). */
+  function hashrateVersusExpectedPercentFromRow(row: GridRow | null | undefined): number | null {
+    if (!row) return null;
+    const rec = row as Record<string, unknown>;
+    const expRaw = rec.expected_hashrate ?? rec.expectedHashrate;
+    const expectedHs = parseJsonOrValueAsHashrateHs(expRaw);
+    const currentHs = parseHashRateToHs(rec.hashrate);
+    if (expectedHs === null || expectedHs <= 0 || currentHs === null || !Number.isFinite(currentHs) || currentHs < 0)
+      return null;
+    return (currentHs / expectedHs) * 100;
+  }
+
+  type CountVersusExpectedKind = "chips" | "fans" | "hashboards";
+
+  function parseNonnegInt(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return Math.trunc(value);
+    if (typeof value === "string") {
+      const parsed = Number.parseInt(value.trim(), 10);
+      if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+    }
+    return null;
+  }
+
+  /** Miner `MinerData`: expected_* vs totals / array lengths (snake_case JSON from asic-rs). */
+  function countVersusExpectedFromRow(
+    row: GridRow | null | undefined,
+    kind: CountVersusExpectedKind,
+  ): { actual: number; expected: number; pct: number } | null {
+    if (!row) return null;
+    const rec = row as Record<string, unknown>;
+    let expected: number | null = null;
+    let actual: number | null = null;
+    if (kind === "chips") {
+      expected = parseNonnegInt(rec.expected_chips ?? rec.expectedChips);
+      actual = parseNonnegInt(rec.total_chips ?? rec.totalChips);
+    } else if (kind === "fans") {
+      expected = parseNonnegInt(rec.expected_fans ?? rec.expectedFans);
+      const fans = rec.fans;
+      actual = Array.isArray(fans) ? fans.length : null;
+    } else {
+      expected = parseNonnegInt(rec.expected_hashboards ?? rec.expectedHashboards);
+      const boards = rec.hashboards;
+      actual = Array.isArray(boards) ? boards.length : null;
+    }
+    if (expected === null || expected <= 0 || actual === null || !Number.isFinite(actual)) return null;
+    return { actual, expected, pct: (actual / expected) * 100 };
+  }
+
+  /** Shared bar: fixed track = 100% nominal; fill by `pct`; over-target amber + stripes +. */
+  function appendVersusExpectedPercentVisual(
+    wrap: HTMLDivElement,
+    pct: number,
+    rightLabel: string,
+    title: string,
+  ): void {
+    wrap.style.cssText =
+      "display:flex;flex-direction:row;align-items:center;gap:8px;min-width:6.5rem;padding:2px 4px;";
+    const trackW = "4.5rem";
+    const track = document.createElement("div");
+    track.style.cssText = `position:relative;flex:0 0 ${trackW};width:${trackW};height:10px;border-radius:9999px;background:rgba(24,24,27,0.95);box-shadow:inset 0 1px 2px rgba(0,0,0,0.45);overflow:hidden;`;
+    const fill = document.createElement("div");
+    fill.style.cssText =
+      "height:100%;border-radius:9999px;transition:width 180ms ease-out,background 180ms ease;";
+    if (pct < 100) {
+      fill.style.width = `${Math.max(0, pct)}%`;
+      fill.style.background = "rgba(139,92,246,0.92)";
+    } else {
+      fill.style.width = "100%";
+      fill.style.background =
+        pct > 100 ? "rgba(245,158,11,0.9)" : "rgba(139,92,246,0.92)";
+    }
+    track.appendChild(fill);
+    const tick = document.createElement("div");
+    tick.style.cssText =
+      "position:absolute;top:0;bottom:0;left:100%;width:1px;margin-left:-1px;background:rgba(250,250,250,0.35);pointer-events:none;";
+    track.appendChild(tick);
+    if (pct > 100) {
+      const stripes = document.createElement("div");
+      stripes.style.cssText =
+        "position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:repeating-linear-gradient(135deg,rgba(255,255,255,0.14) 0 3px,transparent 3px 6px);";
+      track.appendChild(stripes);
+      const overMark = document.createElement("span");
+      overMark.textContent = "+";
+      overMark.style.cssText =
+        "position:absolute;right:4px;top:50%;transform:translateY(-50%);font-size:8px;font-weight:700;color:rgba(254,243,199,0.95);line-height:1;text-shadow:0 0 3px rgba(0,0,0,0.75);pointer-events:none;";
+      track.appendChild(overMark);
+    }
+    const label = document.createElement("span");
+    label.style.cssText =
+      "flex:0 0 auto;font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:11px;line-height:1;letter-spacing:0.02em;color:rgba(212,212,216,0.95);white-space:nowrap;";
+    label.textContent = rightLabel;
+    wrap.appendChild(track);
+    wrap.appendChild(label);
+    wrap.title = title;
+  }
+
+  const FAN_SVG_NS = "http://www.w3.org/2000/svg";
+
+  function fanRpmFromUnknown(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+    if (typeof raw === "string") {
+      const p = Number.parseFloat(raw.trim());
+      return Number.isFinite(p) ? p : null;
+    }
+    if (typeof raw === "object" && !Array.isArray(raw)) {
+      const o = raw as Record<string, unknown>;
+      const v = o.value ?? o.rpm;
+      if (v !== undefined && v !== raw) return fanRpmFromUnknown(v);
+    }
+    return null;
+  }
+
+  type ParsedFanDisplay = { position: number; rpmRounded: number | null };
+
+  function parseFansFromRow(row: GridRow | null | undefined): ParsedFanDisplay[] {
+    if (!row) return [];
+    const rec = row as Record<string, unknown>;
+    if (!Array.isArray(rec.fans)) return [];
+    const out: ParsedFanDisplay[] = [];
+    let idx = 0;
+    for (const item of rec.fans) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const r = item as Record<string, unknown>;
+      let position = idx;
+      const posRaw = r.position;
+      if (typeof posRaw === "number" && Number.isFinite(posRaw)) position = posRaw;
+      else if (typeof posRaw === "string") {
+        const p = Number.parseInt(posRaw, 10);
+        if (Number.isFinite(p)) position = p;
+      }
+      const rpmVal = fanRpmFromUnknown(r.rpm);
+      const rpmRounded = rpmVal === null ? null : Math.round(rpmVal);
+      out.push({ position, rpmRounded });
+      idx += 1;
+    }
+    out.sort((a, b) => a.position - b.position);
+    return out;
+  }
+
+  function fanSortMetricFromRow(row: GridRow | null | undefined): number | undefined {
+    const fans = parseFansFromRow(row);
+    if (fans.length === 0) return undefined;
+    const withRpm = fans
+      .map((f) => f.rpmRounded)
+      .filter((n): n is number => n !== null && Number.isFinite(n));
+    if (withRpm.length === 0) return undefined;
+    const sum = withRpm.reduce((a, b) => a + b, 0);
+    return sum / withRpm.length;
+  }
+
+  function createFanIconElement(rpmRoundedForSpeed: number | null): HTMLElement {
+    const wrap = document.createElement("span");
+    wrap.className = "tm-fan-svg-wrap";
+    const periodSec =
+      rpmRoundedForSpeed !== null && rpmRoundedForSpeed > 0
+        ? Math.max(0.38, Math.min(2.75, 2800 / rpmRoundedForSpeed))
+        : 1.2;
+    wrap.style.animation = `tm-fan-rotate ${periodSec}s linear infinite`;
+
+    const svg = document.createElementNS(FAN_SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", "18");
+    svg.setAttribute("height", "18");
+    svg.setAttribute("aria-hidden", "true");
+
+    const hub = document.createElementNS(FAN_SVG_NS, "circle");
+    hub.setAttribute("cx", "12");
+    hub.setAttribute("cy", "12");
+    hub.setAttribute("r", "2.6");
+    hub.setAttribute("fill", "currentColor");
+    hub.setAttribute("opacity", "0.45");
+    svg.appendChild(hub);
+    const bladeW = 5.2;
+    const bladeH = 9;
+    const bladeX = 12 - bladeW / 2;
+    const bladeY = 3;
+    const bladeRx = 2.4;
+    for (let deg = 0; deg < 360; deg += 120) {
+      const blade = document.createElementNS(FAN_SVG_NS, "rect");
+      blade.setAttribute("x", String(bladeX));
+      blade.setAttribute("y", String(bladeY));
+      blade.setAttribute("width", String(bladeW));
+      blade.setAttribute("height", String(bladeH));
+      blade.setAttribute("rx", String(bladeRx));
+      blade.setAttribute("fill", "currentColor");
+      blade.setAttribute("opacity", "0.92");
+      blade.setAttribute("transform", `rotate(${deg} 12 12)`);
+      svg.appendChild(blade);
+    }
+    wrap.appendChild(svg);
+    return wrap;
+  }
+
   function parseMetricValue(col: string, value: unknown): number | null {
     if (!MOVEMENT_COLUMNS.has(col)) return null;
     if (col === "hashrate") return parseHashRateToHs(value);
@@ -329,6 +739,47 @@
       }
       return formatGridValue(value);
     }
+    if (col === "timestamp") {
+      const sec = parseUnixTimestampSeconds(value);
+      if (sec === null) return "\u2014";
+      return formatTimestampSecondsLocal(sec);
+    }
+    if (col === "uptime") {
+      const t = parseUptimeTotalSeconds(value);
+      if (t === null) return "\u2014";
+      return formatUptimeYmdHms(t);
+    }
+    if (col === "fans") {
+      if (value === undefined || value === null) return "\u2014";
+      if (!Array.isArray(value)) return formatGridValue(value);
+      const parts: string[] = [];
+      for (const item of value) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const r = item as Record<string, unknown>;
+        const rpmVal = fanRpmFromUnknown(r.rpm);
+        parts.push(rpmVal === null ? "\u2014" : `${Math.round(rpmVal)} rpm`);
+      }
+      return parts.length > 0 ? parts.join(", ") : "\u2014";
+    }
+    if (col === "pools_accepted") {
+      if (value === undefined || value === null) return "\u2014";
+      if (typeof value === "number" && Number.isFinite(value)) return value.toLocaleString();
+      return "\u2014";
+    }
+    if (col === "pools_rejected") {
+      if (value === undefined || value === null) return "\u2014";
+      if (typeof value === "number" && Number.isFinite(value)) return value.toLocaleString();
+      return "\u2014";
+    }
+    if (col === "pools_stratum") {
+      if (typeof value === "string" && value.trim()) return value.trim();
+      return "\u2014";
+    }
+    if (col === "control_board_version" || col === "controlBoardVersion") {
+      const name = formatJsonNamedBlob(value);
+      if (name !== null) return name;
+      return formatGridValue(value);
+    }
     return formatGridValue(value);
   }
 
@@ -343,10 +794,467 @@
     return `${rowId}:${col}`;
   }
 
+  /** Sum accepted/rejected shares from miner pool payloads (JSON string or array of `{ pools: [...] }`). */
+  function parsePoolsShareTotals(value: unknown): { accepted: number | null; rejected: number | null } {
+    let accTotal = 0;
+    let rejTotal = 0;
+    let accFound = false;
+    let rejFound = false;
+
+    const addFromPoolObj = (o: Record<string, unknown>) => {
+      const a = o.accepted_shares ?? o.acceptedShares;
+      const r = o.rejected_shares ?? o.rejectedShares;
+      if (typeof a === "number" && Number.isFinite(a)) {
+        accTotal += a;
+        accFound = true;
+      } else if (typeof a === "string") {
+        const na = Number.parseInt(a.trim(), 10);
+        if (Number.isFinite(na)) {
+          accTotal += na;
+          accFound = true;
+        }
+      }
+      if (typeof r === "number" && Number.isFinite(r)) {
+        rejTotal += r;
+        rejFound = true;
+      } else if (typeof r === "string") {
+        const nr = Number.parseInt(r.trim(), 10);
+        if (Number.isFinite(nr)) {
+          rejTotal += nr;
+          rejFound = true;
+        }
+      }
+    };
+
+    const visit = (node: unknown): void => {
+      if (node === undefined || node === null) return;
+      if (typeof node === "string") {
+        const t = node.trim();
+        if (!t) return;
+        try {
+          visit(JSON.parse(t));
+        } catch {
+          return;
+        }
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const el of node) {
+          if (!el || typeof el !== "object") continue;
+          const rec = el as Record<string, unknown>;
+          const pools = rec.pools ?? rec.Pools;
+          if (Array.isArray(pools)) {
+            for (const p of pools) {
+              if (p && typeof p === "object" && !Array.isArray(p)) addFromPoolObj(p as Record<string, unknown>);
+            }
+          }
+          if (recordLooksLikePoolEntry(rec)) addFromPoolObj(rec);
+        }
+        return;
+      }
+      if (typeof node === "object") {
+        const rec = node as Record<string, unknown>;
+        const pools = rec.pools ?? rec.Pools;
+        if (Array.isArray(pools)) {
+          for (const p of pools) {
+            if (p && typeof p === "object" && !Array.isArray(p)) addFromPoolObj(p as Record<string, unknown>);
+          }
+        }
+        if (recordLooksLikePoolEntry(rec)) addFromPoolObj(rec);
+      }
+    };
+
+    visit(value);
+    return {
+      accepted: accFound ? accTotal : null,
+      rejected: rejFound ? rejTotal : null,
+    };
+  }
+
+  /** Hostname from stratum URL, `host:port`, or similar miner pool strings. */
+  function hostFromPoolishString(raw: string): string | null {
+    const t = raw.trim();
+    if (!t) return null;
+    const tryParse = (href: string): string | null => {
+      try {
+        const u = new URL(href);
+        return u.hostname || null;
+      } catch {
+        return null;
+      }
+    };
+    let h = tryParse(t);
+    if (h) return h;
+    const schemes = ["stratum+tcp://", "stratum+ssl://", "stratum://"];
+    for (const sc of schemes) {
+      if (t.toLowerCase().startsWith(sc)) {
+        h = tryParse(`http://${t.slice(sc.length)}`);
+        if (h) return h;
+      }
+    }
+    const at = t.lastIndexOf("@");
+    if (at >= 0) {
+      const tail = t.slice(at + 1).split(/[\s/?#]/)[0];
+      h = tryParse(`http://${tail}`);
+      if (h) return h;
+    }
+    const hostPort = t.split(/[\s/?#]/)[0];
+    const noPort = hostPort.replace(/:\d+$/, "");
+    if (/^[a-z0-9][a-z0-9.-]*$/i.test(noPort) && noPort.includes(".")) return noPort.toLowerCase();
+    return null;
+  }
+
+  /** Lowercase host presentation: `subdomain` + `.` + last two labels (`domain.tld`). */
+  function formatSubdomainDotDomain(hostname: string): string {
+    const labels = hostname
+      .toLowerCase()
+      .replace(/^\[|\]$/g, "")
+      .split(".")
+      .filter((p) => p.length > 0);
+    if (labels.length === 0) return "";
+    if (labels.length <= 2) return labels.join(".");
+    const domain = labels.slice(-2).join(".");
+    const sub = labels.slice(0, -2).join(".");
+    return sub ? `${sub}.${domain}` : domain;
+  }
+
+  function recordLooksLikePoolEntry(r: Record<string, unknown>): boolean {
+    const urlObj = r.url;
+    let urlHasHost = false;
+    if (urlObj && typeof urlObj === "object" && !Array.isArray(urlObj)) {
+      const h = (urlObj as Record<string, unknown>).host;
+      urlHasHost = typeof h === "string" && h.trim().length > 0;
+    }
+    return (
+      r.accepted_shares != null ||
+      r.acceptedShares != null ||
+      r.rejected_shares != null ||
+      r.rejectedShares != null ||
+      typeof r.url === "string" ||
+      urlHasHost ||
+      typeof r.stratum_url === "string" ||
+      typeof r.stratumUrl === "string" ||
+      typeof r.pool_url === "string" ||
+      typeof r.poolUrl === "string"
+    );
+  }
+
+  /** Unique pool hosts from stratum URLs in pool payloads, as `subdomain.domain.tld`. */
+  function parsePoolsStratumDisplay(value: unknown): string {
+    const hosts = new Set<string>();
+
+    const addHost = (raw: string) => {
+      const h = hostFromPoolishString(raw.trim());
+      if (h) hosts.add(formatSubdomainDotDomain(h));
+    };
+
+    const considerPool = (o: Record<string, unknown>) => {
+      const urlVal = o.url;
+      if (urlVal && typeof urlVal === "object" && !Array.isArray(urlVal)) {
+        const uo = urlVal as Record<string, unknown>;
+        const hostStr = uo.host;
+        if (typeof hostStr === "string" && hostStr.trim()) addHost(hostStr);
+      }
+      const rawScalar: unknown[] = [
+        typeof o.url === "string" ? o.url : undefined,
+        o.stratum_url,
+        o.stratumUrl,
+        o.pool_url,
+        o.poolUrl,
+        o.connection,
+        o.address,
+        o.host,
+        o.hostname,
+        o.server,
+        o.socket,
+        o.endpoint,
+        o.stratum_host,
+        o.stratumHost,
+        o.mining_address,
+        o.miningAddress,
+      ];
+      for (const c of rawScalar) {
+        if (typeof c !== "string" || !c.trim()) continue;
+        addHost(c);
+      }
+      const conn = o.connection;
+      if (conn && typeof conn === "object" && !Array.isArray(conn)) {
+        const cr = conn as Record<string, unknown>;
+        for (const k of ["url", "uri", "host", "hostname", "address"]) {
+          const v = cr[k];
+          if (typeof v === "string" && v.trim()) addHost(v);
+        }
+      }
+      const nestedStratum = o.stratum ?? o.Stratum;
+      if (nestedStratum && typeof nestedStratum === "object" && !Array.isArray(nestedStratum)) {
+        const so = nestedStratum as Record<string, unknown>;
+        for (const k of ["url", "host", "hostname", "address", "endpoint", "connection"]) {
+          const v = so[k];
+          if (typeof v === "string" && v.trim()) addHost(v);
+        }
+      }
+      if (typeof o.stratum === "string" && o.stratum.trim()) addHost(o.stratum);
+      if (typeof o.Stratum === "string" && o.Stratum.trim()) addHost(o.Stratum);
+
+      for (const key of [
+        "stratum_urls",
+        "stratumUrls",
+        "urls",
+        "stratumURL",
+        "endpoints",
+        "addresses",
+      ] as const) {
+        const v = o[key];
+        if (!Array.isArray(v)) continue;
+        for (const item of v) {
+          if (typeof item === "string" && item.trim()) addHost(item);
+          else if (item && typeof item === "object" && !Array.isArray(item))
+            considerPool(item as Record<string, unknown>);
+        }
+      }
+      const nm = o.name;
+      if (typeof nm === "string" && nm.includes(".") && !nm.startsWith("[")) addHost(nm);
+    };
+
+    const visit = (node: unknown): void => {
+      if (node === undefined || node === null) return;
+      if (typeof node === "string") {
+        const s = node.trim();
+        if (!s) return;
+        try {
+          visit(JSON.parse(s));
+        } catch {
+          return;
+        }
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const el of node) {
+          if (!el || typeof el !== "object") continue;
+          const rec = el as Record<string, unknown>;
+          const pools = rec.pools ?? rec.Pools;
+          if (Array.isArray(pools)) {
+            for (const p of pools) {
+              if (typeof p === "string" && p.trim()) addHost(p);
+              else if (p && typeof p === "object" && !Array.isArray(p))
+                considerPool(p as Record<string, unknown>);
+            }
+          }
+          if (recordLooksLikePoolEntry(rec)) considerPool(rec);
+        }
+        return;
+      }
+      if (typeof node === "object") {
+        const rec = node as Record<string, unknown>;
+        const pools = rec.pools ?? rec.Pools;
+        if (Array.isArray(pools)) {
+          for (const p of pools) {
+            if (typeof p === "string" && p.trim()) addHost(p);
+            else if (p && typeof p === "object" && !Array.isArray(p))
+              considerPool(p as Record<string, unknown>);
+          }
+        }
+        if (recordLooksLikePoolEntry(rec)) considerPool(rec);
+      }
+    };
+
+    visit(value);
+    return hosts.size === 0 ? "" : [...hosts].sort((a, b) => a.localeCompare(b)).join(", ");
+  }
+
+  function poolsRawFromRow(row: Record<string, unknown> | undefined): unknown {
+    if (!row) return undefined;
+    return row.pools ?? row.Pools ?? row.pool ?? row.Pool;
+  }
+
   function formatGridValue(value: unknown) {
     if (value === undefined) return "\u2014";
     if (typeof value === "string") return value;
     return JSON.stringify(value);
+  }
+
+  /** Miner `timestamp` (Unix time). Values above 1e12 are treated as milliseconds. */
+  function parseUnixTimestampSeconds(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    let n: number;
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      n = raw;
+    } else if (typeof raw === "string") {
+      const t = raw.trim();
+      if (!t) return null;
+      const p = Number.parseFloat(t);
+      if (!Number.isFinite(p)) return null;
+      n = p;
+    } else {
+      return null;
+    }
+    const sec = n > 1e12 ? n / 1000 : n;
+    return Number.isFinite(sec) && sec > 0 ? sec : null;
+  }
+
+  function formatTimestampSecondsLocal(sec: number): string {
+    const d = new Date(sec * 1000);
+    if (!Number.isFinite(d.getTime())) return "\u2014";
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
+
+  /** Rust `Duration`-style JSON: `{ secs, nanos }` (or stringified). */
+  function parseUptimeTotalSeconds(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      return raw >= 0 ? raw : null;
+    }
+    if (typeof raw === "string") {
+      const t = raw.trim();
+      if (!t) return null;
+      try {
+        return parseUptimeTotalSeconds(JSON.parse(t) as unknown);
+      } catch {
+        const p = Number.parseFloat(t);
+        return Number.isFinite(p) && p >= 0 ? p : null;
+      }
+    }
+    if (typeof raw === "object" && !Array.isArray(raw)) {
+      const o = raw as Record<string, unknown>;
+      const secsRaw = o.secs ?? o.seconds;
+      const nanosRaw = o.nanos ?? o.nanoseconds ?? 0;
+      let secs = 0;
+      if (typeof secsRaw === "number" && Number.isFinite(secsRaw)) secs = secsRaw;
+      else if (typeof secsRaw === "string") {
+        const p = Number.parseFloat(secsRaw);
+        if (Number.isFinite(p)) secs = p;
+      }
+      let nanos = 0;
+      if (typeof nanosRaw === "number" && Number.isFinite(nanosRaw)) nanos = nanosRaw;
+      const total = secs + nanos / 1e9;
+      return Number.isFinite(total) && total >= 0 ? total : null;
+    }
+    return null;
+  }
+
+  /**
+   * Elapsed uptime: `yr mo d h min s` (365d year, 30d month). Omits any of yr/mo/d/h when zero;
+   * always shows minutes and seconds (e.g. `5mo 2d 21h 0min 5s`).
+   */
+  function formatUptimeYmdHms(totalSeconds: number): string {
+    if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "\u2014";
+    const sec = Math.floor(totalSeconds);
+    const SEC_PER_MIN = 60;
+    const SEC_PER_HOUR = 3600;
+    const SEC_PER_DAY = 86400;
+    const SEC_PER_MONTH = 30 * SEC_PER_DAY;
+    const SEC_PER_YEAR = 365 * SEC_PER_DAY;
+
+    let r = sec;
+    const y = Math.floor(r / SEC_PER_YEAR);
+    r -= y * SEC_PER_YEAR;
+    const mo = Math.floor(r / SEC_PER_MONTH);
+    r -= mo * SEC_PER_MONTH;
+    const d = Math.floor(r / SEC_PER_DAY);
+    r -= d * SEC_PER_DAY;
+    const h = Math.floor(r / SEC_PER_HOUR);
+    r -= h * SEC_PER_HOUR;
+    const mi = Math.floor(r / SEC_PER_MIN);
+    const s = Math.floor(r - mi * SEC_PER_MIN);
+
+    const parts: string[] = [];
+    if (y > 0) parts.push(`${y}yr`);
+    if (mo > 0) parts.push(`${mo}mo`);
+    if (d > 0) parts.push(`${d}d`);
+    if (h > 0) parts.push(`${h}h`);
+    parts.push(`${mi}min`);
+    parts.push(`${s}s`);
+    return parts.join(" ");
+  }
+
+  function parseDeviceInfoBlob(raw: unknown): Record<string, unknown> | null {
+    if (raw === undefined || raw === null) return null;
+    let obj: unknown;
+    if (typeof raw === "string") {
+      const t = raw.trim();
+      if (!t) return null;
+      try {
+        obj = JSON.parse(t) as unknown;
+      } catch {
+        return null;
+      }
+    } else if (typeof raw === "object" && !Array.isArray(raw)) {
+      obj = raw;
+    } else {
+      return null;
+    }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+    return obj as Record<string, unknown>;
+  }
+
+  function pickIdentityString(v: unknown): string | undefined {
+    if (typeof v === "string") {
+      const t = v.trim();
+      return t || undefined;
+    }
+    if (typeof v === "number" && Number.isFinite(v)) return String(v);
+    return undefined;
+  }
+
+  /** Pull common identity fields from a miner device_info JSON object. */
+  function extractDeviceIdentityFields(device: Record<string, unknown>): {
+    firmware?: string;
+    make?: string;
+    model?: string;
+  } {
+    const firmware = pickIdentityString(
+      device.firmware ?? device.fw ?? device.firmware_version,
+    );
+    const make = pickIdentityString(device.make ?? device.vendor ?? device.manufacturer);
+    const model = pickIdentityString(
+      device.model ??
+        device.product ??
+        device.product_name ??
+        device.name ??
+        device.device_model,
+    );
+    const out: { firmware?: string; make?: string; model?: string } = {};
+    if (firmware) out.firmware = firmware;
+    if (make) out.make = make;
+    if (model) out.model = model;
+    return out;
+  }
+
+  /** Flatten device_info JSON into firmware/make/model columns and drop the blob key. */
+  function expandDeviceInfoInRowRecord(row: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...row };
+    for (const k of LEGACY_DEVICE_INFO_KEYS) {
+      if (!(k in out)) continue;
+      const parsed = parseDeviceInfoBlob(out[k]);
+      if (!parsed) continue;
+      const identity = extractDeviceIdentityFields(parsed);
+      delete out[k];
+      for (const [ik, iv] of Object.entries(identity)) {
+        const cur = out[ik];
+        const empty =
+          cur === undefined ||
+          cur === null ||
+          (typeof cur === "string" && !String(cur).trim());
+        if (empty && typeof iv === "string" && iv) out[ik] = iv;
+      }
+      break;
+    }
+    return out;
+  }
+
+  /** JSON object/string with a `name` field (e.g. control board `{"known":true,"name":"B602"}`). */
+  function formatJsonNamedBlob(value: unknown): string | null {
+    const rec = parseDeviceInfoBlob(value);
+    if (!rec) return null;
+    const name = pickIdentityString(rec.name);
+    return name ?? null;
   }
 
   function formatHashRateValue(value: unknown) {
@@ -356,62 +1264,398 @@
     return `${scaled.amount.toFixed(2)} ${scaled.unit}`;
   }
 
+  /** Split `snake_case` or `camelCase` column keys into lowercase word parts. */
+  function splitColumnKeyToParts(key: string): string[] {
+    const withUnderscores = key.replace(/([a-z\d])([A-Z])/g, "$1_$2");
+    return withUnderscores.split("_").filter(Boolean).map((p) => p.toLowerCase());
+  }
+
+  function titleCaseHeaderPart(part: string): string {
+    const acronyms: Record<string, string> = {
+      ip: "IP",
+      mac: "MAC",
+      api: "API",
+      id: "ID",
+      psu: "PSU",
+      rpm: "RPM",
+      uuid: "UUID",
+      url: "URL",
+      rgb: "RGB",
+      json: "JSON",
+      tls: "TLS",
+      ssl: "SSL",
+      dhcp: "DHCP",
+      dns: "DNS",
+      ntp: "NTP",
+    };
+    const lower = part.toLowerCase();
+    const acronym = acronyms[lower];
+    if (acronym !== undefined) return acronym;
+    if (lower === "hashrate") return "HashRate";
+    return lower.charAt(0).toUpperCase() + lower.slice(1);
+  }
+
   function formatColumnHeader(col: string) {
     const explicit: Record<string, string> = {
       ip: "IP",
       mac: "MAC",
       hashrate: "HashRate",
       average_temperature: "Avg Temp",
+      firmware: "Firmware",
+      make: "Make",
+      model: "Model",
+      control_board_version: "Control Board",
+      controlBoardVersion: "Control Board",
+      expected_hashrate: "HashRate Performance",
+      expectedHashrate: "HashRate Performance",
+      expected_chips: "# of Chips",
+      expectedChips: "# of Chips",
+      expected_fans: "# of Fans",
+      expectedFans: "# of Fans",
+      fans: "Fans",
+      expected_hashboards: "# of Hashboards",
+      expectedHashboards: "# of Hashboards",
+      schema_version: "Schema Version",
+      serial_number: "Serial Number",
+      firmware_version: "Firmware Version",
+      hostname: "Hostname",
+      hashboards: "Hashboards",
+      psu_fans: "PSU Fans",
+      fluid_temperature: "Fluid Temperature",
+      fluidTemperature: "Fluid Temperature",
+      tuning_target: "Tuning Target",
+      light_flashing: "Light Flashing",
+      wattage: "Wattage",
+      efficiency: "Efficiency",
+      messages: "Messages",
+      uptime: "Uptime",
+      pools: "Pools",
+      pools_accepted: "Accepted Shares",
+      pools_rejected: "Rejected Shares",
+      pools_stratum: "Pool",
+      timestamp: "Last Seen",
+      status: "Status",
+      discovery: "Discovery",
     };
     const mapped = explicit[col];
     if (mapped) return mapped;
-    return col
-      .split("_")
-      .filter(Boolean)
-      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-      .join(" ");
+    return splitColumnKeyToParts(col).map(titleCaseHeaderPart).join(" ");
   }
 
-  function refreshGridLayout() {
-    if (!gridApi) return;
-    gridApi.refreshCells({ force: true });
-    gridApi.autoSizeAllColumns(false);
-    // Keep each column's minWidth aligned to its latest autosized width.
-    for (const column of gridApi.getAllDisplayedColumns()) {
-      const width = column.getActualWidth();
-      column.getColDef().minWidth = width;
+  /** Autosize often under-measures custom cell renderers; never shrink these below this width. */
+  const AUTOSIZE_MIN_WIDTH_FLOOR_PX: Record<string, number> = {
+    expected_hashrate: 188,
+    expectedHashrate: 188,
+    expected_chips: 118,
+    expectedChips: 118,
+    expected_fans: 118,
+    expectedFans: 118,
+    expected_hashboards: 118,
+    expectedHashboards: 118,
+    fans: 168,
+    timestamp: 168,
+    uptime: 220,
+  };
+
+  /** One-shot autosize + min-width floors (only when no saved column layout exists). */
+  function runGridAutosizeWithWidthFloors(api: GridApi<GridRow>) {
+    api.autoSizeAllColumns(false);
+    const widen: { key: string; newWidth: number }[] = [];
+    for (const column of api.getAllDisplayedColumns()) {
+      const rawW = column.getActualWidth();
+      const width = typeof rawW === "number" ? rawW : 0;
+      const field = column.getColDef().field as string | undefined;
+      const floor = field ? (AUTOSIZE_MIN_WIDTH_FLOOR_PX[field] ?? 0) : 0;
+      const nextMin = Math.max(width, floor);
+      column.getColDef().minWidth = nextMin;
+      if (nextMin > width) {
+        widen.push({ key: column.getColId(), newWidth: nextMin });
+      }
+    }
+    if (widen.length > 0) {
+      api.setColumnWidths(widen);
     }
   }
 
-  function applyTargetProfile(profileId: string) {
-    selectedProfileId = profileId;
-    const profile = targetProfiles.find((p) => p.id === profileId);
+  function bumpAutoLoopsForProfileScopeChange() {
+    autoLoopRestartEpoch += 1;
+  }
+
+  /** Stop any in-flight discover/enrich run and detach listeners after backend cancel (profile switch). */
+  async function interruptAllDiscoveryRunsForUi() {
+    try {
+      await invoke<number>("stop_all_discovery_runs");
+    } catch {
+      // ignore
+    }
+    for (const u of unlistenFns) void u();
+    unlistenFns = [];
+    if (coalesceTimer) clearTimeout(coalesceTimer);
+    coalesceTimer = null;
+    workbenchPendingRows.clear();
+    busy = false;
+    runId = null;
+    activeRunKind = null;
+    flushRows();
+  }
+
+  async function pruneStateToCurrentTargetsSpec() {
+    const spec = targets.trim();
+    if (!spec) return;
+
+    const candidates = new Set<string>();
+    for (const d of knownDevices) {
+      const ip = d.ip.trim();
+      if (ip) candidates.add(ip);
+    }
+    for (const ev of discoveryWorkbench.rows.values()) {
+      const ip = typeof ev.row?.ip === "string" ? ev.row.ip.trim() : "";
+      if (ip) candidates.add(ip);
+    }
+    const list = [...candidates];
+    if (list.length === 0) return;
+
+    try {
+      const kept = await invoke<string[]>("filter_ips_matching_targets", {
+        ips: list,
+        targets: spec,
+      });
+      const keptSet = new Set(kept.map((s) => s.trim()));
+
+      knownDevices = knownDevices.filter((d) => keptSet.has(d.ip.trim()));
+
+      const nextRows = new Map(discoveryWorkbench.rows);
+      for (const [k, ev] of discoveryWorkbench.rows) {
+        const ip = typeof ev.row?.ip === "string" ? ev.row.ip.trim() : "";
+        if (ip && !keptSet.has(ip)) nextRows.delete(k);
+      }
+      discoveryWorkbench.rows = nextRows;
+
+      for (const k of [...workbenchPendingRows.keys()]) {
+        if (!keptSet.has(k)) workbenchPendingRows.delete(k);
+      }
+
+      const nextMiss = new Map(discoveryWorkbench.missStreakByRow);
+      for (const rk of [...nextMiss.keys()]) {
+        if (!keptSet.has(rk)) nextMiss.delete(rk);
+      }
+      discoveryWorkbench.missStreakByRow = nextMiss;
+
+      const nextMovement = new Map(discoveryWorkbench.movementByCell);
+      for (const key of [...nextMovement.keys()]) {
+        const idx = key.lastIndexOf(":");
+        const rowId = idx > 0 ? key.slice(0, idx) : "";
+        if (rowId && !keptSet.has(rowId)) nextMovement.delete(key);
+      }
+      discoveryWorkbench.movementByCell = nextMovement;
+    } catch (e) {
+      console.warn("prune targets: filter_ips_matching_targets failed", e);
+    }
+  }
+
+  /** After profile/target scope changes: cancel runs, prune, reset auto-interval clocks, optionally start discover immediately. */
+  async function handleProfileTargetsScopeChanged() {
+    await interruptAllDiscoveryRunsForUi();
+    bumpAutoLoopsForProfileScopeChange();
+    await pruneStateToCurrentTargetsSpec();
+    if (settings.autoDiscoverEnabled && targets.trim()) {
+      queueMicrotask(() => void startRun());
+    }
+  }
+
+  async function applyTargetProfile(profileId: string) {
+    const id = profileId || DEFAULT_PROFILE_ID;
+    selectedProfileId = id;
+    const profile = targetProfiles.find((p) => p.id === id);
     if (profile) {
       targets = profile.targets;
     }
+    await handleProfileTargetsScopeChanged();
   }
 
-  function saveTargetProfile() {
-    const value = targets.trim();
-    if (!value) return;
-    const existing = targetProfiles.find((p) => p.id === selectedProfileId);
-    if (existing) {
-      existing.targets = value;
-      targetProfiles = [...targetProfiles];
+  function closeProfileDrawer() {
+    profileDrawerOpen = false;
+    profileDrawerPane = "list";
+    profileDrawerEditingId = null;
+    drawerProfileName = "";
+    drawerProfileTargets = "";
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileListDeletePendingId = null;
+  }
+
+  function openProfilesDrawer() {
+    profileMenuOpen = false;
+    profileDrawerPane = "list";
+    profileDrawerEditingId = null;
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileListDeletePendingId = null;
+    profileDrawerOpen = true;
+  }
+
+  async function pickProfileFromMenu(profileId: string) {
+    profileMenuOpen = false;
+    await applyTargetProfile(profileId);
+  }
+
+  function backToProfilesListFromForm() {
+    profileDrawerPane = "list";
+    profileDrawerEditingId = null;
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileListDeletePendingId = null;
+  }
+
+  function navigateToProfileFormNew() {
+    profileDrawerPane = "form";
+    profileDrawerEditingId = null;
+    drawerProfileName = "";
+    drawerProfileTargets = targets.trim();
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileListDeletePendingId = null;
+  }
+
+  function navigateToProfileFormEdit(profileId: string) {
+    const p = targetProfiles.find((x) => x.id === profileId);
+    if (!p) return;
+    profileDrawerPane = "form";
+    profileDrawerEditingId = p.id;
+    drawerProfileName = p.name;
+    drawerProfileTargets = p.targets;
+    profileDrawerError = null;
+    profileDeleteConfirmPending = false;
+    profileListDeletePendingId = null;
+  }
+
+  function ellipsisTargets(spec: string, maxLen = 72) {
+    const t = spec.replace(/\s+/g, " ").trim();
+    if (t.length <= maxLen) return t;
+    return `${t.slice(0, Math.max(0, maxLen - 3))}...`;
+  }
+
+  function startProfileListDelete(profileId: string) {
+    if (profileId === DEFAULT_PROFILE_ID) return;
+    profileDrawerError = null;
+    profileListDeletePendingId = profileId;
+  }
+
+  function cancelProfileListDelete() {
+    profileListDeletePendingId = null;
+  }
+
+  async function confirmProfileListDelete() {
+    const id = profileListDeletePendingId;
+    if (!id || id === DEFAULT_PROFILE_ID) return;
+    targetProfiles = normalizeTargetProfiles(targetProfiles.filter((p) => p.id !== id));
+    if (selectedProfileId === id) {
+      selectedProfileId = DEFAULT_PROFILE_ID;
+      const def = targetProfiles.find((p) => p.id === DEFAULT_PROFILE_ID);
+      if (def) targets = def.targets;
+    }
+    profileListDeletePendingId = null;
+    await handleProfileTargetsScopeChanged();
+  }
+
+  /**
+   * Overwrites the built-in Default profile (reserved id) with this profile's name/targets,
+   * selects Default, and applies discovery scope — used for session/fallback when no saved selection.
+   */
+  async function setBuiltinDefaultFromProfile(profileId: string) {
+    if (profileId === DEFAULT_PROFILE_ID) return;
+    const src = targetProfiles.find((x) => x.id === profileId);
+    if (!src) return;
+    const name = src.name.trim() || "Default";
+    const t = src.targets.trim();
+    if (!t) return;
+    targetProfiles = normalizeTargetProfiles(
+      targetProfiles.map((prof) =>
+        prof.id === DEFAULT_PROFILE_ID ? { ...prof, name, targets: t } : prof,
+      ),
+    );
+    selectedProfileId = DEFAULT_PROFILE_ID;
+    targets = t;
+    await handleProfileTargetsScopeChanged();
+  }
+
+  function startProfileDeleteConfirmation() {
+    const id = profileDrawerEditingId;
+    if (!id || id === DEFAULT_PROFILE_ID) return;
+    profileDrawerError = null;
+    profileDeleteConfirmPending = true;
+  }
+
+  function cancelProfileDeleteConfirmation() {
+    profileDeleteConfirmPending = false;
+  }
+
+  function normalizeProfileNameKey(name: string) {
+    return name.trim().toLowerCase();
+  }
+
+  function profileNameTakenByOther(
+    ignoringId: string | null,
+    name: string,
+  ): string | null {
+    const nk = normalizeProfileNameKey(name);
+    for (const p of targetProfiles) {
+      if (ignoringId && p.id === ignoringId) continue;
+      if (normalizeProfileNameKey(p.name) === nk) return "Another profile already uses this name.";
+    }
+    return null;
+  }
+
+  async function saveProfileFromDrawer() {
+    profileDrawerError = null;
+    const name = drawerProfileName.trim();
+    const t = drawerProfileTargets.trim();
+    if (!name) {
+      profileDrawerError = "Enter a profile name.";
       return;
     }
-
-    const name = window.prompt("Profile name", `Targets ${targetProfiles.length + 1}`)?.trim();
-    if (!name) return;
-    const id = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`;
-    targetProfiles = [...targetProfiles, { id, name, targets: value }];
-    selectedProfileId = id;
+    if (!t) {
+      profileDrawerError = "Enter at least one target (CIDR, IP, or range).";
+      return;
+    }
+    const dup = profileNameTakenByOther(profileDrawerEditingId, name);
+    if (dup) {
+      profileDrawerError = dup;
+      return;
+    }
+    const editingId = profileDrawerEditingId;
+    if (editingId) {
+      targetProfiles = normalizeTargetProfiles(
+        targetProfiles.map((p) =>
+          p.id === editingId ? { ...p, name, targets: t } : p,
+        ),
+      );
+      if (selectedProfileId === editingId) {
+        targets = t;
+      }
+    } else {
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `${Date.now()}`;
+      targetProfiles = normalizeTargetProfiles([...targetProfiles, { id, name, targets: t }]);
+      selectedProfileId = id;
+      targets = t;
+    }
+    await handleProfileTargetsScopeChanged();
+    backToProfilesListFromForm();
   }
 
-  function deleteTargetProfile() {
-    if (!selectedProfileId) return;
-    targetProfiles = targetProfiles.filter((p) => p.id !== selectedProfileId);
-    selectedProfileId = "";
+  async function confirmDeleteProfileFromDrawer() {
+    const id = profileDrawerEditingId;
+    if (!id || id === DEFAULT_PROFILE_ID) return;
+    targetProfiles = normalizeTargetProfiles(targetProfiles.filter((p) => p.id !== id));
+    if (selectedProfileId === id) {
+      selectedProfileId = DEFAULT_PROFILE_ID;
+      const def = targetProfiles.find((p) => p.id === DEFAULT_PROFILE_ID);
+      if (def) targets = def.targets;
+    }
+    profileDeleteConfirmPending = false;
+    await handleProfileTargetsScopeChanged();
+    backToProfilesListFromForm();
   }
 
   function normalizeKnownDevices(devices: KnownDevice[]) {
@@ -429,24 +1673,36 @@
     return [...byIp.values()].sort((a, b) => a.ip.localeCompare(b.ip));
   }
 
-  function clearKnownDevicesAction() {
-    if (typeof window !== "undefined" && !window.confirm("Clear all persisted known devices?")) {
-      return;
-    }
+  function executeClearKnownDevices() {
     knownDevices = [];
     clearKnownDevices();
+    workbenchPendingRows.clear();
+    discoveryWorkbench.rows = new Map();
+    discoveryWorkbench.missStreakByRow = new Map();
+    discoveryWorkbench.movementByCell = new Map();
+    discoveryWorkbench.progress = { ...emptyWorkbenchProgress() };
+    clearDevicesConfirmPending = false;
+  }
+
+  function cancelClearKnownDevicesConfirm() {
+    clearDevicesConfirmPending = false;
+  }
+
+  function startClearKnownDevicesConfirm() {
+    if (knownDevices.length === 0) return;
+    clearDevicesConfirmPending = true;
   }
 
   function flushRows() {
-    if (pendingRows.size === 0) return;
-    const next = new Map(rows);
-    for (const [k, v] of pendingRows) {
+    if (workbenchPendingRows.size === 0) return;
+    const next = new Map(discoveryWorkbench.rows);
+    for (const [k, v] of workbenchPendingRows) {
       const existing = next.get(k);
       if (existing && isFinalStatus(existing.status) && !isFinalStatus(v.status)) continue;
       next.set(k, v);
     }
-    pendingRows.clear();
-    rows = next;
+    workbenchPendingRows.clear();
+    discoveryWorkbench.rows = next;
   }
 
   function scheduleCoalesce() {
@@ -466,39 +1722,39 @@
     const key = rowKeyForEvent(ev);
     const normalizedEvent = key === ev.id ? ev : { ...ev, id: key };
     if (activeRunKind === "discover" && normalizedEvent.status === "Miss") {
-      const nextStreak = (missStreakByRow.get(key) ?? 0) + 1;
-      const nextMissStreak = new Map(missStreakByRow);
+      const nextStreak = (discoveryWorkbench.missStreakByRow.get(key) ?? 0) + 1;
+      const nextMissStreak = new Map(discoveryWorkbench.missStreakByRow);
       nextMissStreak.set(key, nextStreak);
-      missStreakByRow = nextMissStreak;
+      discoveryWorkbench.missStreakByRow = nextMissStreak;
       if (nextStreak >= 3) {
-        pendingRows.delete(key);
-        const nextRows = new Map(rows);
+        workbenchPendingRows.delete(key);
+        const nextRows = new Map(discoveryWorkbench.rows);
         nextRows.delete(key);
-        rows = nextRows;
-        const nextMovement = new Map(movementByCell);
-        for (const col of MOVEMENT_COLUMNS) {
+        discoveryWorkbench.rows = nextRows;
+        const nextMovement = new Map(discoveryWorkbench.movementByCell);
+        for (const col of [...MOVEMENT_COLUMNS, ...POOLS_MOVEMENT_IDS]) {
           nextMovement.delete(movementKey(key, col));
         }
-        movementByCell = nextMovement;
-        const resetMissStreak = new Map(missStreakByRow);
+        discoveryWorkbench.movementByCell = nextMovement;
+        const resetMissStreak = new Map(discoveryWorkbench.missStreakByRow);
         resetMissStreak.delete(key);
-        missStreakByRow = resetMissStreak;
+        discoveryWorkbench.missStreakByRow = resetMissStreak;
       }
       return;
     }
     if (isFinalStatus(ev.status)) {
       // Show finalized discovery rows immediately when enrichment completes.
-      pendingRows.delete(key);
-      const previous = rows.get(key);
-      rows = new Map(rows).set(key, normalizedEvent);
-      if (missStreakByRow.has(key)) {
-        const nextMissStreak = new Map(missStreakByRow);
+      workbenchPendingRows.delete(key);
+      const previous = discoveryWorkbench.rows.get(key);
+      discoveryWorkbench.rows = new Map(discoveryWorkbench.rows).set(key, normalizedEvent);
+      if (discoveryWorkbench.missStreakByRow.has(key)) {
+        const nextMissStreak = new Map(discoveryWorkbench.missStreakByRow);
         nextMissStreak.delete(key);
-        missStreakByRow = nextMissStreak;
+        discoveryWorkbench.missStreakByRow = nextMissStreak;
       }
       const currentRow = normalizedEvent.row ?? {};
       const previousRow = previous?.row ?? {};
-      const nextMovement = new Map(movementByCell);
+      const nextMovement = new Map(discoveryWorkbench.movementByCell);
       for (const col of MOVEMENT_COLUMNS) {
         const prevMetric = parseMetricValue(col, previousRow[col]);
         const nextMetric = parseMetricValue(col, currentRow[col]);
@@ -520,12 +1776,32 @@
               : formatDelta(col, Math.abs(delta)),
         });
       }
-      movementByCell = nextMovement;
+      const prevPools = parsePoolsShareTotals(poolsRawFromRow(previousRow));
+      const nextPools = parsePoolsShareTotals(poolsRawFromRow(currentRow));
+      for (const movId of POOLS_MOVEMENT_IDS) {
+        const keyForCell = movementKey(key, movId);
+        const prevV = movId === "pools_accepted" ? prevPools.accepted : prevPools.rejected;
+        const nextV = movId === "pools_accepted" ? nextPools.accepted : nextPools.rejected;
+        if (prevV === null || nextV === null) {
+          nextMovement.delete(keyForCell);
+          continue;
+        }
+        const delta = nextV - prevV;
+        if (!Number.isFinite(delta) || delta <= 0) {
+          nextMovement.delete(keyForCell);
+          continue;
+        }
+        nextMovement.set(keyForCell, {
+          direction: "up",
+          deltaText: String(Math.round(delta)),
+        });
+      }
+      discoveryWorkbench.movementByCell = nextMovement;
       return;
     }
-    const existing = rows.get(key);
+    const existing = discoveryWorkbench.rows.get(key);
     if (existing && isFinalStatus(existing.status)) return;
-    pendingRows.set(key, normalizedEvent);
+    workbenchPendingRows.set(key, normalizedEvent);
     scheduleCoalesce();
   }
 
@@ -549,7 +1825,7 @@
       unlistenFns.push(
         await listen<DiscoveryProgress>(progEv, (e) => {
           if (activeRunKind !== "discover") return;
-          progress = e.payload;
+          discoveryWorkbench.progress = e.payload;
         }),
       );
       unlistenFns.push(
@@ -575,8 +1851,8 @@
   async function startRun() {
     if (activeRunKind) return;
     errorMsg = null;
-    progress = { ...emptyProgress };
-    pendingRows.clear();
+    discoveryWorkbench.progress = { ...emptyWorkbenchProgress() };
+    workbenchPendingRows.clear();
     busy = true;
     activeRunKind = "discover";
     const id =
@@ -601,7 +1877,7 @@
   async function startKnownDeviceEnrichRun() {
     if (busy || knownDevices.length === 0) return;
     errorMsg = null;
-    pendingRows.clear();
+    workbenchPendingRows.clear();
     busy = true;
     activeRunKind = "enrich";
     const id =
@@ -641,8 +1917,32 @@
     }
   }
 
+  /** True when there is no usable fluid temperature reading (null, NaN, string "null", etc.). */
+  function isFluidTemperatureValueEmpty(v: unknown): boolean {
+    if (v === undefined || v === null) return true;
+    if (typeof v === "number") return !Number.isFinite(v);
+    if (typeof v === "string") {
+      const t = v.trim().toLowerCase();
+      if (t === "" || t === "null" || t === "undefined") return true;
+      return !Number.isFinite(Number.parseFloat(t));
+    }
+    if (typeof v === "object" && !Array.isArray(v)) {
+      const o = v as Record<string, unknown>;
+      const inner = o.value ?? o.celsius;
+      if (inner === undefined || inner === null) return true;
+      if (typeof inner === "number") return !Number.isFinite(inner);
+      if (typeof inner === "string") {
+        const s = inner.trim().toLowerCase();
+        if (s === "" || s === "null") return true;
+        return !Number.isFinite(Number.parseFloat(s));
+      }
+      return true;
+    }
+    return true;
+  }
+
   const rowList = $derived(
-    [...rows.values()].sort((a, b) => a.id.localeCompare(b.id)),
+    [...discoveryWorkbench.rows.values()].sort((a, b) => a.id.localeCompare(b.id)),
   );
 
   const visibleRowList = $derived(
@@ -655,36 +1955,81 @@
     const keys = new Set<string>();
     for (const r of visibleRowList) {
       if (r.row && typeof r.row === "object") {
-        for (const k of Object.keys(r.row)) {
-          if (k !== "_truncated") keys.add(k);
+        const expanded = expandDeviceInfoInRowRecord(r.row as Record<string, unknown>);
+        for (const k of Object.keys(expanded)) {
+          if (k !== "_truncated" && !LEGACY_DEVICE_INFO_KEYS.has(k)) keys.add(k);
         }
       }
     }
     return [...keys].sort();
   });
 
-  const columnKeys = $derived.by(() => {
-    const merged = new Set<string>([...BASELINE_COLUMN_KEYS, ...rememberedColumnKeys, ...discoveredColumnKeys]);
-    const sorted = [...merged].sort();
+  const canonicalColumnKeys = $derived.by(() => {
+    const merged = new Set<string>([
+      ...BASELINE_COLUMN_KEYS,
+      ...rememberedColumnKeys.filter((k) => !LEGACY_DEVICE_INFO_KEYS.has(k)),
+      ...discoveredColumnKeys,
+    ]);
+    // Preserve insertion order from the Set (baseline → remembered → discovered); do not sort,
+    // or auto-discover / enrich will reshuffle columns whenever new fields appear.
+    const ordered = [...merged];
     const preferredPinned = ["ip", "mac"];
-    const preferredUnpinnedLeft = ["hashrate", "average_temperature", "efficiency", "wattage"];
-    const pinned = preferredPinned.filter((key) => sorted.includes(key));
-    const remaining = sorted.filter((key) => !preferredPinned.includes(key));
+    const preferredUnpinnedLeft = [
+      "hashrate",
+      "expected_hashrate",
+      "expectedHashrate",
+      "expected_chips",
+      "expectedChips",
+      "expected_fans",
+      "expectedFans",
+      "fans",
+      "expected_hashboards",
+      "expectedHashboards",
+      "average_temperature",
+      "efficiency",
+      "wattage",
+      "timestamp",
+      "uptime",
+    ];
+    const preferredIdentity = ["firmware", "make", "model"];
+    const pinned = preferredPinned.filter((key) => ordered.includes(key));
+    const remaining = ordered.filter((key) => !preferredPinned.includes(key));
     const leftUnpinned = preferredUnpinnedLeft.filter((key) => remaining.includes(key));
-    const rest = remaining.filter((key) => !preferredUnpinnedLeft.includes(key));
-    return ["status", ...pinned, ...leftUnpinned, ...rest];
+    const identityCols = preferredIdentity.filter((key) => remaining.includes(key));
+    const rest = remaining.filter(
+      (key) => !preferredUnpinnedLeft.includes(key) && !preferredIdentity.includes(key),
+    );
+    return expandPoolsColumnKeys(["status", ...pinned, ...leftUnpinned, ...identityCols, ...rest]);
   });
 
   const gridRowData = $derived(
     visibleRowList.map((r) => ({
       id: r.id,
       status: r.status,
-      ...(r.row ?? {}),
+      ...expandDeviceInfoInRowRecord((r.row ?? {}) as Record<string, unknown>),
     })),
   );
 
+  const fluidTemperatureHiddenAllNull = $derived.by(() => {
+    if (gridRowData.length === 0) return false;
+    for (const row of gridRowData) {
+      const rec = row as Record<string, unknown>;
+      const v = rec.fluid_temperature ?? rec.fluidTemperature;
+      if (!isFluidTemperatureValueEmpty(v)) return false;
+    }
+    return true;
+  });
+
+  const displayColumnKeys = $derived.by(() =>
+    mergeDisplayColumnOrder(canonicalColumnKeys, persistedColumnOrderIds),
+  );
+
+  const layoutIdentitySig = $derived(
+    layoutIdentitySigFromCanonical(canonicalColumnKeys, fluidTemperatureHiddenAllNull),
+  );
+
   const gridColumnDefs = $derived.by<ColDef<GridRow>[]>(() =>
-    columnKeys.map((col): ColDef<GridRow> => {
+    displayColumnKeys.map((col): ColDef<GridRow> => {
       if (col === "status") {
         return {
           field: col,
@@ -699,9 +2044,353 @@
         };
       }
 
+      if (col === "expected_hashrate" || col === "expectedHashrate") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 188,
+          flex: 0.9,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => {
+            const v = hashrateVersusExpectedPercentFromRow(p.data as GridRow | undefined);
+            return v === null ? undefined : v;
+          },
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => {
+            const v = p.value;
+            if (typeof v !== "number" || !Number.isFinite(v)) return "\u2014";
+            return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)}% of expected`;
+          },
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return 1;
+            if (!Number.isFinite(nb)) return -1;
+            return na - nb;
+          },
+          cellRenderer: (params: ICellRendererParams<GridRow>) => {
+            const pct =
+              typeof params.value === "number" && Number.isFinite(params.value)
+                ? params.value
+                : hashrateVersusExpectedPercentFromRow(params.data);
+            const wrap = document.createElement("div");
+            if (pct === null || !Number.isFinite(pct)) {
+              wrap.textContent = "\u2014";
+              wrap.style.color = "rgb(161, 161, 170)";
+              wrap.style.fontSize = "12px";
+              return wrap;
+            }
+            const pctLabel = `${pct >= 100 ? pct.toFixed(0) : pct.toFixed(1)}%`;
+            const title =
+              pct > 100
+                ? `Above expected: ${pct.toFixed(1)}% of target (full bar, stripes and + mean over 100%).`
+                : pct < 100
+                  ? `Below expected: ${pct.toFixed(1)}% of target (bar length vs full track = 100% nominal).`
+                  : `On target: ${pct.toFixed(0)}% of expected hashrate.`;
+            appendVersusExpectedPercentVisual(wrap, pct, pctLabel, title);
+            return wrap;
+          },
+        };
+      }
+
+      if (
+        col === "expected_chips" ||
+        col === "expectedChips" ||
+        col === "expected_fans" ||
+        col === "expectedFans" ||
+        col === "expected_hashboards" ||
+        col === "expectedHashboards"
+      ) {
+        const kind =
+          col === "expected_chips" || col === "expectedChips"
+            ? ("chips" as const)
+            : col === "expected_fans" || col === "expectedFans"
+              ? ("fans" as const)
+              : ("hashboards" as const);
+        const noun =
+          kind === "chips" ? "chips" : kind === "fans" ? "fans" : "hashboards";
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 118,
+          flex: 0.35,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => {
+            const v = countVersusExpectedFromRow(p.data as GridRow | undefined, kind);
+            return v === null ? undefined : v.pct;
+          },
+          valueFormatter: (_p: ValueFormatterParams<GridRow>) => {
+            const m = countVersusExpectedFromRow(_p.data as GridRow | undefined, kind);
+            if (!m) return "\u2014";
+            const ok = m.actual >= m.expected;
+            return `${ok ? "OK" : "LOW"} ${m.actual}/${m.expected} ${noun}`;
+          },
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return 1;
+            if (!Number.isFinite(nb)) return -1;
+            return na - nb;
+          },
+          cellRenderer: (params: ICellRendererParams<GridRow>) => {
+            const m = countVersusExpectedFromRow(params.data, kind);
+            const wrap = document.createElement("div");
+            if (!m) {
+              wrap.textContent = "\u2014";
+              wrap.style.cssText = "color:rgb(161,161,170);font-size:12px;padding:2px 6px;";
+              return wrap;
+            }
+            const met = m.actual >= m.expected;
+            wrap.style.cssText =
+              "display:flex;flex-direction:row;align-items:center;gap:6px;padding:2px 6px;line-height:1;";
+            const icon = document.createElement("span");
+            icon.setAttribute("aria-hidden", "true");
+            icon.style.cssText =
+              "font-size:15px;font-weight:600;width:1.1em;text-align:center;flex-shrink:0;";
+            if (met) {
+              icon.textContent = "\u2714";
+              icon.style.color = "rgba(52, 211, 153, 0.95)";
+              wrap.title =
+                m.actual > m.expected
+                  ? `${m.actual} ${noun} reported, ${m.expected} expected — above nominal (still meeting minimum).`
+                  : `${m.actual} of ${m.expected} expected ${noun} — meets expectation.`;
+            } else {
+              icon.textContent = "\u2716";
+              icon.style.color = "rgba(248, 113, 113, 0.95)";
+              wrap.title = `${m.actual} of ${m.expected} expected ${noun} — below expectation.`;
+            }
+            const sub = document.createElement("span");
+            sub.style.cssText =
+              "font-family:ui-monospace,monospace;font-variant-numeric:tabular-nums;font-size:10px;color:rgba(161,161,170,0.95);white-space:nowrap;";
+            sub.textContent = `${m.actual}\u2044${m.expected}`;
+            wrap.append(icon, sub);
+            return wrap;
+          },
+        };
+      }
+
+      if (col === "fans") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 168,
+          flex: 0.85,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => fanSortMetricFromRow(p.data as GridRow | undefined),
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => {
+            const row = p.data as GridRow | undefined;
+            const raw = row ? (row as Record<string, unknown>).fans : undefined;
+            return formatColumnValue("fans", raw);
+          },
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return 1;
+            if (!Number.isFinite(nb)) return -1;
+            return na - nb;
+          },
+          cellRenderer: (params: ICellRendererParams<GridRow>) => {
+            const fans = parseFansFromRow(params.data);
+            const wrap = document.createElement("div");
+            wrap.className = "tm-fan-cell";
+            if (fans.length === 0) {
+              wrap.textContent = "\u2014";
+              wrap.style.color = "rgb(161, 161, 170)";
+              wrap.style.fontSize = "12px";
+              return wrap;
+            }
+            for (const f of fans) {
+              const slot = document.createElement("div");
+              slot.className = "tm-fan-slot";
+              const icon = createFanIconElement(f.rpmRounded);
+              const rpmEl = document.createElement("span");
+              rpmEl.className = "tm-fan-rpm";
+              if (f.rpmRounded === null) {
+                rpmEl.textContent = "\u2014";
+                rpmEl.style.color = "rgb(161, 161, 170)";
+              } else {
+                const num = document.createElement("span");
+                num.className = "tm-fan-rpm-num";
+                num.textContent = String(f.rpmRounded);
+                const unit = document.createElement("span");
+                unit.className = "tm-fan-rpm-unit";
+                unit.textContent = " rpm";
+                rpmEl.append(num, unit);
+              }
+              slot.append(icon, rpmEl);
+              wrap.appendChild(slot);
+            }
+            wrap.removeAttribute("title");
+            return wrap;
+          },
+        };
+      }
+
+      if (col === "timestamp") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 168,
+          flex: 0.45,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) =>
+            parseUnixTimestampSeconds((p.data as Record<string, unknown> | undefined)?.timestamp),
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return -1;
+            if (!Number.isFinite(nb)) return 1;
+            return na - nb;
+          },
+          cellRenderer: (params: ValueFormatterParams<GridRow>) =>
+            formatColumnValue(col, params.value),
+        };
+      }
+
+      if (col === "uptime") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 220,
+          flex: 0.55,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) =>
+            parseUptimeTotalSeconds((p.data as Record<string, unknown> | undefined)?.uptime),
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return -1;
+            if (!Number.isFinite(nb)) return 1;
+            return na - nb;
+          },
+          cellRenderer: (params: ValueFormatterParams<GridRow>) =>
+            formatColumnValue(col, params.value),
+        };
+      }
+
+      if (col === "pools_accepted") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 148,
+          flex: 0.45,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => {
+            const t = parsePoolsShareTotals(poolsRawFromRow(p.data as Record<string, unknown> | undefined));
+            return t.accepted ?? Number.MIN_SAFE_INTEGER;
+          },
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return -1;
+            if (!Number.isFinite(nb)) return 1;
+            return na - nb;
+          },
+          cellRenderer: (params: ValueFormatterParams<GridRow>) => {
+            const formatted = formatColumnValue(col, params.value);
+            const rowId = typeof params.data?.id === "string" ? params.data.id : "";
+            if (!rowId) return formatted;
+            const movement = discoveryWorkbench.movementByCell.get(movementKey(rowId, "pools_accepted"));
+            if (!movement) return formatted;
+            const wrapper = document.createElement("span");
+            wrapper.className = "tm-move-cell";
+            const valueEl = document.createElement("span");
+            valueEl.className = "tm-move-value";
+            valueEl.textContent = formatted;
+            const indicator = document.createElement("span");
+            indicator.className = "tm-move-indicator tm-move-up";
+            indicator.textContent = ` \u2191 +${movement.deltaText}`;
+            wrapper.append(valueEl, indicator);
+            return wrapper;
+          },
+        };
+      }
+
+      if (col === "pools_rejected") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 148,
+          flex: 0.45,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => {
+            const t = parsePoolsShareTotals(poolsRawFromRow(p.data as Record<string, unknown> | undefined));
+            return t.rejected ?? Number.MIN_SAFE_INTEGER;
+          },
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return -1;
+            if (!Number.isFinite(nb)) return 1;
+            return na - nb;
+          },
+          cellRenderer: (params: ValueFormatterParams<GridRow>) => {
+            const formatted = formatColumnValue(col, params.value);
+            const rowId = typeof params.data?.id === "string" ? params.data.id : "";
+            if (!rowId) return formatted;
+            const movement = discoveryWorkbench.movementByCell.get(movementKey(rowId, "pools_rejected"));
+            if (!movement) return formatted;
+            const wrapper = document.createElement("span");
+            wrapper.className = "tm-move-cell";
+            const valueEl = document.createElement("span");
+            valueEl.className = "tm-move-value";
+            valueEl.textContent = formatted;
+            const indicator = document.createElement("span");
+            indicator.className = "tm-move-indicator tm-move-down";
+            indicator.textContent = ` \u2191 +${movement.deltaText}`;
+            wrapper.append(valueEl, indicator);
+            return wrapper;
+          },
+        };
+      }
+
+      if (col === "pools_stratum") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 220,
+          flex: 0.65,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) =>
+            parsePoolsStratumDisplay(poolsRawFromRow(p.data as Record<string, unknown> | undefined)),
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) =>
+            String(valueA ?? "").localeCompare(String(valueB ?? ""), undefined, { sensitivity: "base" }),
+          cellRenderer: (params: ValueFormatterParams<GridRow>) => formatColumnValue(col, params.value),
+        };
+      }
+
       return {
         field: col,
         headerName: formatColumnHeader(col),
+        hide:
+          col === "discovery" ||
+          col === "api_version" ||
+          col === "apiVersion" ||
+          col === "is_mining" ||
+          col === "isMining" ||
+          col === "total_chips" ||
+          col === "totalChips" ||
+          ((col === "fluid_temperature" || col === "fluidTemperature") &&
+            fluidTemperatureHiddenAllNull),
         pinned: col === "ip" || col === "mac" ? "left" : undefined,
         valueFormatter: (params: ValueFormatterParams<GridRow>) => formatColumnValue(col, params.value),
         cellRenderer: (params: ValueFormatterParams<GridRow>) => {
@@ -709,7 +2398,7 @@
           if (!MOVEMENT_COLUMNS.has(col)) return formatted;
           const rowId = typeof params.data?.id === "string" ? params.data.id : "";
           if (!rowId) return formatted;
-          const movement = movementByCell.get(movementKey(rowId, col));
+          const movement = discoveryWorkbench.movementByCell.get(movementKey(rowId, col));
           if (!movement) return formatted;
           const wrapper = document.createElement("span");
           wrapper.className = "tm-move-cell";
@@ -757,26 +2446,94 @@
   };
 
   const probeProgressPercent = $derived.by(() => {
-    if (progress.totalTargets <= 0) return activeRunKind === "discover" ? 0 : 100;
-    return Math.min(100, Math.max(0, (progress.probed / progress.totalTargets) * 100));
+    if (discoveryWorkbench.progress.totalTargets <= 0) return activeRunKind === "discover" ? 0 : 100;
+    return Math.min(100, Math.max(0, (discoveryWorkbench.progress.probed / discoveryWorkbench.progress.totalTargets) * 100));
   });
   const discoverInProgress = $derived(activeRunKind === "discover");
 
+  function formatCountdownMmSs(totalSec: number): string {
+    const s = Math.max(0, Math.ceil(totalSec));
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return `${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  }
+
+  const autoDiscoverNextInSec = $derived.by(() => {
+    autoDiscoverUiTick;
+    autoDiscoverCadenceAnchorMs;
+    autoLoopRestartEpoch;
+    if (!settings.autoDiscoverEnabled) return null;
+    const iv = Math.max(5, settings.autoDiscoverIntervalSec) * 1000;
+    const now = Date.now();
+    const anchor = autoDiscoverCadenceAnchorMs || now;
+    const elapsed = Math.max(0, now - anchor);
+    const n = Math.floor(elapsed / iv) + 1;
+    const nextMs = anchor + n * iv;
+    return Math.max(0, (nextMs - now) / 1000);
+  });
+
   onMount(() => {
     settings = loadDiscoverySettings();
-    targetProfiles = loadTargetProfiles();
+    targetProfiles = normalizeTargetProfiles(loadTargetProfiles());
+    let restoredSession = false;
+    if (typeof window !== "undefined") {
+      try {
+        const raw = window.sessionStorage.getItem(MAIN_UI_SESSION_KEY);
+        if (raw) {
+          const o = JSON.parse(raw) as { selectedProfileId?: unknown; targets?: unknown };
+          const sid = typeof o.selectedProfileId === "string" ? o.selectedProfileId : "";
+          const t = typeof o.targets === "string" ? o.targets : "";
+          if (sid && targetProfiles.some((p) => p.id === sid)) {
+            selectedProfileId = sid;
+            targets = t;
+            restoredSession = true;
+          }
+        }
+      } catch {
+        // ignore malformed session blob
+      }
+    }
+    if (!restoredSession) {
+      const def = targetProfiles.find((p) => p.id === DEFAULT_PROFILE_ID);
+      if (def) {
+        targets = def.targets;
+        selectedProfileId = DEFAULT_PROFILE_ID;
+      }
+    }
     knownDevices = loadKnownDevices();
     rememberedColumnKeys = loadGridColumnKeys();
+    const initialColState = loadGridColumnState();
+    persistedColumnOrderIds = initialColState?.length
+      ? initialColState.flatMap((c) => {
+          const id = c.colId;
+          if (typeof id !== "string" || !id.length) return [];
+          return expandPoolsColumnId(id);
+        })
+      : null;
+    discoveryListsPersistAllowed = true;
     if (!gridHost) return;
     const gridOptions: GridOptions<GridRow> = {
       rowModelType: "clientSide",
       defaultColDef,
       animateRows: true,
+      suppressColumnMoveAnimation: false,
       columnDefs: gridColumnDefs,
       rowData: gridRowData,
       onModelUpdated: () => {
         if (!gridApi) return;
-        refreshGridLayout();
+        gridApi.refreshCells({ force: true });
+      },
+      onColumnResized: (e) => {
+        if (e.finished) schedulePersistGridColumnLayout();
+      },
+      onColumnMoved: (e) => {
+        if (e.finished) schedulePersistGridColumnLayout();
+      },
+      onColumnPinned: () => {
+        schedulePersistGridColumnLayout();
+      },
+      onColumnVisible: () => {
+        schedulePersistGridColumnLayout();
       },
       localeText: {
         noRowsToShow: "No responding IPs yet",
@@ -784,27 +2541,110 @@
       getRowId: (params) => params.data.id,
     };
     gridApi = createGrid(gridHost, gridOptions);
-    requestAnimationFrame(() => refreshGridLayout());
+    requestAnimationFrame(() => {
+      if (!gridApi) return;
+      if (!loadGridColumnState()?.length) {
+        runGridAutosizeWithWidthFloors(gridApi);
+        schedulePersistGridColumnLayout();
+      }
+    });
   });
 
   $effect(() => {
+    if (!discoveryListsPersistAllowed) return;
     saveTargetProfiles(targetProfiles);
   });
 
+  /** Keep the selected profile's stored targets in sync with the main textarea (avoids losing edits on Default). */
   $effect(() => {
+    if (!discoveryListsPersistAllowed) return;
+    const id = selectedProfileId;
+    const t = targets;
+    untrack(() => {
+      const cur = targetProfiles.find((p) => p.id === id);
+      if (!cur || cur.targets === t) return;
+      targetProfiles = targetProfiles.map((p) => (p.id === id ? { ...p, targets: t } : p));
+    });
+  });
+
+  $effect(() => {
+    if (!discoveryListsPersistAllowed) return;
     saveKnownDevices(knownDevices);
   });
 
   $effect(() => {
-    const merged = [...new Set([...rememberedColumnKeys, ...discoveredColumnKeys])].sort();
+    if (typeof window === "undefined" || !discoveryListsPersistAllowed) return;
+    const sid = selectedProfileId;
+    const t = targets;
+    queueMicrotask(() => {
+      try {
+        window.sessionStorage.setItem(
+          MAIN_UI_SESSION_KEY,
+          JSON.stringify({ selectedProfileId: sid, targets: t }),
+        );
+      } catch {
+        // ignore quota / private mode
+      }
+    });
+  });
+
+  $effect(() => {
+    if (!profileDrawerOpen || typeof window === "undefined") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      if (profileDrawerPane === "form") {
+        e.preventDefault();
+        backToProfilesListFromForm();
+        return;
+      }
+      closeProfileDrawer();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
+  $effect(() => {
+    if (!profileMenuOpen || typeof window === "undefined") return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target;
+      if (!(t instanceof Node)) return;
+      if (profileMenuHost?.contains(t)) return;
+      profileMenuOpen = false;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") profileMenuOpen = false;
+    };
+    document.addEventListener("mousedown", onDoc, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  });
+
+  $effect(() => {
+    const seen = new Set<string>();
+    const mergedOrdered: string[] = [];
+    for (const k of rememberedColumnKeys) {
+      if (!k || LEGACY_DEVICE_INFO_KEYS.has(k)) continue;
+      if (seen.has(k)) continue;
+      mergedOrdered.push(k);
+      seen.add(k);
+    }
+    for (const k of discoveredColumnKeys) {
+      if (LEGACY_DEVICE_INFO_KEYS.has(k)) continue;
+      if (seen.has(k)) continue;
+      mergedOrdered.push(k);
+      seen.add(k);
+    }
     if (
-      merged.length === rememberedColumnKeys.length &&
-      merged.every((key, idx) => key === rememberedColumnKeys[idx])
+      mergedOrdered.length === rememberedColumnKeys.length &&
+      mergedOrdered.every((key, idx) => key === rememberedColumnKeys[idx])
     ) {
       return;
     }
-    rememberedColumnKeys = merged;
-    saveGridColumnKeys(merged);
+    rememberedColumnKeys = mergedOrdered;
+    saveGridColumnKeys(mergedOrdered);
   });
 
   $effect(() => {
@@ -841,13 +2681,27 @@
     }
   });
 
+  /** Keep Discover button countdown synced with roughly 250 ms resolution. */
   $effect(() => {
+    if (!settings.autoDiscoverEnabled || typeof window === "undefined") return;
+    settings.autoDiscoverIntervalSec;
+    autoDiscoverUiTick = Date.now();
+    const id = window.setInterval(() => {
+      autoDiscoverUiTick = Date.now();
+    }, 250);
+    return () => window.clearInterval(id);
+  });
+
+  $effect(() => {
+    autoLoopRestartEpoch;
     if (autoDiscoverTimer) {
       clearInterval(autoDiscoverTimer);
       autoDiscoverTimer = null;
     }
     if (!settings.autoDiscoverEnabled) return;
     const intervalMs = Math.max(5, settings.autoDiscoverIntervalSec) * 1000;
+    autoDiscoverCadenceAnchorMs = Date.now();
+    autoDiscoverUiTick = Date.now();
     autoDiscoverTimer = setInterval(() => {
       if (busy) return;
       void startRun();
@@ -861,6 +2715,7 @@
   });
 
   $effect(() => {
+    autoLoopRestartEpoch;
     if (autoEnrichTimer) {
       clearInterval(autoEnrichTimer);
       autoEnrichTimer = null;
@@ -882,15 +2737,41 @@
   $effect(() => {
     if (!gridApi) return;
     const api = gridApi;
-    api.setGridOption("columnDefs", gridColumnDefs);
+    const colDefs = gridColumnDefs;
+    const sig = layoutIdentitySig;
+    const defsChanged = sig !== prevGridColumnLayoutSig;
+    const newGridInstance = lastGridApiWithPersistedLayout !== api;
+    if (defsChanged) {
+      prevGridColumnLayoutSig = sig;
+      writeGridColumnLayoutSigToSession(sig);
+      api.setGridOption("columnDefs", colDefs);
+    }
     api.setGridOption("rowData", gridRowData);
     requestAnimationFrame(() => {
       if (gridApi !== api) return;
-      refreshGridLayout();
+      if (defsChanged || newGridInstance) {
+        applyPersistedGridColumnLayout(api, colDefs);
+      }
+      lastGridApiWithPersistedLayout = api;
+      api.refreshCells({ force: true });
     });
   });
 
   onDestroy(() => {
+    if (columnLayoutPersistTimer !== null) {
+      clearTimeout(columnLayoutPersistTimer);
+      columnLayoutPersistTimer = null;
+    }
+    if (gridApi) {
+      try {
+        const st = gridApi.getColumnState();
+        // AG Grid can report an empty column model during teardown; never overwrite good storage with [].
+        if (st.length > 0) saveGridColumnState(st);
+      } catch {
+        // ignore
+      }
+    }
+    lastGridApiWithPersistedLayout = null;
     for (const u of unlistenFns) void u();
     if (coalesceTimer) clearTimeout(coalesceTimer);
     if (autoDiscoverTimer) clearInterval(autoDiscoverTimer);
@@ -917,41 +2798,99 @@
           placeholder="192.168.1.0/24 or 10.0.0.1, 10.0.0.5-10"
         ></textarea>
       </div>
-      <div class="flex flex-wrap gap-2">
-        <select
-          class="h-10 rounded-lg border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-300"
-          value={selectedProfileId}
-          onchange={(e) => applyTargetProfile((e.currentTarget as HTMLSelectElement).value)}
-        >
-          <option value="">Custom targets</option>
-          {#each targetProfiles as profile}
-            <option value={profile.id}>{profile.name}</option>
-          {/each}
-        </select>
+      <div class="flex flex-wrap items-end gap-2">
+        <div class="flex flex-col gap-1">
+          <label
+            id="profile-menu-label"
+            class="text-xs font-medium text-zinc-500"
+            for="profile-menu-trigger"
+          >
+            Profile
+          </label>
+          <div class="relative min-w-[11rem]" bind:this={profileMenuHost}>
+            <button
+              type="button"
+              id="profile-menu-trigger"
+              class="flex h-10 w-full min-w-[11rem] items-center justify-between gap-2 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-left text-xs text-zinc-200 hover:border-zinc-600 hover:bg-zinc-800/80 focus:border-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-600"
+              aria-haspopup="listbox"
+              aria-expanded={profileMenuOpen}
+              onclick={() => (profileMenuOpen = !profileMenuOpen)}
+            >
+              <span class="truncate">
+                {targetProfiles.find((p) => p.id === selectedProfileId)?.name ?? "Profile"}
+              </span>
+              <ChevronDown
+                class="h-4 w-4 shrink-0 text-zinc-500 transition-transform duration-200 {profileMenuOpen
+                  ? 'rotate-180'
+                  : ''}"
+                aria-hidden="true"
+              />
+            </button>
+            {#if profileMenuOpen}
+              <div
+                class="absolute left-0 top-full z-50 mt-1 max-h-[min(18rem,calc(100vh-8rem))] w-full overflow-auto rounded-lg border border-zinc-700 bg-zinc-950 py-1 shadow-xl ring-1 ring-black/40"
+                role="listbox"
+                aria-labelledby="profile-menu-label"
+              >
+                {#each targetProfiles as profile}
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={profile.id === selectedProfileId}
+                    class="flex w-full items-center gap-2 px-3 py-2 text-left text-xs text-zinc-200 hover:bg-zinc-800/90 {profile.id === selectedProfileId
+                      ? 'bg-zinc-900/80'
+                      : ''}"
+                    onclick={() => void pickProfileFromMenu(profile.id)}
+                  >
+                    <span class="flex w-4 shrink-0 items-center justify-center" aria-hidden="true">
+                      {#if profile.id === selectedProfileId}
+                        <Check class="h-3.5 w-3.5 tm-accent-text" />
+                      {:else}
+                        <span class="block h-3.5 w-3.5"></span>
+                      {/if}
+                    </span>
+                    <span class="min-w-0 flex-1 truncate">{profile.name}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        </div>
         <button
           type="button"
-          class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
-          onclick={saveTargetProfile}
+          class="h-10 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1 text-xs text-zinc-200 hover:bg-zinc-800"
+          onclick={openProfilesDrawer}
+          title="View and manage target profiles"
         >
-          {selectedProfileId ? "Update profile" : "Save profile"}
+          Profiles
         </button>
-        <button
-          type="button"
-          class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-40"
-          disabled={!selectedProfileId}
-          onclick={deleteTargetProfile}
-        >
-          Delete
-        </button>
-        <button
-          type="button"
-          class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-40"
-          disabled={knownDevices.length === 0}
-          onclick={clearKnownDevicesAction}
-          title="Clear persisted known devices"
-        >
-          Clear devices ({knownDevices.length})
-        </button>
+        {#if clearDevicesConfirmPending}
+          <span class="self-center text-xs text-amber-300/95">Clear saved devices &amp; table?</span>
+          <button
+            type="button"
+            class="h-10 shrink-0 rounded-lg border border-zinc-600 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900"
+            onclick={cancelClearKnownDevicesConfirm}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="h-10 shrink-0 rounded-lg border border-red-800 bg-red-900/55 px-2 py-1 text-xs text-red-100 hover:bg-red-900/80"
+            onclick={executeClearKnownDevices}
+          >
+            Confirm clear
+          </button>
+        {:else}
+          <button
+            type="button"
+            class="h-10 rounded-lg border border-zinc-700 px-2 py-1 text-xs text-zinc-300 hover:bg-zinc-900 disabled:opacity-40"
+            disabled={knownDevices.length === 0}
+            onclick={startClearKnownDevicesConfirm}
+            title="Clear persisted known devices and remove rows from Results"
+          >
+            Clear devices ({knownDevices.length})
+          </button>
+        {/if}
       </div>
       <a
         href="/settings"
@@ -963,16 +2902,30 @@
       </a>
       <button
         type="button"
-        class="h-10 rounded-lg tm-accent-bg px-4 py-2 text-sm font-medium text-black hover:text-black disabled:opacity-40"
+        class="h-10 min-w-[10.5rem] whitespace-nowrap rounded-lg tm-accent-bg px-3 py-2 text-sm font-medium text-black hover:text-black disabled:opacity-40"
         disabled={discoverInProgress}
         onclick={startRun}
+        title={discoverInProgress
+          ? ""
+          : settings.autoDiscoverEnabled
+            ? `Start a probe run manually. Next auto-discovery in ~${formatCountdownMmSs(autoDiscoverNextInSec ?? 0)}.`
+            : "Scan targets for reachable hosts"}
       >
-        Discover
+        {#if settings.autoDiscoverEnabled}
+          <span class="flex items-center justify-center gap-2 tracking-tight">
+            <span>Auto-Discover</span>
+            <span class="font-mono text-xs tabular-nums opacity-95">{formatCountdownMmSs(autoDiscoverNextInSec ?? 0)}</span>
+          </span>
+        {:else}
+          Discover
+        {/if}
       </button>
       <button
         type="button"
-        class="h-10 rounded-lg border border-zinc-600 px-4 py-2 text-sm hover:bg-zinc-900"
+        class="h-10 rounded-lg border border-zinc-600 px-4 py-2 text-sm hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-40"
+        disabled={!discoverInProgress}
         onclick={stopRun}
+        title={discoverInProgress ? "" : "Only available while Discover is running"}
       >
         Stop
       </button>
@@ -993,13 +2946,13 @@
       ></div>
     </div>
     <div class="flex flex-wrap gap-3 text-xs text-zinc-400">
-      <span>Total {progress.totalTargets}</span>
-      <span>Probed {progress.probed}</span>
-      <span>Alive {progress.alive}</span>
-      <span>Miss {progress.missed}</span>
-      <span>Enriched {progress.enriched}</span>
-      <span>Partial {progress.partial}</span>
-      <span>Cancelled {progress.cancelled}</span>
+      <span>Total {discoveryWorkbench.progress.totalTargets}</span>
+      <span>Probed {discoveryWorkbench.progress.probed}</span>
+      <span>Alive {discoveryWorkbench.progress.alive}</span>
+      <span>Miss {discoveryWorkbench.progress.missed}</span>
+      <span>Enriched {discoveryWorkbench.progress.enriched}</span>
+      <span>Partial {discoveryWorkbench.progress.partial}</span>
+      <span>Cancelled {discoveryWorkbench.progress.cancelled}</span>
     </div>
   </div>
 
@@ -1012,4 +2965,236 @@
       ></div>
     </div>
   </div>
+
+  {#if profileDrawerOpen}
+    <div
+      class="fixed inset-0 z-[100] bg-black/60"
+      role="presentation"
+      aria-hidden="true"
+      onclick={closeProfileDrawer}
+      transition:fade={{ duration: 150 }}
+    ></div>
+    <div
+      class="fixed top-0 right-0 z-[101] flex h-full w-full max-w-md flex-col border-l border-zinc-800 bg-zinc-950 shadow-2xl"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="profile-drawer-title"
+      transition:fly={{ x: 400, duration: 220, opacity: 1 }}
+    >
+      {#if profileDrawerPane === "list"}
+        <div class="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+          <h2 id="profile-drawer-title" class="text-base font-semibold text-zinc-100">Profiles</h2>
+          <button
+            type="button"
+            class="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            onclick={closeProfileDrawer}
+            aria-label="Close profiles panel"
+          >
+            <X class="h-5 w-5" aria-hidden="true" />
+          </button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div class="min-h-0 flex-1 space-y-3 overflow-y-auto px-4 py-4">
+            {#each targetProfiles as p (p.id)}
+              <div
+                class="space-y-2 rounded-lg border bg-zinc-900/35 p-3 {p.id === selectedProfileId
+                  ? 'border-emerald-800/65 ring-1 ring-emerald-900/55'
+                  : 'border-zinc-800'}"
+              >
+                <div class="flex flex-wrap items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <p class="truncate text-sm font-medium text-zinc-100">{p.name}</p>
+                    {#if p.id === selectedProfileId}
+                      <p class="mt-0.5 text-[10px] font-medium uppercase tracking-wide tm-accent-text">Active</p>
+                    {/if}
+                  </div>
+                </div>
+                <p class="break-all font-mono text-xs leading-snug text-zinc-500" title={p.targets.trim()}>
+                  {ellipsisTargets(p.targets)}
+                </p>
+                {#if profileListDeletePendingId === p.id && p.id !== DEFAULT_PROFILE_ID}
+                  <div class="rounded-lg border border-red-900/60 bg-red-950/35 px-3 py-2 text-xs">
+                    <p class="font-medium text-red-200">Delete “{p.name}”?</p>
+                    <p class="mt-1 text-red-300/90">You cannot undo this.</p>
+                    <div class="mt-2 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        class="rounded-lg border border-zinc-600 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-900"
+                        onclick={cancelProfileListDelete}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        class="rounded-lg border border-red-800 bg-red-900/70 px-2 py-1 text-[11px] text-red-100 hover:bg-red-900"
+                        onclick={() => void confirmProfileListDelete()}
+                      >
+                        Delete permanently
+                      </button>
+                    </div>
+                  </div>
+                {:else}
+                  <div class="flex flex-wrap gap-2">
+                    {#if p.id !== selectedProfileId}
+                      <button
+                        type="button"
+                        class="rounded-lg border border-zinc-600 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-900"
+                        onclick={() => void applyTargetProfile(p.id)}
+                      >
+                        Use profile
+                      </button>
+                    {/if}
+                    {#if p.id !== DEFAULT_PROFILE_ID && p.targets.trim()}
+                      <button
+                        type="button"
+                        class="rounded-lg border border-emerald-900/65 px-2 py-1 text-[11px] text-emerald-200/95 hover:bg-emerald-950/45"
+                        title="Replace the Default profile with this one's name and targets, and select Default"
+                        onclick={() => void setBuiltinDefaultFromProfile(p.id)}
+                      >
+                        Set as Default
+                      </button>
+                    {/if}
+                    <button
+                      type="button"
+                      class="rounded-lg border border-zinc-600 px-2 py-1 text-[11px] text-zinc-200 hover:bg-zinc-900"
+                      onclick={() => navigateToProfileFormEdit(p.id)}
+                    >
+                      Edit
+                    </button>
+                    {#if p.id !== DEFAULT_PROFILE_ID}
+                      <button
+                        type="button"
+                        class="rounded-lg border border-red-900/80 bg-red-950/40 px-2 py-1 text-[11px] text-red-300 hover:bg-red-950/70"
+                        onclick={() => startProfileListDelete(p.id)}
+                      >
+                        Delete
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
+          <div class="shrink-0 border-t border-zinc-800 px-4 py-3">
+            <button
+              type="button"
+              class="h-10 w-full rounded-lg border border-zinc-600 px-3 text-xs font-medium text-zinc-200 hover:bg-zinc-900"
+              onclick={navigateToProfileFormNew}
+            >
+              + Add profile
+            </button>
+          </div>
+        </div>
+      {:else}
+        <div class="flex items-center gap-2 border-b border-zinc-800 px-2 py-2 pr-4">
+          <button
+            type="button"
+            class="rounded-lg p-2 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            onclick={backToProfilesListFromForm}
+            aria-label="Back to profiles list"
+          >
+            <ArrowLeft class="h-5 w-5" aria-hidden="true" />
+          </button>
+          <h2 id="profile-drawer-title" class="flex-1 text-base font-semibold text-zinc-100">
+            {profileDrawerEditingId ? "Edit profile" : "New profile"}
+          </h2>
+          <button
+            type="button"
+            class="rounded-lg p-1.5 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100"
+            onclick={closeProfileDrawer}
+            aria-label="Close profile panel"
+          >
+            <X class="h-5 w-5" aria-hidden="true" />
+          </button>
+        </div>
+        <div class="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 py-4">
+          <div class="flex flex-col gap-1.5">
+            <label class="text-xs font-medium text-zinc-500" for="drawer-profile-name">Name</label>
+            <input
+              id="drawer-profile-name"
+              type="text"
+              bind:value={drawerProfileName}
+              class="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+              placeholder="e.g. Home LAN"
+              oninput={() => {
+                profileDrawerError = null;
+                profileDeleteConfirmPending = false;
+              }}
+            />
+          </div>
+          <div class="flex min-h-0 flex-1 flex-col gap-1.5">
+            <label class="text-xs font-medium text-zinc-500" for="drawer-profile-targets">Targets</label>
+            <textarea
+              id="drawer-profile-targets"
+              bind:value={drawerProfileTargets}
+              class="min-h-[8rem] flex-1 resize-y rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 font-mono text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-zinc-500 focus:outline-none"
+              placeholder="192.168.1.0/24 or 10.0.0.1, 10.0.0.5-10"
+              rows="8"
+              oninput={() => {
+                profileDrawerError = null;
+                profileDeleteConfirmPending = false;
+              }}
+            ></textarea>
+          </div>
+          {#if profileDrawerError}
+            <p class="text-xs text-red-400" role="alert">{profileDrawerError}</p>
+          {/if}
+        </div>
+        <div class="mt-auto flex w-full flex-col gap-3 border-t border-zinc-800 px-4 py-3">
+          {#if profileDrawerEditingId && profileDrawerEditingId !== DEFAULT_PROFILE_ID && profileDeleteConfirmPending}
+            <div class="rounded-lg border border-red-900/60 bg-red-950/35 px-3 py-2 text-xs">
+              <p class="font-medium text-red-200">Delete this profile?</p>
+              <p class="mt-1 text-red-300/90">You cannot undo this.</p>
+            </div>
+          {/if}
+          <div class="flex w-full flex-wrap items-center gap-2">
+            <div class="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+              {#if profileDrawerEditingId && profileDrawerEditingId !== DEFAULT_PROFILE_ID}
+                {#if profileDeleteConfirmPending}
+                  <button
+                    type="button"
+                    class="h-10 shrink-0 rounded-lg border border-zinc-600 px-3 text-xs text-zinc-200 hover:bg-zinc-800"
+                    onclick={cancelProfileDeleteConfirmation}
+                  >
+                    Back
+                  </button>
+                  <button
+                    type="button"
+                    class="h-10 shrink-0 rounded-lg border border-red-800 bg-red-900/70 px-3 text-xs text-red-100 hover:bg-red-900"
+                    onclick={() => void confirmDeleteProfileFromDrawer()}
+                  >
+                    Delete permanently
+                  </button>
+                {:else}
+                  <button
+                    type="button"
+                    class="h-10 shrink-0 rounded-lg border border-red-900/80 bg-red-950/40 px-3 text-xs text-red-300 hover:bg-red-950/70"
+                    onclick={startProfileDeleteConfirmation}
+                  >
+                    Delete profile
+                  </button>
+                {/if}
+              {/if}
+            </div>
+            <div class="flex shrink-0 flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                class="h-10 rounded-lg border border-zinc-600 px-3 text-xs text-zinc-300 hover:bg-zinc-800"
+                onclick={backToProfilesListFromForm}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="h-10 rounded-lg px-4 text-xs font-medium text-black tm-accent-bg hover:text-black"
+                onclick={() => void saveProfileFromDrawer()}
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      {/if}
+    </div>
+  {/if}
 </div>

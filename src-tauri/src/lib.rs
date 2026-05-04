@@ -8,6 +8,7 @@ pub fn run() {
         .manage(discovery::AppState::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            discovery::filter_ips_matching_targets,
             discovery::start_discovery_run,
             discovery::enrich_known_devices_run,
             discovery::stop_discovery_run,
