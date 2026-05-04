@@ -4,10 +4,19 @@ const STORAGE_KEY = "tm.discovery.settings.v1";
 const TARGET_PROFILES_KEY = "tm.discovery.targetProfiles.v1";
 const KNOWN_DEVICES_KEY = "tm.discovery.knownDevices.v1";
 
+/** Reserved id for the built-in default profile (shown first; renamable, not deletable). */
+export const DEFAULT_PROFILE_ID = "__tm_default";
+
 export type TargetProfile = {
   id: string;
   name: string;
   targets: string;
+};
+
+const DEFAULT_PROFILE_TEMPLATE: TargetProfile = {
+  id: DEFAULT_PROFILE_ID,
+  name: "Default",
+  targets: "192.168.1.0/24",
 };
 
 export type KnownDevice = {
@@ -44,6 +53,16 @@ export function loadTargetProfiles(): TargetProfile[] {
   } catch {
     return [];
   }
+}
+
+/** Ensures the default profile exists once (first in list), with a stable reserved id. */
+export function normalizeTargetProfiles(profiles: TargetProfile[]): TargetProfile[] {
+  const rest = profiles.filter((p) => p.id !== DEFAULT_PROFILE_ID);
+  const existing = profiles.find((p) => p.id === DEFAULT_PROFILE_ID);
+  const def: TargetProfile = existing
+    ? { ...DEFAULT_PROFILE_TEMPLATE, ...existing, id: DEFAULT_PROFILE_ID }
+    : { ...DEFAULT_PROFILE_TEMPLATE };
+  return [def, ...rest];
 }
 
 export function saveTargetProfiles(profiles: TargetProfile[]) {

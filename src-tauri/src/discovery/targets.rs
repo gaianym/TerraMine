@@ -121,6 +121,61 @@ pub fn parse_targets_to_ips(input: &str) -> Result<Vec<IpAddr>, String> {
     Ok(out)
 }
 
+pub fn addr_matches_targets(addr: IpAddr, input: &str) -> Result<bool, String> {
+    for raw in input.split(|c: char| c == ',' || c == '\n' || c == ';') {
+        let token = raw.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        if let Ok(net) = token.parse::<IpNet>() {
+            if net.contains(&addr) {
+                return Ok(true);
+            }
+            continue;
+        }
+
+        if let Ok(ip) = token.parse::<IpAddr>() {
+            if ip == addr {
+                return Ok(true);
+            }
+            continue;
+        }
+
+        if let Some(ips) = parse_ipv4_dash_range(token)? {
+            if ips.contains(&addr) {
+                return Ok(true);
+            }
+            continue;
+        }
+
+        return Err(format!("Unrecognized target: {token}"));
+    }
+
+    Ok(false)
+}
+
+pub fn filter_ips_matching_targets(ips: &[String], targets: &str) -> Result<Vec<String>, String> {
+    let targets = targets.trim();
+    if targets.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut kept = Vec::new();
+    for ip_s in ips {
+        let t = ip_s.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Ok(addr) = t.parse::<IpAddr>() else {
+            continue;
+        };
+        if addr_matches_targets(addr, targets)? {
+            kept.push(t.to_string());
+        }
+    }
+    Ok(kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
