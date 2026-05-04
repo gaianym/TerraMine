@@ -1,9 +1,11 @@
 <script lang="ts">
   import {
     ClientSideRowModelModule,
+    ColumnApiModule,
     ModuleRegistry,
     createGrid,
     type ColDef,
+    type ColumnState,
     type GridApi,
     type GridOptions,
     type ICellRendererParams,
@@ -12,6 +14,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { fade, fly } from "svelte/transition";
+  import { beforeNavigate } from "$app/navigation";
   import { onDestroy, onMount, untrack } from "svelte";
   import { ArrowLeft, Check, ChevronDown, Settings, X } from "lucide-svelte";
   import {
@@ -71,6 +74,13 @@
   let coalesceTimer: ReturnType<typeof setTimeout> | null = null;
   let gridHost: HTMLDivElement | null = null;
   let gridApi: GridApi<GridRow> | null = null;
+  let columnLayoutPersistTimer: number | null = null;
+  /** Used to skip redundant `columnDefs` updates (row-only refreshes were resetting column order). */
+  let prevGridColumnLayoutSig = "";
+  /** Re-apply saved widths/order after `createGrid` (e.g. return from /settings), not only when the column sig changes. */
+  let lastGridApiWithPersistedLayout: GridApi<GridRow> | null = null;
+  /** Column order from last persisted grid state; drives `displayColumnKeys` so remount matches saved order without animating. */
+  let persistedColumnOrderIds = $state<string[] | null>(null);
   let autoDiscoverTimer: ReturnType<typeof setInterval> | null = null;
   let autoEnrichTimer: ReturnType<typeof setInterval> | null = null;
   /** Bumped when the active target profile/spec changes so auto-discover/enrich timers reset their interval clocks. */
@@ -90,7 +100,33 @@
     [key: string]: unknown;
   };
   const MOVEMENT_COLUMNS = new Set(["hashrate", "average_temperature", "efficiency", "wattage"]);
+  /** Synthetic movement keys for split pool columns (not in MOVEMENT_COLUMNS / parseMetricValue). */
+  const POOLS_MOVEMENT_IDS = ["pools_accepted", "pools_rejected"] as const;
   const GRID_COLUMN_KEYS_STORAGE_KEY = "tm:discovery:grid-column-keys:v1";
+  const GRID_COLUMN_STATE_STORAGE_KEY = "tm:discovery:grid-column-state:v1";
+  /** Survives Vite HMR so we do not call `setColumnDefs` when only the module reloaded (that was resetting widths/order). */
+  const GRID_COLUMN_LAYOUT_SIG_SESSION_KEY = "tm:discovery:grid-layout-sig:v1";
+
+  function readGridColumnLayoutSigFromSession(): string {
+    if (typeof window === "undefined") return "";
+    try {
+      return window.sessionStorage.getItem(GRID_COLUMN_LAYOUT_SIG_SESSION_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  }
+
+  function writeGridColumnLayoutSigToSession(sig: string) {
+    if (typeof window === "undefined") return;
+    try {
+      window.sessionStorage.setItem(GRID_COLUMN_LAYOUT_SIG_SESSION_KEY, sig);
+    } catch {
+      // ignore quota / private mode
+    }
+  }
+
+  prevGridColumnLayoutSig = readGridColumnLayoutSigFromSession();
+
   const BASELINE_COLUMN_KEYS = ["ip", "discovery"];
   const LEGACY_DEVICE_INFO_KEYS = new Set(["device_info", "deviceInfo", "deviceInformation"]);
 
@@ -128,7 +164,143 @@
     }
   }
 
-  ModuleRegistry.registerModules([ClientSideRowModelModule]);
+  function loadGridColumnState(): ColumnState[] | null {
+    if (typeof window === "undefined") return null;
+    try {
+      const raw = window.localStorage.getItem(GRID_COLUMN_STATE_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as unknown;
+      if (!Array.isArray(parsed)) return null;
+      const out: ColumnState[] = [];
+      for (const item of parsed) {
+        if (!item || typeof item !== "object") continue;
+        const o = item as Record<string, unknown>;
+        if (typeof o.colId !== "string" || !o.colId) continue;
+        out.push(item as ColumnState);
+      }
+      return out.length > 0 ? out : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Split legacy `pools` column id into the three synthetic pool columns. */
+  function expandPoolsColumnId(id: string): string[] {
+    if (id === "pools" || id === "Pools") {
+      return ["pools_accepted", "pools_rejected", "pools_stratum"];
+    }
+    return [id];
+  }
+
+  /** Replace `pools` / `Pools` keys with `pools_accepted`, `pools_rejected`, `pools_stratum`. */
+  function expandPoolsColumnKeys(keys: string[]): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    const pushPoolTriplet = () => {
+      for (const syn of ["pools_accepted", "pools_rejected", "pools_stratum"] as const) {
+        if (seen.has(syn)) continue;
+        out.push(syn);
+        seen.add(syn);
+      }
+    };
+    for (const k of keys) {
+      if (k === "pools" || k === "Pools") {
+        pushPoolTriplet();
+      } else {
+        if (seen.has(k)) continue;
+        out.push(k);
+        seen.add(k);
+      }
+    }
+    return out;
+  }
+
+  /** Merge canonical column membership with persisted header order (AG Grid column state order). */
+  function mergeDisplayColumnOrder(canonical: string[], persistedOrder: string[] | null): string[] {
+    if (!persistedOrder?.length) return canonical;
+    const canon = new Set(canonical);
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const id of persistedOrder) {
+      for (const eid of expandPoolsColumnId(id)) {
+        if (!canon.has(eid) || seen.has(eid)) continue;
+        out.push(eid);
+        seen.add(eid);
+      }
+    }
+    for (const id of canonical) {
+      if (!seen.has(id)) out.push(id);
+    }
+    return out;
+  }
+
+  /** Stable identity for column *set* + fluid flag (order-independent so user reorder does not refresh defs). */
+  function layoutIdentitySigFromCanonical(canonical: string[], fluidAllNull: boolean): string {
+    const sorted = [...canonical].sort((a, b) => a.localeCompare(b));
+    return `${sorted.join("\u0001")}\u0002${fluidAllNull}`;
+  }
+
+  function saveGridColumnState(state: ColumnState[]) {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(GRID_COLUMN_STATE_STORAGE_KEY, JSON.stringify(state));
+    } catch {
+      // ignore storage write failures
+    }
+    if (state.length > 0) {
+      persistedColumnOrderIds = state.flatMap((c) => {
+        const id = c.colId;
+        if (typeof id !== "string" || !id.length) return [];
+        return expandPoolsColumnId(id);
+      });
+    }
+  }
+
+  function schedulePersistGridColumnLayout() {
+    if (typeof window === "undefined") return;
+    if (columnLayoutPersistTimer !== null) {
+      clearTimeout(columnLayoutPersistTimer);
+    }
+    columnLayoutPersistTimer = window.setTimeout(() => {
+      columnLayoutPersistTimer = null;
+      if (!gridApi) return;
+      const st = gridApi.getColumnState();
+      if (st.length > 0) saveGridColumnState(st);
+    }, 200);
+  }
+
+  function applyPersistedGridColumnLayout(api: GridApi<GridRow>, defs: ColDef<GridRow>[]) {
+    const saved = loadGridColumnState();
+    if (!saved?.length) return;
+    const known = new Set(
+      defs.map((d) => d.field).filter((f): f is string => typeof f === "string" && f.length > 0),
+    );
+    const filtered = saved.filter((c) => known.has(c.colId));
+    if (!filtered.length) return;
+    api.setGridOption("suppressColumnMoveAnimation", true);
+    try {
+      api.applyColumnState({ state: filtered, applyOrder: true });
+    } finally {
+      api.setGridOption("suppressColumnMoveAnimation", false);
+    }
+  }
+
+  /** Persist while the grid column model is still valid (onDestroy often sees an empty model). */
+  beforeNavigate(() => {
+    if (columnLayoutPersistTimer !== null) {
+      clearTimeout(columnLayoutPersistTimer);
+      columnLayoutPersistTimer = null;
+    }
+    if (!gridApi) return;
+    try {
+      const st = gridApi.getColumnState();
+      if (st.length > 0) saveGridColumnState(st);
+    } catch {
+      // ignore
+    }
+  });
+
+  ModuleRegistry.registerModules([ClientSideRowModelModule, ColumnApiModule]);
 
   const HASH_RATE_UNIT_TIERS = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"] as const;
 
@@ -567,6 +739,16 @@
       }
       return formatGridValue(value);
     }
+    if (col === "timestamp") {
+      const sec = parseUnixTimestampSeconds(value);
+      if (sec === null) return "\u2014";
+      return formatTimestampSecondsLocal(sec);
+    }
+    if (col === "uptime") {
+      const t = parseUptimeTotalSeconds(value);
+      if (t === null) return "\u2014";
+      return formatUptimeYmdHms(t);
+    }
     if (col === "fans") {
       if (value === undefined || value === null) return "\u2014";
       if (!Array.isArray(value)) return formatGridValue(value);
@@ -578,6 +760,20 @@
         parts.push(rpmVal === null ? "\u2014" : `${Math.round(rpmVal)} rpm`);
       }
       return parts.length > 0 ? parts.join(", ") : "\u2014";
+    }
+    if (col === "pools_accepted") {
+      if (value === undefined || value === null) return "\u2014";
+      if (typeof value === "number" && Number.isFinite(value)) return value.toLocaleString();
+      return "\u2014";
+    }
+    if (col === "pools_rejected") {
+      if (value === undefined || value === null) return "\u2014";
+      if (typeof value === "number" && Number.isFinite(value)) return value.toLocaleString();
+      return "\u2014";
+    }
+    if (col === "pools_stratum") {
+      if (typeof value === "string" && value.trim()) return value.trim();
+      return "\u2014";
     }
     if (col === "control_board_version" || col === "controlBoardVersion") {
       const name = formatJsonNamedBlob(value);
@@ -598,10 +794,384 @@
     return `${rowId}:${col}`;
   }
 
+  /** Sum accepted/rejected shares from miner pool payloads (JSON string or array of `{ pools: [...] }`). */
+  function parsePoolsShareTotals(value: unknown): { accepted: number | null; rejected: number | null } {
+    let accTotal = 0;
+    let rejTotal = 0;
+    let accFound = false;
+    let rejFound = false;
+
+    const addFromPoolObj = (o: Record<string, unknown>) => {
+      const a = o.accepted_shares ?? o.acceptedShares;
+      const r = o.rejected_shares ?? o.rejectedShares;
+      if (typeof a === "number" && Number.isFinite(a)) {
+        accTotal += a;
+        accFound = true;
+      } else if (typeof a === "string") {
+        const na = Number.parseInt(a.trim(), 10);
+        if (Number.isFinite(na)) {
+          accTotal += na;
+          accFound = true;
+        }
+      }
+      if (typeof r === "number" && Number.isFinite(r)) {
+        rejTotal += r;
+        rejFound = true;
+      } else if (typeof r === "string") {
+        const nr = Number.parseInt(r.trim(), 10);
+        if (Number.isFinite(nr)) {
+          rejTotal += nr;
+          rejFound = true;
+        }
+      }
+    };
+
+    const visit = (node: unknown): void => {
+      if (node === undefined || node === null) return;
+      if (typeof node === "string") {
+        const t = node.trim();
+        if (!t) return;
+        try {
+          visit(JSON.parse(t));
+        } catch {
+          return;
+        }
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const el of node) {
+          if (!el || typeof el !== "object") continue;
+          const rec = el as Record<string, unknown>;
+          const pools = rec.pools ?? rec.Pools;
+          if (Array.isArray(pools)) {
+            for (const p of pools) {
+              if (p && typeof p === "object" && !Array.isArray(p)) addFromPoolObj(p as Record<string, unknown>);
+            }
+          }
+          if (recordLooksLikePoolEntry(rec)) addFromPoolObj(rec);
+        }
+        return;
+      }
+      if (typeof node === "object") {
+        const rec = node as Record<string, unknown>;
+        const pools = rec.pools ?? rec.Pools;
+        if (Array.isArray(pools)) {
+          for (const p of pools) {
+            if (p && typeof p === "object" && !Array.isArray(p)) addFromPoolObj(p as Record<string, unknown>);
+          }
+        }
+        if (recordLooksLikePoolEntry(rec)) addFromPoolObj(rec);
+      }
+    };
+
+    visit(value);
+    return {
+      accepted: accFound ? accTotal : null,
+      rejected: rejFound ? rejTotal : null,
+    };
+  }
+
+  /** Hostname from stratum URL, `host:port`, or similar miner pool strings. */
+  function hostFromPoolishString(raw: string): string | null {
+    const t = raw.trim();
+    if (!t) return null;
+    const tryParse = (href: string): string | null => {
+      try {
+        const u = new URL(href);
+        return u.hostname || null;
+      } catch {
+        return null;
+      }
+    };
+    let h = tryParse(t);
+    if (h) return h;
+    const schemes = ["stratum+tcp://", "stratum+ssl://", "stratum://"];
+    for (const sc of schemes) {
+      if (t.toLowerCase().startsWith(sc)) {
+        h = tryParse(`http://${t.slice(sc.length)}`);
+        if (h) return h;
+      }
+    }
+    const at = t.lastIndexOf("@");
+    if (at >= 0) {
+      const tail = t.slice(at + 1).split(/[\s/?#]/)[0];
+      h = tryParse(`http://${tail}`);
+      if (h) return h;
+    }
+    const hostPort = t.split(/[\s/?#]/)[0];
+    const noPort = hostPort.replace(/:\d+$/, "");
+    if (/^[a-z0-9][a-z0-9.-]*$/i.test(noPort) && noPort.includes(".")) return noPort.toLowerCase();
+    return null;
+  }
+
+  /** Lowercase host presentation: `subdomain` + `.` + last two labels (`domain.tld`). */
+  function formatSubdomainDotDomain(hostname: string): string {
+    const labels = hostname
+      .toLowerCase()
+      .replace(/^\[|\]$/g, "")
+      .split(".")
+      .filter((p) => p.length > 0);
+    if (labels.length === 0) return "";
+    if (labels.length <= 2) return labels.join(".");
+    const domain = labels.slice(-2).join(".");
+    const sub = labels.slice(0, -2).join(".");
+    return sub ? `${sub}.${domain}` : domain;
+  }
+
+  function recordLooksLikePoolEntry(r: Record<string, unknown>): boolean {
+    const urlObj = r.url;
+    let urlHasHost = false;
+    if (urlObj && typeof urlObj === "object" && !Array.isArray(urlObj)) {
+      const h = (urlObj as Record<string, unknown>).host;
+      urlHasHost = typeof h === "string" && h.trim().length > 0;
+    }
+    return (
+      r.accepted_shares != null ||
+      r.acceptedShares != null ||
+      r.rejected_shares != null ||
+      r.rejectedShares != null ||
+      typeof r.url === "string" ||
+      urlHasHost ||
+      typeof r.stratum_url === "string" ||
+      typeof r.stratumUrl === "string" ||
+      typeof r.pool_url === "string" ||
+      typeof r.poolUrl === "string"
+    );
+  }
+
+  /** Unique pool hosts from stratum URLs in pool payloads, as `subdomain.domain.tld`. */
+  function parsePoolsStratumDisplay(value: unknown): string {
+    const hosts = new Set<string>();
+
+    const addHost = (raw: string) => {
+      const h = hostFromPoolishString(raw.trim());
+      if (h) hosts.add(formatSubdomainDotDomain(h));
+    };
+
+    const considerPool = (o: Record<string, unknown>) => {
+      const urlVal = o.url;
+      if (urlVal && typeof urlVal === "object" && !Array.isArray(urlVal)) {
+        const uo = urlVal as Record<string, unknown>;
+        const hostStr = uo.host;
+        if (typeof hostStr === "string" && hostStr.trim()) addHost(hostStr);
+      }
+      const rawScalar: unknown[] = [
+        typeof o.url === "string" ? o.url : undefined,
+        o.stratum_url,
+        o.stratumUrl,
+        o.pool_url,
+        o.poolUrl,
+        o.connection,
+        o.address,
+        o.host,
+        o.hostname,
+        o.server,
+        o.socket,
+        o.endpoint,
+        o.stratum_host,
+        o.stratumHost,
+        o.mining_address,
+        o.miningAddress,
+      ];
+      for (const c of rawScalar) {
+        if (typeof c !== "string" || !c.trim()) continue;
+        addHost(c);
+      }
+      const conn = o.connection;
+      if (conn && typeof conn === "object" && !Array.isArray(conn)) {
+        const cr = conn as Record<string, unknown>;
+        for (const k of ["url", "uri", "host", "hostname", "address"]) {
+          const v = cr[k];
+          if (typeof v === "string" && v.trim()) addHost(v);
+        }
+      }
+      const nestedStratum = o.stratum ?? o.Stratum;
+      if (nestedStratum && typeof nestedStratum === "object" && !Array.isArray(nestedStratum)) {
+        const so = nestedStratum as Record<string, unknown>;
+        for (const k of ["url", "host", "hostname", "address", "endpoint", "connection"]) {
+          const v = so[k];
+          if (typeof v === "string" && v.trim()) addHost(v);
+        }
+      }
+      if (typeof o.stratum === "string" && o.stratum.trim()) addHost(o.stratum);
+      if (typeof o.Stratum === "string" && o.Stratum.trim()) addHost(o.Stratum);
+
+      for (const key of [
+        "stratum_urls",
+        "stratumUrls",
+        "urls",
+        "stratumURL",
+        "endpoints",
+        "addresses",
+      ] as const) {
+        const v = o[key];
+        if (!Array.isArray(v)) continue;
+        for (const item of v) {
+          if (typeof item === "string" && item.trim()) addHost(item);
+          else if (item && typeof item === "object" && !Array.isArray(item))
+            considerPool(item as Record<string, unknown>);
+        }
+      }
+      const nm = o.name;
+      if (typeof nm === "string" && nm.includes(".") && !nm.startsWith("[")) addHost(nm);
+    };
+
+    const visit = (node: unknown): void => {
+      if (node === undefined || node === null) return;
+      if (typeof node === "string") {
+        const s = node.trim();
+        if (!s) return;
+        try {
+          visit(JSON.parse(s));
+        } catch {
+          return;
+        }
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const el of node) {
+          if (!el || typeof el !== "object") continue;
+          const rec = el as Record<string, unknown>;
+          const pools = rec.pools ?? rec.Pools;
+          if (Array.isArray(pools)) {
+            for (const p of pools) {
+              if (typeof p === "string" && p.trim()) addHost(p);
+              else if (p && typeof p === "object" && !Array.isArray(p))
+                considerPool(p as Record<string, unknown>);
+            }
+          }
+          if (recordLooksLikePoolEntry(rec)) considerPool(rec);
+        }
+        return;
+      }
+      if (typeof node === "object") {
+        const rec = node as Record<string, unknown>;
+        const pools = rec.pools ?? rec.Pools;
+        if (Array.isArray(pools)) {
+          for (const p of pools) {
+            if (typeof p === "string" && p.trim()) addHost(p);
+            else if (p && typeof p === "object" && !Array.isArray(p))
+              considerPool(p as Record<string, unknown>);
+          }
+        }
+        if (recordLooksLikePoolEntry(rec)) considerPool(rec);
+      }
+    };
+
+    visit(value);
+    return hosts.size === 0 ? "" : [...hosts].sort((a, b) => a.localeCompare(b)).join(", ");
+  }
+
+  function poolsRawFromRow(row: Record<string, unknown> | undefined): unknown {
+    if (!row) return undefined;
+    return row.pools ?? row.Pools ?? row.pool ?? row.Pool;
+  }
+
   function formatGridValue(value: unknown) {
     if (value === undefined) return "\u2014";
     if (typeof value === "string") return value;
     return JSON.stringify(value);
+  }
+
+  /** Miner `timestamp` (Unix time). Values above 1e12 are treated as milliseconds. */
+  function parseUnixTimestampSeconds(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    let n: number;
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      n = raw;
+    } else if (typeof raw === "string") {
+      const t = raw.trim();
+      if (!t) return null;
+      const p = Number.parseFloat(t);
+      if (!Number.isFinite(p)) return null;
+      n = p;
+    } else {
+      return null;
+    }
+    const sec = n > 1e12 ? n / 1000 : n;
+    return Number.isFinite(sec) && sec > 0 ? sec : null;
+  }
+
+  function formatTimestampSecondsLocal(sec: number): string {
+    const d = new Date(sec * 1000);
+    if (!Number.isFinite(d.getTime())) return "\u2014";
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
+
+  /** Rust `Duration`-style JSON: `{ secs, nanos }` (or stringified). */
+  function parseUptimeTotalSeconds(raw: unknown): number | null {
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw === "number" && Number.isFinite(raw)) {
+      return raw >= 0 ? raw : null;
+    }
+    if (typeof raw === "string") {
+      const t = raw.trim();
+      if (!t) return null;
+      try {
+        return parseUptimeTotalSeconds(JSON.parse(t) as unknown);
+      } catch {
+        const p = Number.parseFloat(t);
+        return Number.isFinite(p) && p >= 0 ? p : null;
+      }
+    }
+    if (typeof raw === "object" && !Array.isArray(raw)) {
+      const o = raw as Record<string, unknown>;
+      const secsRaw = o.secs ?? o.seconds;
+      const nanosRaw = o.nanos ?? o.nanoseconds ?? 0;
+      let secs = 0;
+      if (typeof secsRaw === "number" && Number.isFinite(secsRaw)) secs = secsRaw;
+      else if (typeof secsRaw === "string") {
+        const p = Number.parseFloat(secsRaw);
+        if (Number.isFinite(p)) secs = p;
+      }
+      let nanos = 0;
+      if (typeof nanosRaw === "number" && Number.isFinite(nanosRaw)) nanos = nanosRaw;
+      const total = secs + nanos / 1e9;
+      return Number.isFinite(total) && total >= 0 ? total : null;
+    }
+    return null;
+  }
+
+  /**
+   * Elapsed uptime: `yr mo d h min s` (365d year, 30d month). Omits any of yr/mo/d/h when zero;
+   * always shows minutes and seconds (e.g. `5mo 2d 21h 0min 5s`).
+   */
+  function formatUptimeYmdHms(totalSeconds: number): string {
+    if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return "\u2014";
+    const sec = Math.floor(totalSeconds);
+    const SEC_PER_MIN = 60;
+    const SEC_PER_HOUR = 3600;
+    const SEC_PER_DAY = 86400;
+    const SEC_PER_MONTH = 30 * SEC_PER_DAY;
+    const SEC_PER_YEAR = 365 * SEC_PER_DAY;
+
+    let r = sec;
+    const y = Math.floor(r / SEC_PER_YEAR);
+    r -= y * SEC_PER_YEAR;
+    const mo = Math.floor(r / SEC_PER_MONTH);
+    r -= mo * SEC_PER_MONTH;
+    const d = Math.floor(r / SEC_PER_DAY);
+    r -= d * SEC_PER_DAY;
+    const h = Math.floor(r / SEC_PER_HOUR);
+    r -= h * SEC_PER_HOUR;
+    const mi = Math.floor(r / SEC_PER_MIN);
+    const s = Math.floor(r - mi * SEC_PER_MIN);
+
+    const parts: string[] = [];
+    if (y > 0) parts.push(`${y}yr`);
+    if (mo > 0) parts.push(`${mo}mo`);
+    if (d > 0) parts.push(`${d}d`);
+    if (h > 0) parts.push(`${h}h`);
+    parts.push(`${mi}min`);
+    parts.push(`${s}s`);
+    return parts.join(" ");
   }
 
   function parseDeviceInfoBlob(raw: unknown): Record<string, unknown> | null {
@@ -694,6 +1264,37 @@
     return `${scaled.amount.toFixed(2)} ${scaled.unit}`;
   }
 
+  /** Split `snake_case` or `camelCase` column keys into lowercase word parts. */
+  function splitColumnKeyToParts(key: string): string[] {
+    const withUnderscores = key.replace(/([a-z\d])([A-Z])/g, "$1_$2");
+    return withUnderscores.split("_").filter(Boolean).map((p) => p.toLowerCase());
+  }
+
+  function titleCaseHeaderPart(part: string): string {
+    const acronyms: Record<string, string> = {
+      ip: "IP",
+      mac: "MAC",
+      api: "API",
+      id: "ID",
+      psu: "PSU",
+      rpm: "RPM",
+      uuid: "UUID",
+      url: "URL",
+      rgb: "RGB",
+      json: "JSON",
+      tls: "TLS",
+      ssl: "SSL",
+      dhcp: "DHCP",
+      dns: "DNS",
+      ntp: "NTP",
+    };
+    const lower = part.toLowerCase();
+    const acronym = acronyms[lower];
+    if (acronym !== undefined) return acronym;
+    if (lower === "hashrate") return "HashRate";
+    return lower.charAt(0).toUpperCase() + lower.slice(1);
+  }
+
   function formatColumnHeader(col: string) {
     const explicit: Record<string, string> = {
       ip: "IP",
@@ -703,48 +1304,64 @@
       firmware: "Firmware",
       make: "Make",
       model: "Model",
-      control_board_version: "Control board",
-      controlBoardVersion: "Control board",
-      expected_hashrate: "Hashrate vs expected",
-      expectedHashrate: "Hashrate vs expected",
-      expected_chips: "Chips vs expected",
-      expectedChips: "Chips vs expected",
-      expected_fans: "Fans vs expected",
-      expectedFans: "Fans vs expected",
+      control_board_version: "Control Board",
+      controlBoardVersion: "Control Board",
+      expected_hashrate: "HashRate Performance",
+      expectedHashrate: "HashRate Performance",
+      expected_chips: "# of Chips",
+      expectedChips: "# of Chips",
+      expected_fans: "# of Fans",
+      expectedFans: "# of Fans",
       fans: "Fans",
-      expected_hashboards: "Hashboards vs expected",
-      expectedHashboards: "Hashboards vs expected",
+      expected_hashboards: "# of Hashboards",
+      expectedHashboards: "# of Hashboards",
+      schema_version: "Schema Version",
+      serial_number: "Serial Number",
+      firmware_version: "Firmware Version",
+      hostname: "Hostname",
+      hashboards: "Hashboards",
+      psu_fans: "PSU Fans",
+      fluid_temperature: "Fluid Temperature",
+      fluidTemperature: "Fluid Temperature",
+      tuning_target: "Tuning Target",
+      light_flashing: "Light Flashing",
+      wattage: "Wattage",
+      efficiency: "Efficiency",
+      messages: "Messages",
+      uptime: "Uptime",
+      pools: "Pools",
+      pools_accepted: "Accepted Shares",
+      pools_rejected: "Rejected Shares",
+      pools_stratum: "Pool",
+      timestamp: "Last Seen",
+      status: "Status",
+      discovery: "Discovery",
     };
     const mapped = explicit[col];
     if (mapped) return mapped;
-    return col
-      .split("_")
-      .filter(Boolean)
-      .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-      .join(" ");
+    return splitColumnKeyToParts(col).map(titleCaseHeaderPart).join(" ");
   }
 
   /** Autosize often under-measures custom cell renderers; never shrink these below this width. */
   const AUTOSIZE_MIN_WIDTH_FLOOR_PX: Record<string, number> = {
     expected_hashrate: 188,
     expectedHashrate: 188,
-    expected_chips: 92,
-    expectedChips: 92,
-    expected_fans: 92,
-    expectedFans: 92,
-    expected_hashboards: 92,
-    expectedHashboards: 92,
+    expected_chips: 118,
+    expectedChips: 118,
+    expected_fans: 118,
+    expectedFans: 118,
+    expected_hashboards: 118,
+    expectedHashboards: 118,
     fans: 168,
+    timestamp: 168,
+    uptime: 220,
   };
 
-  function refreshGridLayout() {
-    if (!gridApi) return;
-    gridApi.refreshCells({ force: true });
-    gridApi.autoSizeAllColumns(false);
-    // Keep each column's minWidth aligned to its latest autosized width, but do not go below
-    // renderer-aware floors (otherwise minWidth gets locked too narrow on every model update).
+  /** One-shot autosize + min-width floors (only when no saved column layout exists). */
+  function runGridAutosizeWithWidthFloors(api: GridApi<GridRow>) {
+    api.autoSizeAllColumns(false);
     const widen: { key: string; newWidth: number }[] = [];
-    for (const column of gridApi.getAllDisplayedColumns()) {
+    for (const column of api.getAllDisplayedColumns()) {
       const rawW = column.getActualWidth();
       const width = typeof rawW === "number" ? rawW : 0;
       const field = column.getColDef().field as string | undefined;
@@ -756,7 +1373,7 @@
       }
     }
     if (widen.length > 0) {
-      gridApi.setColumnWidths(widen);
+      api.setColumnWidths(widen);
     }
   }
 
@@ -1115,7 +1732,7 @@
         nextRows.delete(key);
         discoveryWorkbench.rows = nextRows;
         const nextMovement = new Map(discoveryWorkbench.movementByCell);
-        for (const col of MOVEMENT_COLUMNS) {
+        for (const col of [...MOVEMENT_COLUMNS, ...POOLS_MOVEMENT_IDS]) {
           nextMovement.delete(movementKey(key, col));
         }
         discoveryWorkbench.movementByCell = nextMovement;
@@ -1157,6 +1774,26 @@
             col === "hashrate"
               ? formatHashRateDeltaHs(Math.abs(delta), currentRow[col])
               : formatDelta(col, Math.abs(delta)),
+        });
+      }
+      const prevPools = parsePoolsShareTotals(poolsRawFromRow(previousRow));
+      const nextPools = parsePoolsShareTotals(poolsRawFromRow(currentRow));
+      for (const movId of POOLS_MOVEMENT_IDS) {
+        const keyForCell = movementKey(key, movId);
+        const prevV = movId === "pools_accepted" ? prevPools.accepted : prevPools.rejected;
+        const nextV = movId === "pools_accepted" ? nextPools.accepted : nextPools.rejected;
+        if (prevV === null || nextV === null) {
+          nextMovement.delete(keyForCell);
+          continue;
+        }
+        const delta = nextV - prevV;
+        if (!Number.isFinite(delta) || delta <= 0) {
+          nextMovement.delete(keyForCell);
+          continue;
+        }
+        nextMovement.set(keyForCell, {
+          direction: "up",
+          deltaText: String(Math.round(delta)),
         });
       }
       discoveryWorkbench.movementByCell = nextMovement;
@@ -1280,6 +1917,30 @@
     }
   }
 
+  /** True when there is no usable fluid temperature reading (null, NaN, string "null", etc.). */
+  function isFluidTemperatureValueEmpty(v: unknown): boolean {
+    if (v === undefined || v === null) return true;
+    if (typeof v === "number") return !Number.isFinite(v);
+    if (typeof v === "string") {
+      const t = v.trim().toLowerCase();
+      if (t === "" || t === "null" || t === "undefined") return true;
+      return !Number.isFinite(Number.parseFloat(t));
+    }
+    if (typeof v === "object" && !Array.isArray(v)) {
+      const o = v as Record<string, unknown>;
+      const inner = o.value ?? o.celsius;
+      if (inner === undefined || inner === null) return true;
+      if (typeof inner === "number") return !Number.isFinite(inner);
+      if (typeof inner === "string") {
+        const s = inner.trim().toLowerCase();
+        if (s === "" || s === "null") return true;
+        return !Number.isFinite(Number.parseFloat(s));
+      }
+      return true;
+    }
+    return true;
+  }
+
   const rowList = $derived(
     [...discoveryWorkbench.rows.values()].sort((a, b) => a.id.localeCompare(b.id)),
   );
@@ -1303,13 +1964,15 @@
     return [...keys].sort();
   });
 
-  const columnKeys = $derived.by(() => {
+  const canonicalColumnKeys = $derived.by(() => {
     const merged = new Set<string>([
       ...BASELINE_COLUMN_KEYS,
       ...rememberedColumnKeys.filter((k) => !LEGACY_DEVICE_INFO_KEYS.has(k)),
       ...discoveredColumnKeys,
     ]);
-    const sorted = [...merged].sort();
+    // Preserve insertion order from the Set (baseline → remembered → discovered); do not sort,
+    // or auto-discover / enrich will reshuffle columns whenever new fields appear.
+    const ordered = [...merged];
     const preferredPinned = ["ip", "mac"];
     const preferredUnpinnedLeft = [
       "hashrate",
@@ -1325,16 +1988,18 @@
       "average_temperature",
       "efficiency",
       "wattage",
+      "timestamp",
+      "uptime",
     ];
     const preferredIdentity = ["firmware", "make", "model"];
-    const pinned = preferredPinned.filter((key) => sorted.includes(key));
-    const remaining = sorted.filter((key) => !preferredPinned.includes(key));
+    const pinned = preferredPinned.filter((key) => ordered.includes(key));
+    const remaining = ordered.filter((key) => !preferredPinned.includes(key));
     const leftUnpinned = preferredUnpinnedLeft.filter((key) => remaining.includes(key));
     const identityCols = preferredIdentity.filter((key) => remaining.includes(key));
     const rest = remaining.filter(
       (key) => !preferredUnpinnedLeft.includes(key) && !preferredIdentity.includes(key),
     );
-    return ["status", ...pinned, ...leftUnpinned, ...identityCols, ...rest];
+    return expandPoolsColumnKeys(["status", ...pinned, ...leftUnpinned, ...identityCols, ...rest]);
   });
 
   const gridRowData = $derived(
@@ -1345,8 +2010,26 @@
     })),
   );
 
+  const fluidTemperatureHiddenAllNull = $derived.by(() => {
+    if (gridRowData.length === 0) return false;
+    for (const row of gridRowData) {
+      const rec = row as Record<string, unknown>;
+      const v = rec.fluid_temperature ?? rec.fluidTemperature;
+      if (!isFluidTemperatureValueEmpty(v)) return false;
+    }
+    return true;
+  });
+
+  const displayColumnKeys = $derived.by(() =>
+    mergeDisplayColumnOrder(canonicalColumnKeys, persistedColumnOrderIds),
+  );
+
+  const layoutIdentitySig = $derived(
+    layoutIdentitySigFromCanonical(canonicalColumnKeys, fluidTemperatureHiddenAllNull),
+  );
+
   const gridColumnDefs = $derived.by<ColDef<GridRow>[]>(() =>
-    columnKeys.map((col): ColDef<GridRow> => {
+    displayColumnKeys.map((col): ColDef<GridRow> => {
       if (col === "status") {
         return {
           field: col,
@@ -1430,7 +2113,7 @@
         return {
           field: col,
           headerName: formatColumnHeader(col),
-          minWidth: 92,
+          minWidth: 118,
           flex: 0.35,
           sortable: true,
           filter: true,
@@ -1548,10 +2231,166 @@
         };
       }
 
+      if (col === "timestamp") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 168,
+          flex: 0.45,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) =>
+            parseUnixTimestampSeconds((p.data as Record<string, unknown> | undefined)?.timestamp),
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return -1;
+            if (!Number.isFinite(nb)) return 1;
+            return na - nb;
+          },
+          cellRenderer: (params: ValueFormatterParams<GridRow>) =>
+            formatColumnValue(col, params.value),
+        };
+      }
+
+      if (col === "uptime") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 220,
+          flex: 0.55,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) =>
+            parseUptimeTotalSeconds((p.data as Record<string, unknown> | undefined)?.uptime),
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return -1;
+            if (!Number.isFinite(nb)) return 1;
+            return na - nb;
+          },
+          cellRenderer: (params: ValueFormatterParams<GridRow>) =>
+            formatColumnValue(col, params.value),
+        };
+      }
+
+      if (col === "pools_accepted") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 148,
+          flex: 0.45,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => {
+            const t = parsePoolsShareTotals(poolsRawFromRow(p.data as Record<string, unknown> | undefined));
+            return t.accepted ?? Number.MIN_SAFE_INTEGER;
+          },
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return -1;
+            if (!Number.isFinite(nb)) return 1;
+            return na - nb;
+          },
+          cellRenderer: (params: ValueFormatterParams<GridRow>) => {
+            const formatted = formatColumnValue(col, params.value);
+            const rowId = typeof params.data?.id === "string" ? params.data.id : "";
+            if (!rowId) return formatted;
+            const movement = discoveryWorkbench.movementByCell.get(movementKey(rowId, "pools_accepted"));
+            if (!movement) return formatted;
+            const wrapper = document.createElement("span");
+            wrapper.className = "tm-move-cell";
+            const valueEl = document.createElement("span");
+            valueEl.className = "tm-move-value";
+            valueEl.textContent = formatted;
+            const indicator = document.createElement("span");
+            indicator.className = "tm-move-indicator tm-move-up";
+            indicator.textContent = ` \u2191 +${movement.deltaText}`;
+            wrapper.append(valueEl, indicator);
+            return wrapper;
+          },
+        };
+      }
+
+      if (col === "pools_rejected") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 148,
+          flex: 0.45,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) => {
+            const t = parsePoolsShareTotals(poolsRawFromRow(p.data as Record<string, unknown> | undefined));
+            return t.rejected ?? Number.MIN_SAFE_INTEGER;
+          },
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) => {
+            const na = typeof valueA === "number" ? valueA : Number.NaN;
+            const nb = typeof valueB === "number" ? valueB : Number.NaN;
+            if (!Number.isFinite(na) && !Number.isFinite(nb)) return 0;
+            if (!Number.isFinite(na)) return -1;
+            if (!Number.isFinite(nb)) return 1;
+            return na - nb;
+          },
+          cellRenderer: (params: ValueFormatterParams<GridRow>) => {
+            const formatted = formatColumnValue(col, params.value);
+            const rowId = typeof params.data?.id === "string" ? params.data.id : "";
+            if (!rowId) return formatted;
+            const movement = discoveryWorkbench.movementByCell.get(movementKey(rowId, "pools_rejected"));
+            if (!movement) return formatted;
+            const wrapper = document.createElement("span");
+            wrapper.className = "tm-move-cell";
+            const valueEl = document.createElement("span");
+            valueEl.className = "tm-move-value";
+            valueEl.textContent = formatted;
+            const indicator = document.createElement("span");
+            indicator.className = "tm-move-indicator tm-move-down";
+            indicator.textContent = ` \u2191 +${movement.deltaText}`;
+            wrapper.append(valueEl, indicator);
+            return wrapper;
+          },
+        };
+      }
+
+      if (col === "pools_stratum") {
+        return {
+          field: col,
+          headerName: formatColumnHeader(col),
+          minWidth: 220,
+          flex: 0.65,
+          sortable: true,
+          filter: true,
+          valueGetter: (p) =>
+            parsePoolsStratumDisplay(poolsRawFromRow(p.data as Record<string, unknown> | undefined)),
+          valueFormatter: (p: ValueFormatterParams<GridRow>) => formatColumnValue(col, p.value),
+          comparator: (valueA, valueB) =>
+            String(valueA ?? "").localeCompare(String(valueB ?? ""), undefined, { sensitivity: "base" }),
+          cellRenderer: (params: ValueFormatterParams<GridRow>) => formatColumnValue(col, params.value),
+        };
+      }
+
       return {
         field: col,
         headerName: formatColumnHeader(col),
-        hide: col === "discovery" || col === "api_version" || col === "apiVersion",
+        hide:
+          col === "discovery" ||
+          col === "api_version" ||
+          col === "apiVersion" ||
+          col === "is_mining" ||
+          col === "isMining" ||
+          col === "total_chips" ||
+          col === "totalChips" ||
+          ((col === "fluid_temperature" || col === "fluidTemperature") &&
+            fluidTemperatureHiddenAllNull),
         pinned: col === "ip" || col === "mac" ? "left" : undefined,
         valueFormatter: (params: ValueFormatterParams<GridRow>) => formatColumnValue(col, params.value),
         cellRenderer: (params: ValueFormatterParams<GridRow>) => {
@@ -1663,17 +2502,38 @@
     }
     knownDevices = loadKnownDevices();
     rememberedColumnKeys = loadGridColumnKeys();
+    const initialColState = loadGridColumnState();
+    persistedColumnOrderIds = initialColState?.length
+      ? initialColState.flatMap((c) => {
+          const id = c.colId;
+          if (typeof id !== "string" || !id.length) return [];
+          return expandPoolsColumnId(id);
+        })
+      : null;
     discoveryListsPersistAllowed = true;
     if (!gridHost) return;
     const gridOptions: GridOptions<GridRow> = {
       rowModelType: "clientSide",
       defaultColDef,
       animateRows: true,
+      suppressColumnMoveAnimation: false,
       columnDefs: gridColumnDefs,
       rowData: gridRowData,
       onModelUpdated: () => {
         if (!gridApi) return;
-        refreshGridLayout();
+        gridApi.refreshCells({ force: true });
+      },
+      onColumnResized: (e) => {
+        if (e.finished) schedulePersistGridColumnLayout();
+      },
+      onColumnMoved: (e) => {
+        if (e.finished) schedulePersistGridColumnLayout();
+      },
+      onColumnPinned: () => {
+        schedulePersistGridColumnLayout();
+      },
+      onColumnVisible: () => {
+        schedulePersistGridColumnLayout();
       },
       localeText: {
         noRowsToShow: "No responding IPs yet",
@@ -1681,7 +2541,13 @@
       getRowId: (params) => params.data.id,
     };
     gridApi = createGrid(gridHost, gridOptions);
-    requestAnimationFrame(() => refreshGridLayout());
+    requestAnimationFrame(() => {
+      if (!gridApi) return;
+      if (!loadGridColumnState()?.length) {
+        runGridAutosizeWithWidthFloors(gridApi);
+        schedulePersistGridColumnLayout();
+      }
+    });
   });
 
   $effect(() => {
@@ -1757,15 +2623,28 @@
   });
 
   $effect(() => {
-    const merged = [...new Set([...rememberedColumnKeys, ...discoveredColumnKeys])].sort();
+    const seen = new Set<string>();
+    const mergedOrdered: string[] = [];
+    for (const k of rememberedColumnKeys) {
+      if (!k || LEGACY_DEVICE_INFO_KEYS.has(k)) continue;
+      if (seen.has(k)) continue;
+      mergedOrdered.push(k);
+      seen.add(k);
+    }
+    for (const k of discoveredColumnKeys) {
+      if (LEGACY_DEVICE_INFO_KEYS.has(k)) continue;
+      if (seen.has(k)) continue;
+      mergedOrdered.push(k);
+      seen.add(k);
+    }
     if (
-      merged.length === rememberedColumnKeys.length &&
-      merged.every((key, idx) => key === rememberedColumnKeys[idx])
+      mergedOrdered.length === rememberedColumnKeys.length &&
+      mergedOrdered.every((key, idx) => key === rememberedColumnKeys[idx])
     ) {
       return;
     }
-    rememberedColumnKeys = merged;
-    saveGridColumnKeys(merged);
+    rememberedColumnKeys = mergedOrdered;
+    saveGridColumnKeys(mergedOrdered);
   });
 
   $effect(() => {
@@ -1858,15 +2737,41 @@
   $effect(() => {
     if (!gridApi) return;
     const api = gridApi;
-    api.setGridOption("columnDefs", gridColumnDefs);
+    const colDefs = gridColumnDefs;
+    const sig = layoutIdentitySig;
+    const defsChanged = sig !== prevGridColumnLayoutSig;
+    const newGridInstance = lastGridApiWithPersistedLayout !== api;
+    if (defsChanged) {
+      prevGridColumnLayoutSig = sig;
+      writeGridColumnLayoutSigToSession(sig);
+      api.setGridOption("columnDefs", colDefs);
+    }
     api.setGridOption("rowData", gridRowData);
     requestAnimationFrame(() => {
       if (gridApi !== api) return;
-      refreshGridLayout();
+      if (defsChanged || newGridInstance) {
+        applyPersistedGridColumnLayout(api, colDefs);
+      }
+      lastGridApiWithPersistedLayout = api;
+      api.refreshCells({ force: true });
     });
   });
 
   onDestroy(() => {
+    if (columnLayoutPersistTimer !== null) {
+      clearTimeout(columnLayoutPersistTimer);
+      columnLayoutPersistTimer = null;
+    }
+    if (gridApi) {
+      try {
+        const st = gridApi.getColumnState();
+        // AG Grid can report an empty column model during teardown; never overwrite good storage with [].
+        if (st.length > 0) saveGridColumnState(st);
+      } catch {
+        // ignore
+      }
+    }
+    lastGridApiWithPersistedLayout = null;
     for (const u of unlistenFns) void u();
     if (coalesceTimer) clearTimeout(coalesceTimer);
     if (autoDiscoverTimer) clearInterval(autoDiscoverTimer);
