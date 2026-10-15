@@ -30,6 +30,11 @@ env_logger = "0.11"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["macros", "rt", "sync", "time", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = [] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+diqwest = "3"
+semver = "1"
+md-5 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "sync", "time", "rt-multi-thread", "test-util"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "rt-multi-thread", "net", "io-util", "test-util"] }

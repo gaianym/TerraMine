@@ -2,8 +2,13 @@
 
 pub mod driver;
 pub mod job;
+pub mod overrides;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod http_mock;
+#[cfg(test)]
+mod override_tests;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -15,7 +20,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use driver::{AsicRsFactory, Capabilities, DriverFactory, MinerAction};
+use driver::{Capabilities, DriverFactory, MinerAction, OverlayFactory};
 use job::{ActionRowEvent, JobConfig};
 
 pub const EVENT_ROW: &str = "control:row";
@@ -84,7 +89,7 @@ pub fn job_config(req: &ActionRequest) -> JobConfig {
 #[tauri::command]
 pub async fn miner_capabilities(ips: Vec<String>) -> Result<Vec<CapsRow>, String> {
     let ips = parse_ips(&ips)?;
-    let f = AsicRsFactory::new(Duration::from_secs(5));
+    let f = OverlayFactory::new(Duration::from_secs(5));
     let mut out = Vec::new();
     for ip in ips {
         let d = f.connect(ip).await.ok().flatten();
@@ -103,7 +108,7 @@ pub async fn run_miner_action(app: AppHandle, state: State<'_, ControlState>, re
     let runs = state.runs.clone();
     let rid = run_id.clone();
     tauri::async_runtime::spawn(async move {
-        let factory: Arc<dyn DriverFactory> = Arc::new(AsicRsFactory::new(cfg.timeout));
+        let factory: Arc<dyn DriverFactory> = Arc::new(OverlayFactory::new(cfg.timeout));
         let app2 = app.clone();
         let sink: job::Sink = Arc::new(move |e| {
             let _ = app2.emit(EVENT_ROW, e);
