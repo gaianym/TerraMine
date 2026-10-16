@@ -3,6 +3,7 @@
     ClientSideRowModelModule,
     ColumnApiModule,
     ModuleRegistry,
+    RowSelectionModule,
     createGrid,
     type ColDef,
     type ColumnState,
@@ -26,6 +27,8 @@
     unsupportedReason,
     type MinerAction,
   } from "$lib/control/types";
+  import { formatActionStatusLabel, ipsNeedingRefresh, missingAgGridModules } from "$lib/control/statusLabel";
+  import { applyTargetsShortcut } from "$lib/control/targetsKeys";
   import {
     defaultDiscoverySettings,
     type DiscoveryProgress,
@@ -282,13 +285,26 @@
     const saved = loadGridColumnState();
     if (!saved?.length) return;
     const known = new Set(
-      defs.map((d) => d.field).filter((f): f is string => typeof f === "string" && f.length > 0),
+      defs.flatMap((d) => {
+        const ids: string[] = [];
+        if (typeof d.field === "string" && d.field.length) ids.push(d.field);
+        if (typeof d.colId === "string" && d.colId.length) ids.push(d.colId);
+        return ids;
+      }),
     );
-    const filtered = saved.filter((c) => known.has(c.colId));
-    if (!filtered.length) return;
+    // Always keep the AG Grid selection checkbox column visible and first.
+    const SELECTION_COL = "ag-Grid-SelectionColumn";
+    known.add(SELECTION_COL);
+    const filtered = saved.filter((c) => typeof c.colId === "string" && known.has(c.colId));
+    const withoutSel = filtered.filter((c) => c.colId !== SELECTION_COL);
+    const state = [
+      { colId: SELECTION_COL, pinned: "left" as const, hide: false, width: 48 },
+      ...withoutSel,
+    ];
+    if (state.length <= 1 && !withoutSel.length) return;
     api.setGridOption("suppressColumnMoveAnimation", true);
     try {
-      api.applyColumnState({ state: filtered, applyOrder: true });
+      api.applyColumnState({ state, applyOrder: true });
     } finally {
       api.setGridOption("suppressColumnMoveAnimation", false);
     }
@@ -309,7 +325,16 @@
     }
   });
 
-  ModuleRegistry.registerModules([ClientSideRowModelModule, ColumnApiModule]);
+  ModuleRegistry.registerModules([ClientSideRowModelModule, ColumnApiModule, RowSelectionModule]);
+  // Permanent guard: missing RowSelectionModule silently disables checkboxes (demo bug).
+  {
+    const missing = missingAgGridModules([
+      "ClientSideRowModelModule",
+      "ColumnApiModule",
+      "RowSelectionModule",
+    ]);
+    if (missing.length) console.error("AG Grid modules missing:", missing);
+  }
 
   const HASH_RATE_UNIT_TIERS = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"] as const;
 
@@ -1883,6 +1908,43 @@
     }
   }
 
+  /** Re-poll a subset of IPs (e.g. after reboot verify) and merge into the grid. */
+  async function enrichSpecificIps(ips: string[]) {
+    const unique = [...new Set(ips.filter(Boolean))];
+    if (!unique.length || busy) return;
+    // Make sure each IP is in knownDevices so the enrich pipeline keeps it.
+    const now = Date.now();
+    const have = new Set(knownDevices.map((d) => d.ip));
+    const missing = unique.filter((ip) => !have.has(ip));
+    if (missing.length) {
+      knownDevices = [
+        ...knownDevices,
+        ...missing.map((ip) => ({ ip, lastSeenAt: now })),
+      ];
+    }
+    errorMsg = null;
+    workbenchPendingRows.clear();
+    busy = true;
+    activeRunKind = "enrich";
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    try {
+      await wireEvents(id);
+      await invoke<string>("enrich_known_devices_run", {
+        runId: id,
+        devices: unique,
+        settings,
+      });
+      runId = id;
+    } catch (e) {
+      busy = false;
+      activeRunKind = null;
+      errorMsg = String(e);
+    }
+  }
+
   async function startKnownDeviceEnrichRun() {
     if (busy || knownDevices.length === 0) return;
     errorMsg = null;
@@ -2501,7 +2563,7 @@
       if (row) {
         const chip = document.createElement("span");
         chip.className = `tm-chip ${CHIP_TONE[statusTone(row.status)]}`;
-        chip.textContent = `${row.action}: ${row.status}`;
+        chip.textContent = formatActionStatusLabel(row);
         chip.title = row.msg ?? "";
         wrap.appendChild(chip);
       }
@@ -2516,6 +2578,20 @@
 
   $effect(() => {
     if (selectedIps.length) void control.refreshCaps(selectedIps);
+  });
+
+  /** After a control run finishes, re-poll those miners so hashrate/temp/uptime refresh. */
+  let lastEnrichedDoneId: string | null = null;
+  $effect(() => {
+    const done = control.lastDone;
+    if (!done || done.run_id === lastEnrichedDoneId) return;
+    const ips = ipsNeedingRefresh(done.results);
+    if (!ips.length) {
+      lastEnrichedDoneId = done.run_id;
+      return;
+    }
+    lastEnrichedDoneId = done.run_id;
+    void enrichSpecificIps(ips);
   });
 
   const defaultColDef: ColDef<GridRow> = {
@@ -2619,7 +2695,24 @@
         noRowsToShow: "No responding IPs yet",
       },
       getRowId: (params) => params.data.id,
-      rowSelection: { mode: "multiRow", checkboxes: true, headerCheckbox: true, enableClickSelection: false },
+      // RowSelectionModule (registered above) is required for these checkboxes to appear.
+      rowSelection: {
+        mode: "multiRow",
+        checkboxes: true,
+        headerCheckbox: true,
+        enableClickSelection: true,
+        enableSelectionWithoutKeys: false,
+      },
+      selectionColumnDef: {
+        pinned: "left",
+        lockPinned: true,
+        width: 48,
+        maxWidth: 52,
+        minWidth: 44,
+        resizable: false,
+        suppressHeaderMenuButton: true,
+        headerName: "",
+      },
       onSelectionChanged: (e) => {
         selectedIps = e.api
           .getSelectedRows()
@@ -2884,6 +2977,12 @@
           rows="1"
           bind:value={targets}
           placeholder="192.168.1.0/24 or 10.0.0.1, 10.0.0.5-10"
+          onkeydown={(e) => {
+            applyTargetsShortcut(e, () => {
+              const el = e.currentTarget;
+              if (el instanceof HTMLTextAreaElement) el.select();
+            });
+          }}
         ></textarea>
       </div>
       <div class="flex flex-wrap items-end gap-2">
