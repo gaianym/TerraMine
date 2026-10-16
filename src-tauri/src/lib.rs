@@ -1,4 +1,4 @@
-mod control;
+pub mod control;
 mod discovery;
 mod logger;
 
@@ -18,6 +18,9 @@ pub fn run() {
             control::miner_capabilities,
             control::run_miner_action,
             control::cancel_action_run,
+            control::list_miner_credentials,
+            control::set_miner_credentials,
+            control::delete_miner_credentials,
         ])
         .run(tauri::generate_context!())
         .expect("error while running terra-mine");

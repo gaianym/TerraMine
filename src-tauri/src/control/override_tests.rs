@@ -1,4 +1,3 @@
-#![cfg(test)]
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;

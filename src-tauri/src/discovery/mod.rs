@@ -69,7 +69,7 @@ async fn start_discovery_run_internal(
     if targets.is_empty() {
         return Err("targets must not be empty".to_string());
     }
-    if targets.as_bytes().len() > MAX_TARGETS_LEN_BYTES {
+    if targets.len() > MAX_TARGETS_LEN_BYTES {
         return Err(format!(
             "targets too large (max {MAX_TARGETS_LEN_BYTES} bytes)"
         ));

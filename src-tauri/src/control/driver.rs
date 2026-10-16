@@ -50,6 +50,19 @@ pub trait MinerDriver: Send + Sync {
     fn caps(&self) -> Capabilities;
     /// Ok(true) = accepted, Ok(false) = firmware refused / no-op.
     fn execute(&self, action: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>>;
+    /// Current state used for post-action verification.
+    fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
+        Box::pin(async { anyhow::bail!("status not supported") })
+    }
+}
+
+/// Snapshot used to verify an action took effect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MinerStatus {
+    /// Seconds since boot (or since the mining process started).
+    pub uptime_s: Option<u64>,
+    /// Some(true) = paused/sleeping, Some(false) = hashing.
+    pub paused: Option<bool>,
 }
 
 /// Resolves an IP to a driver (None = no miner found).
@@ -88,6 +101,12 @@ impl MinerDriver for AsicRsDriver {
                 MinerAction::Stop => self.miner.pause(None).await,
                 MinerAction::Reboot => self.miner.restart().await,
             }
+        })
+    }
+    fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
+        Box::pin(async move {
+            let d = self.miner.get_data().await;
+            Ok(MinerStatus { uptime_s: d.uptime.map(|u| u.as_secs()), paused: Some(!d.is_mining) })
         })
     }
 }
@@ -131,6 +150,21 @@ impl OverlayFactory {
             s9_creds: DigestCredentials::antminer_stock_default(),
             asic: AsicRsFactory::new(timeout),
         }
+    }
+
+    /// Loads S9 digest credentials from the credential store (OS keychain
+    /// in the app), falling back to the documented factory default.
+    pub fn with_store(timeout: Duration, store: &dyn super::creds::CredentialStore) -> Self {
+        let creds = store
+            .get(super::creds::FirmwareKind::AntminerStock)
+            .ok()
+            .flatten()
+            .unwrap_or_else(DigestCredentials::antminer_stock_default);
+        Self::new(timeout).with_s9_credentials(creds)
+    }
+
+    pub fn s9_credentials(&self) -> &DigestCredentials {
+        &self.s9_creds
     }
 
     pub fn with_s9_credentials(mut self, creds: DigestCredentials) -> Self {
@@ -200,6 +234,7 @@ pub struct MockDriver {
     pub behavior: MockBehavior,
     pub delay: Duration,
     pub log: std::sync::Arc<MockLog>,
+    pub status: Option<MinerStatus>,
 }
 
 #[cfg(test)]
@@ -228,5 +263,9 @@ impl MinerDriver for MockDriver {
                 MockBehavior::Error => anyhow::bail!("mock transport error"),
             }
         })
+    }
+    fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
+        let st = self.status;
+        Box::pin(async move { st.ok_or_else(|| anyhow::anyhow!("no status")) })
     }
 }

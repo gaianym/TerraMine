@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// HTTP digest username/password for Antminer stock CGI.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestCredentials {
     pub username: String,
     pub password: String,
@@ -27,5 +27,14 @@ impl DigestCredentials {
 impl Default for DigestCredentials {
     fn default() -> Self {
         Self::antminer_stock_default()
+    }
+}
+
+impl std::fmt::Debug for DigestCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DigestCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
     }
 }

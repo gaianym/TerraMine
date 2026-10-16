@@ -14,7 +14,7 @@ use reqwest::Client;
 use semver::Version;
 use serde_json::Value;
 
-use crate::control::driver::{Capabilities, MinerAction, MinerDriver};
+use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus};
 
 /// Minimum AxeOS version that exposes pause/resume endpoints.
 pub const PAUSE_RESUME_MIN: Version = Version::new(2, 14, 0);
@@ -118,6 +118,22 @@ impl MinerDriver for BitaxeDriver {
                 MinerAction::Start | MinerAction::Stop => Ok(false),
             }
         })
+    }
+
+    fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
+        Box::pin(async move {
+            let url = format!("{}/api/system/info", self.base);
+            let body: Value = self.client.get(url).send().await?.error_for_status()?.json().await?;
+            Ok(parse_axeos_status(&body))
+        })
+    }
+}
+
+/// Uptime and pause state from AxeOS `/api/system/info`.
+pub fn parse_axeos_status(body: &Value) -> MinerStatus {
+    MinerStatus {
+        uptime_s: body.get("uptimeSeconds").and_then(|v| v.as_u64()),
+        paused: body.get("miningPaused").and_then(|v| v.as_bool()),
     }
 }
 

@@ -33,7 +33,7 @@ fn sanitize_value(v: &mut Value, depth: usize) {
         Value::String(s) => {
             if s.len() > MAX_STRING_BYTES {
                 s.truncate(MAX_STRING_BYTES);
-                s.push_str("…");
+                s.push('…');
             }
         }
         Value::Array(arr) => {

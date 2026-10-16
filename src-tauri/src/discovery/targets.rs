@@ -92,7 +92,7 @@ pub fn parse_targets_to_ips(input: &str) -> Result<Vec<IpAddr>, String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
 
-    for raw in input.split(|c: char| c == ',' || c == '\n' || c == ';') {
+    for raw in input.split([',', '\n', ';']) {
         let token = raw.trim();
         if token.is_empty() {
             continue;
@@ -122,7 +122,7 @@ pub fn parse_targets_to_ips(input: &str) -> Result<Vec<IpAddr>, String> {
 }
 
 pub fn addr_matches_targets(addr: IpAddr, input: &str) -> Result<bool, String> {
-    for raw in input.split(|c: char| c == ',' || c == '\n' || c == ';') {
+    for raw in input.split([',', '\n', ';']) {
         let token = raw.trim();
         if token.is_empty() {
             continue;

@@ -1,5 +1,4 @@
 //! Minimal HTTP mock servers for Bitaxe/AxeOS and stock S9 CGI tests.
-#![cfg(test)]
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

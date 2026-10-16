@@ -16,7 +16,7 @@ use futures::future::BoxFuture;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 
-use crate::control::driver::{Capabilities, MinerAction, MinerDriver};
+use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus};
 use crate::control::overrides::auth::DigestCredentials;
 
 #[derive(Debug, Clone)]
@@ -26,6 +26,8 @@ pub struct S9StockDriver {
     client: Client,
     creds: DigestCredentials,
     has_miner_mode: bool,
+    /// cgminer API address used for uptime (`summary` → `Elapsed`).
+    pub(crate) cgminer_addr: String,
 }
 
 impl S9StockDriver {
@@ -42,7 +44,26 @@ impl S9StockDriver {
             client,
             creds,
             has_miner_mode,
+            cgminer_addr: format!("{ip}:4028"),
         }
+    }
+
+    pub fn with_cgminer_addr(mut self, addr: String) -> Self {
+        self.cgminer_addr = addr;
+        self
+    }
+
+    async fn cgminer_elapsed(&self) -> anyhow::Result<u64> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut sock = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&self.cgminer_addr),
+        )
+        .await??;
+        sock.write_all(br#"{"command":"summary"}"#).await?;
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf)).await??;
+        parse_cgminer_elapsed(&buf).ok_or_else(|| anyhow::anyhow!("no Elapsed in cgminer summary"))
     }
 
     pub async fn probe(
@@ -176,4 +197,24 @@ impl MinerDriver for S9StockDriver {
             }
         })
     }
+
+    fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
+        Box::pin(async move {
+            let uptime_s = Some(self.cgminer_elapsed().await?);
+            let paused = if self.has_miner_mode {
+                let (_, conf) = self.digest_get("/cgi-bin/get_miner_conf.cgi").await?;
+                conf.and_then(|c| c.get("miner-mode").and_then(|m| m.as_str().map(|m| m == "1")))
+            } else {
+                None
+            };
+            Ok(MinerStatus { uptime_s, paused })
+        })
+    }
+}
+
+/// cgminer replies are JSON, sometimes NUL-terminated.
+pub fn parse_cgminer_elapsed(raw: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(raw);
+    let v: Value = serde_json::from_str(text.trim_end_matches('\0').trim()).ok()?;
+    v.get("SUMMARY")?.get(0)?.get("Elapsed")?.as_u64()
 }
