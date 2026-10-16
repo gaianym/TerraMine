@@ -9,6 +9,7 @@
   } from "$lib/discoveryDefaults";
   import { loadDiscoverySettings, saveDiscoverySettings } from "$lib/discoverySettingsStorage";
   import DiscoveryUIntField from "$lib/DiscoveryUIntField.svelte";
+  import CredentialsPanel from "$lib/control/CredentialsPanel.svelte";
 
   /** Stable key order so fingerprints match across load/save and dirty checks. */
   function fingerprintFromSettings(s: DiscoverySettings): string {
@@ -199,4 +200,5 @@
       />
     </div>
   </section>
+  <CredentialsPanel />
 </div>
