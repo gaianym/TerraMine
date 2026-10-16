@@ -17,6 +17,15 @@
   import { beforeNavigate } from "$app/navigation";
   import { onDestroy, onMount, untrack } from "svelte";
   import { ArrowLeft, Check, ChevronDown, Settings, X } from "lucide-svelte";
+  import { control } from "$lib/control/controlState.svelte";
+  import ControlToolbar from "$lib/control/ControlToolbar.svelte";
+  import ActionDialog from "$lib/control/ActionDialog.svelte";
+  import {
+    ACTION_LABEL,
+    statusTone,
+    unsupportedReason,
+    type MinerAction,
+  } from "$lib/control/types";
   import {
     defaultDiscoverySettings,
     type DiscoveryProgress,
@@ -2436,8 +2445,78 @@
           return String(valueA ?? "").localeCompare(String(valueB ?? ""));
         },
       };
-    }),
+    }).concat([controlColumnDef]),
   );
+
+  // ---- Miner control (start / stop / reboot) ----
+  const CONTROL_COL_ID = "tm_control";
+  let selectedIps = $state<string[]>([]);
+  let actionDialog = $state<{ ips: string[]; action: MinerAction } | null>(null);
+
+  function rowIp(row: GridRow | undefined): string | null {
+    const ip = row?.ip;
+    return typeof ip === "string" && ip.length ? ip : null;
+  }
+
+  function requestAction(ips: string[], action: MinerAction) {
+    if (!ips.length) return;
+    actionDialog = { ips, action };
+  }
+
+  const CHIP_TONE: Record<string, string> = {
+    ok: "tm-chip-ok",
+    warn: "tm-chip-warn",
+    bad: "tm-chip-bad",
+    busy: "tm-chip-busy",
+    muted: "tm-chip-muted",
+  };
+
+  const controlColumnDef: ColDef<GridRow> = {
+    colId: CONTROL_COL_ID,
+    headerName: "Control",
+    pinned: "right",
+    width: 230,
+    sortable: false,
+    filter: false,
+    cellRenderer: (params: ICellRendererParams<GridRow>) => {
+      const ip = rowIp(params.data);
+      const wrap = document.createElement("span");
+      wrap.className = "tm-control-cell";
+      if (!ip) return wrap;
+      for (const a of ["start", "stop", "reboot"] as MinerAction[]) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "tm-control-btn";
+        b.textContent = ACTION_LABEL[a];
+        const reason = unsupportedReason(control.capsByIp[ip], a);
+        b.disabled = !!reason || !!control.activeRunId;
+        b.title = reason ?? `${ACTION_LABEL[a]} ${ip}`;
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          requestAction([ip], a);
+        });
+        wrap.appendChild(b);
+      }
+      const row = control.rowByIp[ip];
+      if (row) {
+        const chip = document.createElement("span");
+        chip.className = `tm-chip ${CHIP_TONE[statusTone(row.status)]}`;
+        chip.textContent = `${row.action}: ${row.status}`;
+        chip.title = row.msg ?? "";
+        wrap.appendChild(chip);
+      }
+      return wrap;
+    },
+  };
+
+  $effect(() => {
+    control.version;
+    if (gridApi) gridApi.refreshCells({ columns: [CONTROL_COL_ID], force: true });
+  });
+
+  $effect(() => {
+    if (selectedIps.length) void control.refreshCaps(selectedIps);
+  });
 
   const defaultColDef: ColDef<GridRow> = {
     resizable: true,
@@ -2473,6 +2552,7 @@
   });
 
   onMount(() => {
+    void control.attach();
     settings = loadDiscoverySettings();
     targetProfiles = normalizeTargetProfiles(loadTargetProfiles());
     let restoredSession = false;
@@ -2539,6 +2619,13 @@
         noRowsToShow: "No responding IPs yet",
       },
       getRowId: (params) => params.data.id,
+      rowSelection: { mode: "multiRow", checkboxes: true, headerCheckbox: true, enableClickSelection: false },
+      onSelectionChanged: (e) => {
+        selectedIps = e.api
+          .getSelectedRows()
+          .map((r) => rowIp(r))
+          .filter((ip): ip is string => ip !== null);
+      },
     };
     gridApi = createGrid(gridHost, gridOptions);
     requestAnimationFrame(() => {
@@ -2758,6 +2845,7 @@
   });
 
   onDestroy(() => {
+    control.detach();
     if (columnLayoutPersistTimer !== null) {
       clearTimeout(columnLayoutPersistTimer);
       columnLayoutPersistTimer = null;
@@ -2957,7 +3045,10 @@
   </div>
 
   <div class="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800">
-    <div class="border-b border-zinc-800 px-3 py-2 text-sm text-zinc-400">Results</div>
+    <div class="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2 text-sm text-zinc-400">
+      <span>Results</span>
+      <ControlToolbar {selectedIps} onrequest={requestAction} />
+    </div>
     <div class="relative min-h-0 w-full flex-1">
       <div
         bind:this={gridHost}
@@ -3198,3 +3289,7 @@
     </div>
   {/if}
 </div>
+
+{#if actionDialog}
+  <ActionDialog ips={actionDialog.ips} action={actionDialog.action} onclose={() => (actionDialog = null)} />
+{/if}
