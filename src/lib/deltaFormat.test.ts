@@ -50,7 +50,7 @@ describe("hashrate ticker auto-scaled to the value column", () => {
   });
   it("always ends in a hashrate unit, never a bare number", () => {
     for (const v of [1, 1e3, 1e6, 1e9, 1e12, 1e15]) {
-      expect(formatHashRateDelta(v, null)).toMatch(/ (H|KH|MH|GH|TH|PH|EH|ZH)\/s$/);
+      expect(formatHashRateDelta(v, null)).toMatch(/ (H|kH|MH|GH|TH|PH|EH|ZH)\/s$/);
     }
   });
 });

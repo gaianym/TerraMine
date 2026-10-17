@@ -50,14 +50,24 @@ body {
   --ag-input-border-color: var(--tm-border);
   --ag-input-background-color: var(--tm-bg);
   --ag-input-focus-border-color: var(--tm-accent);
-  /* Selected-row tint. Kept dark/low-alpha so row text and status badges stay
-     >= 4.5:1 (WCAG AA) even on hover+selected; enforced by chipContrast.test.ts. */
-  --ag-selected-row-background-color: rgba(71, 130, 62, 0.1);
+  --ag-selected-row-background-color: rgba(71, 130, 62, 0.16);
   --ag-range-selection-border-color: rgba(71, 130, 62, 0.75);
   --ag-checkbox-checked-color: var(--tm-accent);
   --ag-font-size: 12px;
   --ag-font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --ag-scrollbar-size: 8px;
+}
+
+/*
+ * Selected-row background. createGrid() uses the Theming API, which wraps the
+ * grid in a div with classes like "ag-theme-params-1". Legacy ag-grid.css sets
+ * [class*=ag-theme-] { --ag-selected-row-background-color: #bbb } and that
+ * matches the wrapper, so the token above never reaches the rows and selected
+ * rows render opaque light grey. Re-declare it below the wrapper with a dark
+ * tint. Contrast is checked in a real browser by gridSelectedRow.browser.test.ts.
+ */
+.ag-theme-quartz-dark .ag-root-wrapper {
+  --ag-selected-row-background-color: #0e2013;
 }
 
 .ag-theme-quartz-dark,

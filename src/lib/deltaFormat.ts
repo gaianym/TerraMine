@@ -3,8 +3,7 @@
  * unit; hashrate is auto-scaled to the value column's tier (H/s … ZH/s)
  * instead of raw hashes.
  */
-export const HASH_RATE_UNIT_TIERS = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"] as const;
-export type HashRateUnit = (typeof HASH_RATE_UNIT_TIERS)[number];
+import { HASH_RATE_UNIT_TIERS, normalizeHashRateUnit, type HashRateUnit } from "./hashrate";
 
 /** Columns that get an up/down ticker, with the unit each one must show. */
 export const TICKER_UNITS = {
@@ -38,7 +37,8 @@ function autoTier(absHs: number): { amount: number; unit: HashRateUnit } {
 export function formatHashRateDelta(absDeltaHs: number, valueUnit?: string | null): string {
   if (!Number.isFinite(absDeltaHs)) return "\u2014";
   const abs = Math.abs(absDeltaHs);
-  const idx = valueUnit ? HASH_RATE_UNIT_TIERS.indexOf(valueUnit as HashRateUnit) : -1;
+  const norm = normalizeHashRateUnit(valueUnit);
+  const idx = norm ? HASH_RATE_UNIT_TIERS.indexOf(norm) : -1;
   if (idx > 0) {
     const amount = abs / 1000 ** idx;
     if (amount >= 0.005) return `${amount.toFixed(2)} ${HASH_RATE_UNIT_TIERS[idx]}`;

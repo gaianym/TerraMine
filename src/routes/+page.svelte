@@ -31,6 +31,12 @@
   import { refreshUntilSettled, type RefreshTarget } from "$lib/control/postActionRefresh";
   import { formatEfficiency, formatGridValue } from "$lib/format";
   import { formatHashRateDelta, formatMetricDelta } from "$lib/deltaFormat";
+  import { formatHashRateValue, getNormalizedHashRateDisplay, parseHashRateToHs } from "$lib/hashrate";
+  import {
+    RESULTS_GRID_HOST_CLASS,
+    RESULTS_GRID_MODULES,
+    RESULTS_GRID_SELECTION_OPTIONS,
+  } from "$lib/grid/gridSelectionOptions";
   import { applyTargetsShortcut } from "$lib/control/targetsKeys";
   import {
     defaultDiscoverySettings,
@@ -328,7 +334,7 @@
     }
   });
 
-  ModuleRegistry.registerModules([ClientSideRowModelModule, ColumnApiModule, RowSelectionModule]);
+  ModuleRegistry.registerModules(RESULTS_GRID_MODULES);
   // Permanent guard: missing RowSelectionModule silently disables checkboxes (demo bug).
   {
     const missing = missingAgGridModules([
@@ -339,171 +345,7 @@
     if (missing.length) console.error("AG Grid modules missing:", missing);
   }
 
-  const HASH_RATE_UNIT_TIERS = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"] as const;
 
-  const HASH_RATE_UNIT_MAP: Record<string, string> = {
-    hash: "H/s",
-    h: "H/s",
-    hs: "H/s",
-    "h/s": "H/s",
-    kilohash: "KH/s",
-    khash: "KH/s",
-    kh: "KH/s",
-    khs: "KH/s",
-    "kh/s": "KH/s",
-    megahash: "MH/s",
-    mhash: "MH/s",
-    mh: "MH/s",
-    mhs: "MH/s",
-    "mh/s": "MH/s",
-    gigahash: "GH/s",
-    ghash: "GH/s",
-    gh: "GH/s",
-    ghs: "GH/s",
-    "gh/s": "GH/s",
-    terahash: "TH/s",
-    thash: "TH/s",
-    th: "TH/s",
-    ths: "TH/s",
-    "th/s": "TH/s",
-    petahash: "PH/s",
-    phash: "PH/s",
-    ph: "PH/s",
-    phs: "PH/s",
-    "ph/s": "PH/s",
-    exahash: "EH/s",
-    ehash: "EH/s",
-    eh: "EH/s",
-    ehs: "EH/s",
-    "eh/s": "EH/s",
-    zettahash: "ZH/s",
-    zhash: "ZH/s",
-    zh: "ZH/s",
-    zhs: "ZH/s",
-    "zh/s": "ZH/s",
-  };
-
-  /** Same tier logic as displayed hashrate cells; used for primary value and delta-in-that-unit. */
-  function scaleHashRateToDisplayTier(amount: number, unit: string) {
-    const unitTiers = HASH_RATE_UNIT_TIERS;
-    let idx = unitTiers.indexOf(unit as (typeof unitTiers)[number]);
-    if (idx < 0) return { amount, unit };
-    if (amount <= 0) {
-      return { amount: 0, unit: "H/s" as const };
-    }
-    while (amount >= 1000 && idx < unitTiers.length - 1) {
-      amount /= 1000;
-      idx += 1;
-    }
-    while (amount < 1 && idx > 0) {
-      amount *= 1000;
-      idx -= 1;
-    }
-    return { amount, unit: unitTiers[idx] };
-  }
-
-  /** Parsed display tier for a cell value (matches `formatHashRateValue`). */
-  function getNormalizedHashRateDisplay(value: unknown): { amount: number; unit: string } | null {
-    if (value === undefined || value === null) return null;
-    if (typeof value === "object") {
-      const record = value as Record<string, unknown>;
-      const rawAmount = record.value;
-      const rawUnit = record.unit;
-      const amount =
-        typeof rawAmount === "number"
-          ? rawAmount
-          : typeof rawAmount === "string"
-            ? Number.parseFloat(rawAmount)
-            : Number.NaN;
-      if (!Number.isFinite(amount)) return null;
-      const unitKey =
-        typeof rawUnit === "string" ? rawUnit.trim().toLowerCase().replace(/\s+/g, "") : "";
-      const unit = HASH_RATE_UNIT_MAP[unitKey] ?? (typeof rawUnit === "string" ? rawUnit.trim() : "");
-      if (!unit) return scaleHashRateToDisplayTier(Math.max(0, amount), "H/s");
-      return scaleHashRateToDisplayTier(amount, unit);
-    }
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return scaleHashRateToDisplayTier(value, "H/s");
-    }
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      const match = trimmed.match(/^(-?\d+(?:\.\d+)?)(.*)$/);
-      if (!match) return null;
-      const amount = Number.parseFloat(match[1]);
-      if (!Number.isFinite(amount)) return null;
-      const rawUnit = match[2].trim();
-      const unitKey = rawUnit.toLowerCase().replace(/\s+/g, "");
-      const unit = HASH_RATE_UNIT_MAP[unitKey] ?? rawUnit;
-      return scaleHashRateToDisplayTier(amount, unit);
-    }
-    return null;
-  }
-
-
-
-  function parseHashRateToHs(value: unknown): number | null {
-    if (value === undefined || value === null) return null;
-    const unitFactor: Record<string, number> = {
-      "h/s": 1,
-      hs: 1,
-      h: 1,
-      hash: 1,
-      khs: 1e3,
-      "kh/s": 1e3,
-      kh: 1e3,
-      kilohash: 1e3,
-      mhs: 1e6,
-      "mh/s": 1e6,
-      mh: 1e6,
-      megahash: 1e6,
-      ghs: 1e9,
-      "gh/s": 1e9,
-      gh: 1e9,
-      gigahash: 1e9,
-      ths: 1e12,
-      "th/s": 1e12,
-      th: 1e12,
-      terahash: 1e12,
-      phs: 1e15,
-      "ph/s": 1e15,
-      ph: 1e15,
-      petahash: 1e15,
-      ehs: 1e18,
-      "eh/s": 1e18,
-      eh: 1e18,
-      exahash: 1e18,
-      zhs: 1e21,
-      "zh/s": 1e21,
-      zh: 1e21,
-      zettahash: 1e21,
-    };
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      const match = trimmed.match(/^(-?\d+(?:\.\d+)?)(.*)$/);
-      if (!match) return null;
-      const amount = Number.parseFloat(match[1]);
-      if (!Number.isFinite(amount)) return null;
-      const unit = match[2].trim().toLowerCase().replace(/\s+/g, "");
-      const factor = unitFactor[unit] ?? 1;
-      return amount * factor;
-    }
-    if (typeof value === "object") {
-      const record = value as Record<string, unknown>;
-      const rawAmount = record.value;
-      const amount =
-        typeof rawAmount === "number"
-          ? rawAmount
-          : typeof rawAmount === "string"
-            ? Number.parseFloat(rawAmount)
-            : Number.NaN;
-      if (!Number.isFinite(amount)) return null;
-      const rawUnit = typeof record.unit === "string" ? record.unit.trim().toLowerCase().replace(/\s+/g, "") : "";
-      const factor = unitFactor[rawUnit] ?? 1;
-      return amount * factor;
-    }
-    return null;
-  }
 
   /** JSON string or hashrate-shaped object → H/s (same rules as `parseHashRateToHs`). */
   function parseJsonOrValueAsHashrateHs(raw: unknown): number | null {
@@ -1270,12 +1112,7 @@
     return name ?? null;
   }
 
-  function formatHashRateValue(value: unknown) {
-    if (value === undefined || value === null) return "\u2014";
-    const scaled = getNormalizedHashRateDisplay(value);
-    if (!scaled) return formatGridValue(value);
-    return `${scaled.amount.toFixed(2)} ${scaled.unit}`;
-  }
+
 
   /** Split `snake_case` or `camelCase` column keys into lowercase word parts. */
   function splitColumnKeyToParts(key: string): string[] {
@@ -2722,23 +2559,7 @@
       },
       getRowId: (params) => params.data.id,
       // RowSelectionModule (registered above) is required for these checkboxes to appear.
-      rowSelection: {
-        mode: "multiRow",
-        checkboxes: true,
-        headerCheckbox: true,
-        enableClickSelection: true,
-        enableSelectionWithoutKeys: false,
-      },
-      selectionColumnDef: {
-        pinned: "left",
-        lockPinned: true,
-        width: 48,
-        maxWidth: 52,
-        minWidth: 44,
-        resizable: false,
-        suppressHeaderMenuButton: true,
-        headerName: "",
-      },
+      ...RESULTS_GRID_SELECTION_OPTIONS,
       onSelectionChanged: (e) => {
         selectedIps = e.api
           .getSelectedRows()
@@ -3177,7 +2998,7 @@
     <div class="relative min-h-0 w-full flex-1">
       <div
         bind:this={gridHost}
-        class="ag-theme-quartz-dark h-full w-full min-h-0 text-xs"
+        class={RESULTS_GRID_HOST_CLASS}
       ></div>
     </div>
   </div>
