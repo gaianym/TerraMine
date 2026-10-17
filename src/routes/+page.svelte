@@ -3,6 +3,7 @@
     ClientSideRowModelModule,
     ColumnApiModule,
     ModuleRegistry,
+    RowSelectionModule,
     createGrid,
     type ColDef,
     type ColumnState,
@@ -22,10 +23,21 @@
   import ActionDialog from "$lib/control/ActionDialog.svelte";
   import {
     ACTION_LABEL,
-    statusTone,
     unsupportedReason,
     type MinerAction,
   } from "$lib/control/types";
+  import { ipsNeedingRefresh, missingAgGridModules } from "$lib/control/statusLabel";
+  import { statusChipSpec } from "$lib/control/statusChip";
+  import { refreshUntilSettled, type RefreshTarget } from "$lib/control/postActionRefresh";
+  import { formatEfficiency, formatGridValue } from "$lib/format";
+  import { formatHashRateDelta, formatMetricDelta } from "$lib/deltaFormat";
+  import { formatHashRateValue, getNormalizedHashRateDisplay, parseHashRateToHs } from "$lib/hashrate";
+  import {
+    RESULTS_GRID_HOST_CLASS,
+    RESULTS_GRID_MODULES,
+    RESULTS_GRID_SELECTION_OPTIONS,
+  } from "$lib/grid/gridSelectionOptions";
+  import { applyTargetsShortcut } from "$lib/control/targetsKeys";
   import {
     defaultDiscoverySettings,
     type DiscoveryProgress,
@@ -282,13 +294,26 @@
     const saved = loadGridColumnState();
     if (!saved?.length) return;
     const known = new Set(
-      defs.map((d) => d.field).filter((f): f is string => typeof f === "string" && f.length > 0),
+      defs.flatMap((d) => {
+        const ids: string[] = [];
+        if (typeof d.field === "string" && d.field.length) ids.push(d.field);
+        if (typeof d.colId === "string" && d.colId.length) ids.push(d.colId);
+        return ids;
+      }),
     );
-    const filtered = saved.filter((c) => known.has(c.colId));
-    if (!filtered.length) return;
+    // Always keep the AG Grid selection checkbox column visible and first.
+    const SELECTION_COL = "ag-Grid-SelectionColumn";
+    known.add(SELECTION_COL);
+    const filtered = saved.filter((c) => typeof c.colId === "string" && known.has(c.colId));
+    const withoutSel = filtered.filter((c) => c.colId !== SELECTION_COL);
+    const state = [
+      { colId: SELECTION_COL, pinned: "left" as const, hide: false, width: 48 },
+      ...withoutSel,
+    ];
+    if (state.length <= 1 && !withoutSel.length) return;
     api.setGridOption("suppressColumnMoveAnimation", true);
     try {
-      api.applyColumnState({ state: filtered, applyOrder: true });
+      api.applyColumnState({ state, applyOrder: true });
     } finally {
       api.setGridOption("suppressColumnMoveAnimation", false);
     }
@@ -309,188 +334,18 @@
     }
   });
 
-  ModuleRegistry.registerModules([ClientSideRowModelModule, ColumnApiModule]);
-
-  const HASH_RATE_UNIT_TIERS = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"] as const;
-
-  const HASH_RATE_UNIT_MAP: Record<string, string> = {
-    hash: "H/s",
-    h: "H/s",
-    hs: "H/s",
-    "h/s": "H/s",
-    kilohash: "KH/s",
-    khash: "KH/s",
-    kh: "KH/s",
-    khs: "KH/s",
-    "kh/s": "KH/s",
-    megahash: "MH/s",
-    mhash: "MH/s",
-    mh: "MH/s",
-    mhs: "MH/s",
-    "mh/s": "MH/s",
-    gigahash: "GH/s",
-    ghash: "GH/s",
-    gh: "GH/s",
-    ghs: "GH/s",
-    "gh/s": "GH/s",
-    terahash: "TH/s",
-    thash: "TH/s",
-    th: "TH/s",
-    ths: "TH/s",
-    "th/s": "TH/s",
-    petahash: "PH/s",
-    phash: "PH/s",
-    ph: "PH/s",
-    phs: "PH/s",
-    "ph/s": "PH/s",
-    exahash: "EH/s",
-    ehash: "EH/s",
-    eh: "EH/s",
-    ehs: "EH/s",
-    "eh/s": "EH/s",
-    zettahash: "ZH/s",
-    zhash: "ZH/s",
-    zh: "ZH/s",
-    zhs: "ZH/s",
-    "zh/s": "ZH/s",
-  };
-
-  /** Same tier logic as displayed hashrate cells; used for primary value and delta-in-that-unit. */
-  function scaleHashRateToDisplayTier(amount: number, unit: string) {
-    const unitTiers = HASH_RATE_UNIT_TIERS;
-    let idx = unitTiers.indexOf(unit as (typeof unitTiers)[number]);
-    if (idx < 0) return { amount, unit };
-    if (amount <= 0) {
-      return { amount: 0, unit: "H/s" as const };
-    }
-    while (amount >= 1000 && idx < unitTiers.length - 1) {
-      amount /= 1000;
-      idx += 1;
-    }
-    while (amount < 1 && idx > 0) {
-      amount *= 1000;
-      idx -= 1;
-    }
-    return { amount, unit: unitTiers[idx] };
+  ModuleRegistry.registerModules(RESULTS_GRID_MODULES);
+  // Permanent guard: missing RowSelectionModule silently disables checkboxes (demo bug).
+  {
+    const missing = missingAgGridModules([
+      "ClientSideRowModelModule",
+      "ColumnApiModule",
+      "RowSelectionModule",
+    ]);
+    if (missing.length) console.error("AG Grid modules missing:", missing);
   }
 
-  /** Parsed display tier for a cell value (matches `formatHashRateValue`). */
-  function getNormalizedHashRateDisplay(value: unknown): { amount: number; unit: string } | null {
-    if (value === undefined || value === null) return null;
-    if (typeof value === "object") {
-      const record = value as Record<string, unknown>;
-      const rawAmount = record.value;
-      const rawUnit = record.unit;
-      const amount =
-        typeof rawAmount === "number"
-          ? rawAmount
-          : typeof rawAmount === "string"
-            ? Number.parseFloat(rawAmount)
-            : Number.NaN;
-      if (!Number.isFinite(amount)) return null;
-      const unitKey =
-        typeof rawUnit === "string" ? rawUnit.trim().toLowerCase().replace(/\s+/g, "") : "";
-      const unit = HASH_RATE_UNIT_MAP[unitKey] ?? (typeof rawUnit === "string" ? rawUnit.trim() : "");
-      if (!unit) return scaleHashRateToDisplayTier(Math.max(0, amount), "H/s");
-      return scaleHashRateToDisplayTier(amount, unit);
-    }
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return scaleHashRateToDisplayTier(value, "H/s");
-    }
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      const match = trimmed.match(/^(-?\d+(?:\.\d+)?)(.*)$/);
-      if (!match) return null;
-      const amount = Number.parseFloat(match[1]);
-      if (!Number.isFinite(amount)) return null;
-      const rawUnit = match[2].trim();
-      const unitKey = rawUnit.toLowerCase().replace(/\s+/g, "");
-      const unit = HASH_RATE_UNIT_MAP[unitKey] ?? rawUnit;
-      return scaleHashRateToDisplayTier(amount, unit);
-    }
-    return null;
-  }
 
-  /** Delta is in H/s; scale to same magnitude as the reference cell (no unit label in the indicator). */
-  function formatHashRateDeltaHs(absDeltaHs: number, referenceValue: unknown): string {
-    if (!Number.isFinite(absDeltaHs)) return "\u2014";
-    const refDisplay = getNormalizedHashRateDisplay(referenceValue);
-    if (!refDisplay) {
-      const scaled = scaleHashRateToDisplayTier(absDeltaHs, "H/s");
-      return scaled.amount.toFixed(2);
-    }
-    const idx = HASH_RATE_UNIT_TIERS.indexOf(refDisplay.unit as (typeof HASH_RATE_UNIT_TIERS)[number]);
-    if (idx < 0) {
-      const scaled = scaleHashRateToDisplayTier(absDeltaHs, "H/s");
-      return scaled.amount.toFixed(2);
-    }
-    const factor = 1000 ** idx;
-    return (absDeltaHs / factor).toFixed(2);
-  }
-
-  function parseHashRateToHs(value: unknown): number | null {
-    if (value === undefined || value === null) return null;
-    const unitFactor: Record<string, number> = {
-      "h/s": 1,
-      hs: 1,
-      h: 1,
-      hash: 1,
-      khs: 1e3,
-      "kh/s": 1e3,
-      kh: 1e3,
-      kilohash: 1e3,
-      mhs: 1e6,
-      "mh/s": 1e6,
-      mh: 1e6,
-      megahash: 1e6,
-      ghs: 1e9,
-      "gh/s": 1e9,
-      gh: 1e9,
-      gigahash: 1e9,
-      ths: 1e12,
-      "th/s": 1e12,
-      th: 1e12,
-      terahash: 1e12,
-      phs: 1e15,
-      "ph/s": 1e15,
-      ph: 1e15,
-      petahash: 1e15,
-      ehs: 1e18,
-      "eh/s": 1e18,
-      eh: 1e18,
-      exahash: 1e18,
-      zhs: 1e21,
-      "zh/s": 1e21,
-      zh: 1e21,
-      zettahash: 1e21,
-    };
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      const match = trimmed.match(/^(-?\d+(?:\.\d+)?)(.*)$/);
-      if (!match) return null;
-      const amount = Number.parseFloat(match[1]);
-      if (!Number.isFinite(amount)) return null;
-      const unit = match[2].trim().toLowerCase().replace(/\s+/g, "");
-      const factor = unitFactor[unit] ?? 1;
-      return amount * factor;
-    }
-    if (typeof value === "object") {
-      const record = value as Record<string, unknown>;
-      const rawAmount = record.value;
-      const amount =
-        typeof rawAmount === "number"
-          ? rawAmount
-          : typeof rawAmount === "string"
-            ? Number.parseFloat(rawAmount)
-            : Number.NaN;
-      if (!Number.isFinite(amount)) return null;
-      const rawUnit = typeof record.unit === "string" ? record.unit.trim().toLowerCase().replace(/\s+/g, "") : "";
-      const factor = unitFactor[rawUnit] ?? 1;
-      return amount * factor;
-    }
-    return null;
-  }
 
   /** JSON string or hashrate-shaped object → H/s (same rules as `parseHashRateToHs`). */
   function parseJsonOrValueAsHashrateHs(raw: unknown): number | null {
@@ -728,16 +583,7 @@
       }
       return formatGridValue(value);
     }
-    if (col === "efficiency") {
-      if (value === undefined || value === null) return "null";
-      if (typeof value === "number" && Number.isFinite(value)) return `${value.toFixed(2)} J/TH`;
-      if (typeof value === "string") {
-        const parsed = Number.parseFloat(value.trim());
-        if (!Number.isFinite(parsed)) return "null";
-        return `${parsed.toFixed(2)} J/TH`;
-      }
-      return "null";
-    }
+    if (col === "efficiency") return formatEfficiency(value);
     if (col === "wattage") {
       if (value === undefined || value === null) return "\u2014";
       if (typeof value === "number" && Number.isFinite(value)) return `${value.toFixed(2)} W`;
@@ -792,10 +638,15 @@
     return formatGridValue(value);
   }
 
-  function formatDelta(col: string, absDelta: number): string {
-    if (col === "average_temperature") return String(Math.round(absDelta));
-    if (col === "efficiency") return absDelta.toFixed(2);
-    if (col === "wattage") return absDelta.toFixed(2);
+  /** Up/down ticker text for a movement column, always in that metric's unit. */
+  function formatDelta(col: string, absDelta: number, currentValue: unknown): string {
+    if (col === "hashrate") {
+      const ref = getNormalizedHashRateDisplay(currentValue);
+      return formatHashRateDelta(absDelta, ref && ref.amount > 0 ? ref.unit : null);
+    }
+    if (col === "average_temperature" || col === "wattage" || col === "efficiency" || col === "fans") {
+      return formatMetricDelta(col, absDelta);
+    }
     return absDelta.toFixed(2);
   }
 
@@ -1076,11 +927,6 @@
     return row.pools ?? row.Pools ?? row.pool ?? row.Pool;
   }
 
-  function formatGridValue(value: unknown) {
-    if (value === undefined) return "\u2014";
-    if (typeof value === "string") return value;
-    return JSON.stringify(value);
-  }
 
   /** Miner `timestamp` (Unix time). Values above 1e12 are treated as milliseconds. */
   function parseUnixTimestampSeconds(raw: unknown): number | null {
@@ -1266,12 +1112,7 @@
     return name ?? null;
   }
 
-  function formatHashRateValue(value: unknown) {
-    if (value === undefined || value === null) return "\u2014";
-    const scaled = getNormalizedHashRateDisplay(value);
-    if (!scaled) return formatGridValue(value);
-    return `${scaled.amount.toFixed(2)} ${scaled.unit}`;
-  }
+
 
   /** Split `snake_case` or `camelCase` column keys into lowercase word parts. */
   function splitColumnKeyToParts(key: string): string[] {
@@ -1741,7 +1582,7 @@
         nextRows.delete(key);
         discoveryWorkbench.rows = nextRows;
         const nextMovement = new Map(discoveryWorkbench.movementByCell);
-        for (const col of [...MOVEMENT_COLUMNS, ...POOLS_MOVEMENT_IDS]) {
+        for (const col of [...MOVEMENT_COLUMNS, ...POOLS_MOVEMENT_IDS, "fans"]) {
           nextMovement.delete(movementKey(key, col));
         }
         discoveryWorkbench.movementByCell = nextMovement;
@@ -1779,11 +1620,23 @@
         }
         nextMovement.set(keyForCell, {
           direction: delta > 0 ? "up" : "down",
-          deltaText:
-            col === "hashrate"
-              ? formatHashRateDeltaHs(Math.abs(delta), currentRow[col])
-              : formatDelta(col, Math.abs(delta)),
+          deltaText: formatDelta(col, Math.abs(delta), currentRow[col]),
         });
+      }
+      {
+        // Fans: average rpm ticker.
+        const keyForCell = movementKey(key, "fans");
+        const prevFan = fanSortMetricFromRow(previousRow as GridRow);
+        const nextFan = fanSortMetricFromRow(currentRow as GridRow);
+        const d = prevFan !== undefined && nextFan !== undefined ? nextFan - prevFan : Number.NaN;
+        if (!Number.isFinite(d) || Math.abs(d) < 1) {
+          nextMovement.delete(keyForCell);
+        } else {
+          nextMovement.set(keyForCell, {
+            direction: d > 0 ? "up" : "down",
+            deltaText: formatDelta("fans", Math.abs(d), undefined),
+          });
+        }
       }
       const prevPools = parsePoolsShareTotals(poolsRawFromRow(previousRow));
       const nextPools = parsePoolsShareTotals(poolsRawFromRow(currentRow));
@@ -1802,7 +1655,7 @@
         }
         nextMovement.set(keyForCell, {
           direction: "up",
-          deltaText: String(Math.round(delta)),
+          deltaText: formatMetricDelta(movId, delta),
         });
       }
       discoveryWorkbench.movementByCell = nextMovement;
@@ -1873,6 +1726,43 @@
       await invoke<string>("start_discovery_run", {
         runId: id,
         targets: targets.trim(),
+        settings,
+      });
+      runId = id;
+    } catch (e) {
+      busy = false;
+      activeRunKind = null;
+      errorMsg = String(e);
+    }
+  }
+
+  /** Re-poll a subset of IPs (e.g. after reboot verify) and merge into the grid. */
+  async function enrichSpecificIps(ips: string[]) {
+    const unique = [...new Set(ips.filter(Boolean))];
+    if (!unique.length || busy) return;
+    // Make sure each IP is in knownDevices so the enrich pipeline keeps it.
+    const now = Date.now();
+    const have = new Set(knownDevices.map((d) => d.ip));
+    const missing = unique.filter((ip) => !have.has(ip));
+    if (missing.length) {
+      knownDevices = [
+        ...knownDevices,
+        ...missing.map((ip) => ({ ip, lastSeenAt: now })),
+      ];
+    }
+    errorMsg = null;
+    workbenchPendingRows.clear();
+    busy = true;
+    activeRunKind = "enrich";
+    const id =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    try {
+      await wireEvents(id);
+      await invoke<string>("enrich_known_devices_run", {
+        runId: id,
+        devices: unique,
         settings,
       });
       runId = id;
@@ -2235,6 +2125,14 @@
               wrap.appendChild(slot);
             }
             wrap.removeAttribute("title");
+            const rowId = params.data?.id;
+            const movement = rowId ? discoveryWorkbench.movementByCell.get(movementKey(rowId, "fans")) : undefined;
+            if (movement) {
+              const indicator = document.createElement("span");
+              indicator.className = `tm-move-indicator ${movement.direction === "up" ? "tm-move-temp-up" : "tm-move-temp-down"}`;
+              indicator.textContent = `${movement.direction === "up" ? "\u2191 +" : "\u2193 -"}${movement.deltaText}`;
+              wrap.appendChild(indicator);
+            }
             return wrap;
           },
         };
@@ -2463,14 +2361,6 @@
     actionDialog = { ips, action };
   }
 
-  const CHIP_TONE: Record<string, string> = {
-    ok: "tm-chip-ok",
-    warn: "tm-chip-warn",
-    bad: "tm-chip-bad",
-    busy: "tm-chip-busy",
-    muted: "tm-chip-muted",
-  };
-
   const controlColumnDef: ColDef<GridRow> = {
     colId: CONTROL_COL_ID,
     headerName: "Control",
@@ -2499,10 +2389,12 @@
       }
       const row = control.rowByIp[ip];
       if (row) {
+        const spec = statusChipSpec(row, control.refreshByIp[ip]);
         const chip = document.createElement("span");
-        chip.className = `tm-chip ${CHIP_TONE[statusTone(row.status)]}`;
-        chip.textContent = `${row.action}: ${row.status}`;
-        chip.title = row.msg ?? "";
+        chip.className = spec.className;
+        chip.dataset.tone = spec.tone;
+        chip.textContent = spec.text;
+        chip.title = spec.title;
         wrap.appendChild(chip);
       }
       return wrap;
@@ -2516,6 +2408,53 @@
 
   $effect(() => {
     if (selectedIps.length) void control.refreshCaps(selectedIps);
+  });
+
+  /** Resolve once `busy` is false (or after maxMs). */
+  async function waitUntilIdle(maxMs: number) {
+    const start = Date.now();
+    while (busy && Date.now() - start < maxMs) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
+  /** Re-poll IPs and resolve after the enrich run has merged its rows. */
+  async function enrichAndWait(ips: string[]) {
+    await waitUntilIdle(60_000);
+    await enrichSpecificIps(ips);
+    await waitUntilIdle(60_000);
+  }
+
+  function rowSnapshot(ip: string) {
+    const row = (untrack(() => gridRowData) as GridRow[]).find((r) => rowIp(r) === ip);
+    if (!row) return undefined;
+    const reachable = row.status === "Enriched" || row.status === "Partial" || row.status === "Alive";
+    return { reachable, hashrateHs: parseHashRateToHs(row.hashrate) };
+  }
+
+  /**
+   * After a control run finishes, keep re-polling those miners until each is
+   * verified back (hashing for reboot/start, answering for stop) or the
+   * timeout passes, so the row never stays stale at 0 H/s after a reboot.
+   */
+  let lastEnrichedDoneId: string | null = null;
+  $effect(() => {
+    const done = control.lastDone;
+    if (!done || done.run_id === lastEnrichedDoneId) return;
+    lastEnrichedDoneId = done.run_id;
+    const ips = new Set(ipsNeedingRefresh(done.results));
+    const targets: RefreshTarget[] = done.results
+      .filter((r) => ips.has(r.ip))
+      .map((r) => ({ ip: r.ip, action: r.action }));
+    if (!targets.length) return;
+    void refreshUntilSettled(targets, {
+      enrich: enrichAndWait,
+      snapshot: rowSnapshot,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      now: () => Date.now(),
+      onState: (ip, st) => control.setRefresh(ip, st),
+      isCancelled: () => control.lastDone?.run_id !== done.run_id,
+    });
   });
 
   const defaultColDef: ColDef<GridRow> = {
@@ -2619,7 +2558,8 @@
         noRowsToShow: "No responding IPs yet",
       },
       getRowId: (params) => params.data.id,
-      rowSelection: { mode: "multiRow", checkboxes: true, headerCheckbox: true, enableClickSelection: false },
+      // RowSelectionModule (registered above) is required for these checkboxes to appear.
+      ...RESULTS_GRID_SELECTION_OPTIONS,
       onSelectionChanged: (e) => {
         selectedIps = e.api
           .getSelectedRows()
@@ -2884,6 +2824,12 @@
           rows="1"
           bind:value={targets}
           placeholder="192.168.1.0/24 or 10.0.0.1, 10.0.0.5-10"
+          onkeydown={(e) => {
+            applyTargetsShortcut(e, () => {
+              const el = e.currentTarget;
+              if (el instanceof HTMLTextAreaElement) el.select();
+            });
+          }}
         ></textarea>
       </div>
       <div class="flex flex-wrap items-end gap-2">
@@ -3052,7 +2998,7 @@
     <div class="relative min-h-0 w-full flex-1">
       <div
         bind:this={gridHost}
-        class="ag-theme-quartz-dark h-full w-full min-h-0 text-xs"
+        class={RESULTS_GRID_HOST_CLASS}
       ></div>
     </div>
   </div>

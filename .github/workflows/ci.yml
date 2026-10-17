@@ -40,6 +40,9 @@ jobs:
 
       - run: npm ci
 
+      - name: Frontend unit tests
+        run: npm test
+
       - name: Frontend check
         run: npm run check
 

@@ -58,6 +58,85 @@ body {
   --ag-scrollbar-size: 8px;
 }
 
+/*
+ * Selected-row background. createGrid() uses the Theming API, which wraps the
+ * grid in a div with classes like "ag-theme-params-1". Legacy ag-grid.css sets
+ * [class*=ag-theme-] { --ag-selected-row-background-color: #bbb } and that
+ * matches the wrapper, so the token above never reaches the rows and selected
+ * rows render opaque light grey. Re-declare it below the wrapper with a dark
+ * tint. Contrast is checked in a real browser by gridSelectedRow.browser.test.ts.
+ */
+.ag-theme-quartz-dark .ag-root-wrapper {
+  /* Opaque neutral grey: lightest grey that keeps every in-row text colour
+     >= 4.5:1 and the accent up-ticker no worse than before (see browser test). */
+  --ag-selected-row-background-color: #1c1c1c;
+}
+
+/*
+ * Selection checkboxes. The Theming API's checkbox colours are shadowed by the
+ * same legacy [class*=ag-theme-] defaults, so checked boxes rendered as hollow
+ * outlines. Draw them explicitly: unchecked = dark box with grey border,
+ * checked = light fill with a dark tick, indeterminate = light fill with a bar.
+ */
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper {
+  position: relative;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 1.5px solid #a1a1aa;
+  border-radius: 3px;
+  background-color: #09090b;
+  box-shadow: none;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper::before {
+  content: none;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper::after {
+  content: none;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper.ag-checked,
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper.ag-indeterminate {
+  border-color: #e4e4e7;
+  background-color: #e4e4e7;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper.ag-checked::after {
+  content: "";
+  position: absolute;
+  left: 3.5px;
+  top: 0.5px;
+  width: 4px;
+  height: 8px;
+  border: solid #09090b;
+  border-width: 0 2px 2px 0;
+  background: transparent;
+  transform: rotate(45deg);
+  opacity: 1;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper.ag-indeterminate::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 4.25px;
+  width: 7px;
+  height: 2px;
+  border: 0;
+  background: #09090b;
+  transform: none;
+  opacity: 1;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
 .ag-theme-quartz-dark,
 .ag-theme-quartz-dark .ag-root-wrapper,
 .ag-theme-quartz-dark .ag-root,
@@ -305,3 +384,4 @@ body {
 .tm-chip-bad { color: rgb(252 165 165); border-color: rgb(153 27 27); }
 .tm-chip-busy { color: rgb(125 211 252); border-color: rgb(7 89 133); }
 .tm-chip-muted { color: rgb(161 161 170); border-color: rgb(63 63 70); }
+.tm-chip-dry { color: rgb(196 181 253); border-color: rgb(109 40 217); border-style: dashed; }
