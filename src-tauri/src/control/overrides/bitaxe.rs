@@ -15,6 +15,7 @@ use semver::Version;
 use serde_json::Value;
 
 use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus};
+use crate::control::safety::DeviceProfile;
 
 /// Minimum AxeOS version that exposes pause/resume endpoints.
 pub const PAUSE_RESUME_MIN: Version = Version::new(2, 14, 0);
@@ -29,6 +30,8 @@ pub struct BitaxeDriver {
     /// True when a probe of `/api/system/pause` returned success even if
     /// the version string was missing or below the floor.
     pause_probe_ok: bool,
+    /// `ASICModel` from system info (limits are keyed on the chip).
+    asic_model: Option<String>,
 }
 
 impl BitaxeDriver {
@@ -45,7 +48,13 @@ impl BitaxeDriver {
             client,
             version,
             pause_probe_ok,
+            asic_model: None,
         }
+    }
+
+    pub fn with_asic_model(mut self, chip: Option<String>) -> Self {
+        self.asic_model = chip;
+        self
     }
 
     /// Probe `GET {base}/api/system/info` and optionally pause support.
@@ -75,7 +84,8 @@ impl BitaxeDriver {
         // Soft probe: `miningPaused` in /info is only present once pause
         // support shipped; avoids POSTing pause against a live miner.
         let pause_probe_ok = body.get("miningPaused").is_some();
-        Ok(Some(Self::from_parts(ip, base, client, version, pause_probe_ok)))
+        let chip = body.get("ASICModel").and_then(|v| v.as_str()).map(str::to_string);
+        Ok(Some(Self::from_parts(ip, base, client, version, pause_probe_ok).with_asic_model(chip)))
     }
 
     fn pause_resume_supported(&self) -> bool {
@@ -127,6 +137,14 @@ impl MinerDriver for BitaxeDriver {
             Ok(parse_axeos_status(&body))
         })
     }
+
+    fn profile(&self) -> DeviceProfile {
+        let fw = match &self.version {
+            Some(v) => format!("AxeOS {v}"),
+            None => "AxeOS".to_string(),
+        };
+        DeviceProfile::classify("Bitaxe", "Bitaxe", &fw, self.asic_model.as_deref())
+    }
 }
 
 /// Uptime and pause state from AxeOS `/api/system/info`.
@@ -137,7 +155,7 @@ pub fn parse_axeos_status(body: &Value) -> MinerStatus {
     }
 }
 
-fn looks_like_axeos(body: &Value) -> bool {
+pub fn looks_like_axeos(body: &Value) -> bool {
     body.get("ASICModel").is_some()
         || body.get("axeOSVersion").is_some()
         || (body.get("version").is_some() && body.get("boardVersion").is_some())

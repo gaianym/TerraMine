@@ -8,6 +8,13 @@
 //!
 //! A reboot takes the miner "offline" (HTTP 503 / closed cgminer socket)
 //! for `reboot_downtime`, then resets uptime to zero.
+//!
+//! AxeOS mocks also hold settings (frequency, core voltage, fan) behind
+//! `PATCH /api/system` and report `temp`. A [`Fault`] simulates a miner
+//! that turns unhealthy whenever its frequency/voltage differ from the
+//! known-good values, which is what the rollback tests exercise. Unlike
+//! real AxeOS, the mock applies settings immediately (no restart).
+//! Every request is logged so tests can prove which endpoints were hit.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -23,6 +30,22 @@ use tokio_util::sync::CancellationToken;
 
 use super::driver::{DriverFactory, MinerDriver};
 use super::overrides::{BitaxeDriver, DigestCredentials, S9StockDriver};
+use super::safety::paths::Target;
+use super::safety::DeviceProfile;
+
+/// How a mock misbehaves once its frequency/voltage leave the known-good values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// Keeps answering but hashes at 0 GH/s.
+    HashrateDrop,
+    /// Keeps hashing but reports 95 °C.
+    Overheat,
+    /// Crashes: offline for the reboot downtime, then back at 0 GH/s.
+    Unreachable,
+}
+
+pub const MOCK_FREQ_MHZ: u32 = 525;
+pub const MOCK_CORE_MV: u32 = 1150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockKind {
@@ -40,6 +63,16 @@ struct State {
     paused: bool,
     reboots: u32,
     downtime: Duration,
+    frequency: u32,
+    core_voltage: u32,
+    fanspeed: u32,
+    autofan: bool,
+    /// Known-good (frequency, core voltage); differing values trigger `fault`.
+    healthy: (u32, u32),
+    fault: Option<Fault>,
+    /// Accept PATCH with 200 but do not apply it (read-back mismatch).
+    ignore_writes: bool,
+    requests: Vec<String>,
 }
 
 impl State {
@@ -62,6 +95,9 @@ impl State {
     fn reboot(&mut self) {
         self.reboots += 1;
         self.offline_until = Some(Instant::now() + self.downtime);
+    }
+    fn degraded(&self) -> Option<Fault> {
+        self.fault.filter(|_| (self.frequency, self.core_voltage) != self.healthy)
     }
 }
 
@@ -90,6 +126,27 @@ impl MockMiner {
     pub fn paused(&self) -> bool {
         self.state.lock().unwrap().paused
     }
+    /// Make the miner unhealthy whenever frequency/voltage leave the
+    /// current (known-good) values.
+    pub fn set_fault(&self, f: Option<Fault>) {
+        self.state.lock().unwrap().fault = f;
+    }
+    pub fn set_ignore_writes(&self, v: bool) {
+        self.state.lock().unwrap().ignore_writes = v;
+    }
+    /// (frequency MHz, core voltage mV).
+    pub fn settings(&self) -> (u32, u32) {
+        let s = self.state.lock().unwrap();
+        (s.frequency, s.core_voltage)
+    }
+    /// Every request seen, e.g. "GET /api/system/info", "cgminer", "unparsed".
+    pub fn requests(&self) -> Vec<String> {
+        self.state.lock().unwrap().requests.clone()
+    }
+    /// Count of setting writes (PATCH) received.
+    pub fn writes(&self) -> usize {
+        self.requests().iter().filter(|r| r.starts_with("PATCH ")).count()
+    }
 
     pub async fn spawn(kind: MockKind, downtime: Duration) -> std::io::Result<Self> {
         let creds = DigestCredentials { username: "root".into(), password: "mock-pass".into() };
@@ -101,6 +158,14 @@ impl MockMiner {
             paused: false,
             reboots: 0,
             downtime,
+            frequency: MOCK_FREQ_MHZ,
+            core_voltage: MOCK_CORE_MV,
+            fanspeed: 60,
+            autofan: true,
+            healthy: (MOCK_FREQ_MHZ, MOCK_CORE_MV),
+            fault: None,
+            ignore_writes: false,
+            requests: Vec::new(),
         }));
         let stop = CancellationToken::new();
         let l = TcpListener::bind("127.0.0.1:0").await?;
@@ -130,6 +195,7 @@ async fn serve_cgminer(l: TcpListener, st: Arc<Mutex<State>>, stop: Cancellation
             let _ = sock.read(&mut buf).await;
             let reply = {
                 let mut s = st.lock().unwrap();
+                s.requests.push("cgminer".into());
                 s.settle();
                 if !s.online() {
                     return; // drop the socket while "rebooting"
@@ -152,7 +218,10 @@ async fn serve_http(l: TcpListener, st: Arc<Mutex<State>>, creds: DigestCredenti
         let st = st.clone();
         let creds = creds.clone();
         tokio::spawn(async move {
-            let Some(req) = read_request(&mut sock).await else { return };
+            let Some(req) = read_request(&mut sock).await else {
+                st.lock().unwrap().requests.push("unparsed".into());
+                return;
+            };
             let resp = handle(&req, &st, &creds);
             let _ = sock.write_all(resp.as_bytes()).await;
         });
@@ -253,12 +322,13 @@ fn digest_ok(req: &Req, c: &DigestCredentials) -> bool {
 
 fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> String {
     let mut s = st.lock().unwrap();
+    let m = req.method.as_str();
+    let p = req.path.split('?').next().unwrap_or("");
+    s.requests.push(format!("{m} {p}"));
     s.settle();
     if !s.online() {
         return http("503 Service Unavailable", "", "{}");
     }
-    let m = req.method.as_str();
-    let p = req.path.split('?').next().unwrap_or("");
     match s.kind {
         MockKind::AxeOs210 | MockKind::AxeOs215 => {
             let new = s.kind == MockKind::AxeOs215;
@@ -266,12 +336,43 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                 ("GET", "/api/system/info") => {
                     let ver = if new { "v2.15.3" } else { "v2.10.1" };
                     let paused = if new { format!(r#","miningPaused":{}"#, s.paused) } else { String::new() };
-                    let hr = if s.paused { 0.0 } else { 1180.5 };
+                    let fault = s.degraded();
+                    let dead = matches!(fault, Some(Fault::HashrateDrop | Fault::Unreachable));
+                    let hr = if s.paused || dead { 0.0 } else { 1180.5 };
+                    let temp = if fault == Some(Fault::Overheat) { 95.0 } else { 52.5 };
                     let body = format!(
-                        r#"{{"ASICModel":"BM1370","boardVersion":"601","version":"{ver}","axeOSVersion":"{ver}","uptimeSeconds":{},"hashRate":{hr}{paused}}}"#,
-                        s.uptime()
+                        r#"{{"ASICModel":"BM1370","boardVersion":"601","version":"{ver}","axeOSVersion":"{ver}","uptimeSeconds":{},"hashRate":{hr},"temp":{temp},"frequency":{},"coreVoltage":{},"fanspeed":{},"autofanspeed":{}{paused}}}"#,
+                        s.uptime(),
+                        s.frequency,
+                        s.core_voltage,
+                        s.fanspeed,
+                        u8::from(s.autofan)
                     );
                     http("200 OK", "", &body)
+                }
+                ("PATCH", "/api/system") => {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(&req.body) else {
+                        return http("400 Bad Request", "", "{}");
+                    };
+                    if !s.ignore_writes {
+                        let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as u32);
+                        if let Some(f) = num("frequency") {
+                            s.frequency = f;
+                        }
+                        if let Some(c) = num("coreVoltage") {
+                            s.core_voltage = c;
+                        }
+                        if let Some(f) = num("fanspeed") {
+                            s.fanspeed = f;
+                        }
+                        if let Some(a) = num("autofanspeed") {
+                            s.autofan = a != 0;
+                        }
+                        if s.degraded() == Some(Fault::Unreachable) {
+                            s.offline_until = Some(Instant::now() + s.downtime);
+                        }
+                    }
+                    http("200 OK", "", "{}")
                 }
                 ("POST", "/api/system/restart") => {
                     s.reboot();
@@ -334,6 +435,25 @@ impl MockMinerFactory {
     }
     pub fn add(&mut self, ip: IpAddr, m: &MockMiner) {
         self.miners.insert(ip, (m.kind, m.base(), m.cgminer, m.creds.clone()));
+    }
+}
+
+impl MockMinerFactory {
+    /// Safety-layer target for a mock: identity mirrors what the real
+    /// drivers report for that firmware.
+    pub fn target(&self, ip: IpAddr) -> Option<Target> {
+        let (kind, base, cg, _) = self.miners.get(&ip)?;
+        let profile = match kind {
+            MockKind::AxeOs210 => DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS 2.10.1", Some("BM1370")),
+            MockKind::AxeOs215 => DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS 2.15.3", Some("BM1370")),
+            MockKind::S9Stock { .. } => DeviceProfile::classify("AntMiner", "Antminer S9", "Stock", None),
+        };
+        let mut t = Target::for_ip(ip, profile);
+        t.http_base = base.clone();
+        if let Some(a) = cg {
+            t.cgminer_addr = a.to_string();
+        }
+        Some(t)
     }
 }
 

@@ -17,6 +17,7 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 
 use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus};
+use crate::control::safety::DeviceProfile;
 use crate::control::overrides::auth::DigestCredentials;
 
 #[derive(Debug, Clone)]
@@ -160,6 +161,10 @@ impl S9StockDriver {
 impl MinerDriver for S9StockDriver {
     fn ip(&self) -> IpAddr {
         self.ip
+    }
+
+    fn profile(&self) -> DeviceProfile {
+        DeviceProfile::classify("AntMiner", "Antminer S9", "Stock", None)
     }
 
     fn caps(&self) -> Capabilities {
