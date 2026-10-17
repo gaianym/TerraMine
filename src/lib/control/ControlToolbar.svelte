@@ -1,6 +1,7 @@
 <script lang="ts">
   import { control } from "./controlState.svelte";
   import { ACTION_LABEL, unsupportedReason, type MinerAction } from "./types";
+  import { summarizeRun } from "./runSummary";
 
   let {
     selectedIps,
@@ -46,9 +47,13 @@
     <span class="text-red-400" title={control.error}>Error: {control.error}</span>
   {/if}
   {#if control.lastDone && !control.activeRunId}
-    {@const r = control.lastDone.results}
-    <span class="text-zinc-500">
-      Last run: {r.filter((x) => x.status === "verified" || x.status === "ok").length}/{r.length} ok
+    {@const s = summarizeRun(control.lastDone.results)}
+    <span
+      data-testid="tm-run-summary"
+      data-kind={s.kind}
+      class={s.kind === "dry" ? "rounded border border-dashed border-violet-700 px-1 text-violet-300" : "text-zinc-500"}
+    >
+      {s.text}
     </span>
   {/if}
 </div>

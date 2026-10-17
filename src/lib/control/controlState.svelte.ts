@@ -9,6 +9,7 @@ import {
   type DoneEvent,
   type MinerAction,
 } from "./types";
+import type { RefreshState } from "./postActionRefresh";
 
 /** Shared, reactive state for miner control actions. */
 class ControlState {
@@ -18,6 +19,8 @@ class ControlState {
   lastDone = $state<DoneEvent | null>(null);
   log = $state<ActionRowEvent[]>([]);
   error = $state<string | null>(null);
+  /** Post-action re-poll state per IP (waiting for hashrate / back online / timeout). */
+  refreshByIp = $state<Record<string, RefreshState>>({});
   /** Bumps on every row event so grids can refresh cells. */
   version = $state(0);
   private unlisten: UnlistenFn[] = [];
@@ -27,6 +30,7 @@ class ControlState {
     this.unlisten.push(
       await listen<ActionRowEvent>(EVENT_ROW, (e) => {
         this.rowByIp[e.payload.ip] = e.payload;
+        delete this.refreshByIp[e.payload.ip];
         this.log = [...this.log.slice(-499), e.payload];
         this.version++;
       }),
@@ -36,6 +40,11 @@ class ControlState {
         this.version++;
       }),
     );
+  }
+
+  setRefresh(ip: string, state: RefreshState) {
+    this.refreshByIp[ip] = state;
+    this.version++;
   }
 
   detach() {

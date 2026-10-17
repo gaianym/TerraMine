@@ -23,11 +23,14 @@
   import ActionDialog from "$lib/control/ActionDialog.svelte";
   import {
     ACTION_LABEL,
-    statusTone,
     unsupportedReason,
     type MinerAction,
   } from "$lib/control/types";
-  import { formatActionStatusLabel, ipsNeedingRefresh, missingAgGridModules } from "$lib/control/statusLabel";
+  import { ipsNeedingRefresh, missingAgGridModules } from "$lib/control/statusLabel";
+  import { statusChipSpec } from "$lib/control/statusChip";
+  import { refreshUntilSettled, type RefreshTarget } from "$lib/control/postActionRefresh";
+  import { formatEfficiency, formatGridValue } from "$lib/format";
+  import { formatHashRateDelta, formatMetricDelta } from "$lib/deltaFormat";
   import { applyTargetsShortcut } from "$lib/control/targetsKeys";
   import {
     defaultDiscoverySettings,
@@ -436,22 +439,7 @@
     return null;
   }
 
-  /** Delta is in H/s; scale to same magnitude as the reference cell (no unit label in the indicator). */
-  function formatHashRateDeltaHs(absDeltaHs: number, referenceValue: unknown): string {
-    if (!Number.isFinite(absDeltaHs)) return "\u2014";
-    const refDisplay = getNormalizedHashRateDisplay(referenceValue);
-    if (!refDisplay) {
-      const scaled = scaleHashRateToDisplayTier(absDeltaHs, "H/s");
-      return scaled.amount.toFixed(2);
-    }
-    const idx = HASH_RATE_UNIT_TIERS.indexOf(refDisplay.unit as (typeof HASH_RATE_UNIT_TIERS)[number]);
-    if (idx < 0) {
-      const scaled = scaleHashRateToDisplayTier(absDeltaHs, "H/s");
-      return scaled.amount.toFixed(2);
-    }
-    const factor = 1000 ** idx;
-    return (absDeltaHs / factor).toFixed(2);
-  }
+
 
   function parseHashRateToHs(value: unknown): number | null {
     if (value === undefined || value === null) return null;
@@ -753,16 +741,7 @@
       }
       return formatGridValue(value);
     }
-    if (col === "efficiency") {
-      if (value === undefined || value === null) return "null";
-      if (typeof value === "number" && Number.isFinite(value)) return `${value.toFixed(2)} J/TH`;
-      if (typeof value === "string") {
-        const parsed = Number.parseFloat(value.trim());
-        if (!Number.isFinite(parsed)) return "null";
-        return `${parsed.toFixed(2)} J/TH`;
-      }
-      return "null";
-    }
+    if (col === "efficiency") return formatEfficiency(value);
     if (col === "wattage") {
       if (value === undefined || value === null) return "\u2014";
       if (typeof value === "number" && Number.isFinite(value)) return `${value.toFixed(2)} W`;
@@ -817,10 +796,15 @@
     return formatGridValue(value);
   }
 
-  function formatDelta(col: string, absDelta: number): string {
-    if (col === "average_temperature") return String(Math.round(absDelta));
-    if (col === "efficiency") return absDelta.toFixed(2);
-    if (col === "wattage") return absDelta.toFixed(2);
+  /** Up/down ticker text for a movement column, always in that metric's unit. */
+  function formatDelta(col: string, absDelta: number, currentValue: unknown): string {
+    if (col === "hashrate") {
+      const ref = getNormalizedHashRateDisplay(currentValue);
+      return formatHashRateDelta(absDelta, ref && ref.amount > 0 ? ref.unit : null);
+    }
+    if (col === "average_temperature" || col === "wattage" || col === "efficiency" || col === "fans") {
+      return formatMetricDelta(col, absDelta);
+    }
     return absDelta.toFixed(2);
   }
 
@@ -1101,11 +1085,6 @@
     return row.pools ?? row.Pools ?? row.pool ?? row.Pool;
   }
 
-  function formatGridValue(value: unknown) {
-    if (value === undefined) return "\u2014";
-    if (typeof value === "string") return value;
-    return JSON.stringify(value);
-  }
 
   /** Miner `timestamp` (Unix time). Values above 1e12 are treated as milliseconds. */
   function parseUnixTimestampSeconds(raw: unknown): number | null {
@@ -1766,7 +1745,7 @@
         nextRows.delete(key);
         discoveryWorkbench.rows = nextRows;
         const nextMovement = new Map(discoveryWorkbench.movementByCell);
-        for (const col of [...MOVEMENT_COLUMNS, ...POOLS_MOVEMENT_IDS]) {
+        for (const col of [...MOVEMENT_COLUMNS, ...POOLS_MOVEMENT_IDS, "fans"]) {
           nextMovement.delete(movementKey(key, col));
         }
         discoveryWorkbench.movementByCell = nextMovement;
@@ -1804,11 +1783,23 @@
         }
         nextMovement.set(keyForCell, {
           direction: delta > 0 ? "up" : "down",
-          deltaText:
-            col === "hashrate"
-              ? formatHashRateDeltaHs(Math.abs(delta), currentRow[col])
-              : formatDelta(col, Math.abs(delta)),
+          deltaText: formatDelta(col, Math.abs(delta), currentRow[col]),
         });
+      }
+      {
+        // Fans: average rpm ticker.
+        const keyForCell = movementKey(key, "fans");
+        const prevFan = fanSortMetricFromRow(previousRow as GridRow);
+        const nextFan = fanSortMetricFromRow(currentRow as GridRow);
+        const d = prevFan !== undefined && nextFan !== undefined ? nextFan - prevFan : Number.NaN;
+        if (!Number.isFinite(d) || Math.abs(d) < 1) {
+          nextMovement.delete(keyForCell);
+        } else {
+          nextMovement.set(keyForCell, {
+            direction: d > 0 ? "up" : "down",
+            deltaText: formatDelta("fans", Math.abs(d), undefined),
+          });
+        }
       }
       const prevPools = parsePoolsShareTotals(poolsRawFromRow(previousRow));
       const nextPools = parsePoolsShareTotals(poolsRawFromRow(currentRow));
@@ -1827,7 +1818,7 @@
         }
         nextMovement.set(keyForCell, {
           direction: "up",
-          deltaText: String(Math.round(delta)),
+          deltaText: formatMetricDelta(movId, delta),
         });
       }
       discoveryWorkbench.movementByCell = nextMovement;
@@ -2297,6 +2288,14 @@
               wrap.appendChild(slot);
             }
             wrap.removeAttribute("title");
+            const rowId = params.data?.id;
+            const movement = rowId ? discoveryWorkbench.movementByCell.get(movementKey(rowId, "fans")) : undefined;
+            if (movement) {
+              const indicator = document.createElement("span");
+              indicator.className = `tm-move-indicator ${movement.direction === "up" ? "tm-move-temp-up" : "tm-move-temp-down"}`;
+              indicator.textContent = `${movement.direction === "up" ? "\u2191 +" : "\u2193 -"}${movement.deltaText}`;
+              wrap.appendChild(indicator);
+            }
             return wrap;
           },
         };
@@ -2525,14 +2524,6 @@
     actionDialog = { ips, action };
   }
 
-  const CHIP_TONE: Record<string, string> = {
-    ok: "tm-chip-ok",
-    warn: "tm-chip-warn",
-    bad: "tm-chip-bad",
-    busy: "tm-chip-busy",
-    muted: "tm-chip-muted",
-  };
-
   const controlColumnDef: ColDef<GridRow> = {
     colId: CONTROL_COL_ID,
     headerName: "Control",
@@ -2561,10 +2552,12 @@
       }
       const row = control.rowByIp[ip];
       if (row) {
+        const spec = statusChipSpec(row, control.refreshByIp[ip]);
         const chip = document.createElement("span");
-        chip.className = `tm-chip ${CHIP_TONE[statusTone(row.status)]}`;
-        chip.textContent = formatActionStatusLabel(row);
-        chip.title = row.msg ?? "";
+        chip.className = spec.className;
+        chip.dataset.tone = spec.tone;
+        chip.textContent = spec.text;
+        chip.title = spec.title;
         wrap.appendChild(chip);
       }
       return wrap;
@@ -2580,18 +2573,51 @@
     if (selectedIps.length) void control.refreshCaps(selectedIps);
   });
 
-  /** After a control run finishes, re-poll those miners so hashrate/temp/uptime refresh. */
+  /** Resolve once `busy` is false (or after maxMs). */
+  async function waitUntilIdle(maxMs: number) {
+    const start = Date.now();
+    while (busy && Date.now() - start < maxMs) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+
+  /** Re-poll IPs and resolve after the enrich run has merged its rows. */
+  async function enrichAndWait(ips: string[]) {
+    await waitUntilIdle(60_000);
+    await enrichSpecificIps(ips);
+    await waitUntilIdle(60_000);
+  }
+
+  function rowSnapshot(ip: string) {
+    const row = (untrack(() => gridRowData) as GridRow[]).find((r) => rowIp(r) === ip);
+    if (!row) return undefined;
+    const reachable = row.status === "Enriched" || row.status === "Partial" || row.status === "Alive";
+    return { reachable, hashrateHs: parseHashRateToHs(row.hashrate) };
+  }
+
+  /**
+   * After a control run finishes, keep re-polling those miners until each is
+   * verified back (hashing for reboot/start, answering for stop) or the
+   * timeout passes, so the row never stays stale at 0 H/s after a reboot.
+   */
   let lastEnrichedDoneId: string | null = null;
   $effect(() => {
     const done = control.lastDone;
     if (!done || done.run_id === lastEnrichedDoneId) return;
-    const ips = ipsNeedingRefresh(done.results);
-    if (!ips.length) {
-      lastEnrichedDoneId = done.run_id;
-      return;
-    }
     lastEnrichedDoneId = done.run_id;
-    void enrichSpecificIps(ips);
+    const ips = new Set(ipsNeedingRefresh(done.results));
+    const targets: RefreshTarget[] = done.results
+      .filter((r) => ips.has(r.ip))
+      .map((r) => ({ ip: r.ip, action: r.action }));
+    if (!targets.length) return;
+    void refreshUntilSettled(targets, {
+      enrich: enrichAndWait,
+      snapshot: rowSnapshot,
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+      now: () => Date.now(),
+      onState: (ip, st) => control.setRefresh(ip, st),
+      isCancelled: () => control.lastDone?.run_id !== done.run_id,
+    });
   });
 
   const defaultColDef: ColDef<GridRow> = {

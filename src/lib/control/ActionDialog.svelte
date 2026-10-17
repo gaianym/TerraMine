@@ -1,5 +1,6 @@
 <script lang="ts">
   import { control } from "./controlState.svelte";
+  import { defaultActionOptions } from "./actionDefaults";
   import {
     ACTION_LABEL,
     TYPED_CONFIRM_THRESHOLD,
@@ -13,10 +14,12 @@
     onclose,
   }: { ips: string[]; action: MinerAction; onclose: () => void } = $props();
 
-  let dryRun = $state(false);
-  let verify = $state(true);
-  let staggerMs = $state(1000);
-  let concurrency = $state(4);
+  // Safety rule: every dialog (per-row and bulk) opens with Dry run checked.
+  const defaults = defaultActionOptions();
+  let dryRun = $state(defaults.dryRun);
+  let verify = $state(defaults.verify);
+  let staggerMs = $state(defaults.staggerMs);
+  let concurrency = $state(defaults.concurrency);
   let typed = $state("");
 
   $effect(() => {
@@ -62,7 +65,7 @@
       {/each}
     </ul>
     <div class="mb-3 grid grid-cols-2 gap-2 text-xs">
-      <label class="flex items-center gap-2"><input type="checkbox" bind:checked={dryRun} /> Dry run (send nothing)</label>
+      <label class="flex items-center gap-2"><input type="checkbox" data-testid="tm-dry-run" bind:checked={dryRun} /> Dry run (send nothing)</label>
       <label class="flex items-center gap-2"><input type="checkbox" bind:checked={verify} /> Verify after sending</label>
       <label class="flex flex-col gap-1">Stagger (ms)
         <input class="rounded border border-zinc-700 bg-zinc-950 px-2 py-1" type="number" min="0" bind:value={staggerMs} />
