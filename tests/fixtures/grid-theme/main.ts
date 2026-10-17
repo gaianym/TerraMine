@@ -2,7 +2,7 @@
 // ag-theme-quartz.css + app.css) and the app's real selection options, selects
 // every row, and exposes what the browser actually paints for selected rows.
 import "../../../src/app.css";
-import { createGrid, ModuleRegistry } from "ag-grid-community";
+import { ClientSideRowModelApiModule, createGrid, ModuleRegistry, RowApiModule, type GridApi, type IRowNode } from "ag-grid-community";
 import {
   RESULTS_GRID_HOST_CLASS,
   RESULTS_GRID_MODULES,
@@ -10,6 +10,8 @@ import {
 } from "../../../src/lib/grid/gridSelectionOptions";
 
 ModuleRegistry.registerModules(RESULTS_GRID_MODULES);
+// Test-only: row lookup API so the fixture can select specific rows (no styling impact).
+ModuleRegistry.registerModules([RowApiModule, ClientSideRowModelApiModule]);
 
 const host = document.getElementById("g")!;
 host.className = RESULTS_GRID_HOST_CLASS;
@@ -39,9 +41,79 @@ const SAMPLES: Array<[string, string, string]> = [
   ["span", "tm-move-indicator tm-move-temp-down", "↓ -2 °C"],
 ];
 
-const rowData = [0, 1, 2, 3].map((i) => ({ id: String(i), ip: `192.0.2.${10 + i}`, mac: "00:00:5E:00:53:0" + i }));
+const rowData = [0, 1, 2, 3, 4, 5].map((i) => ({ id: String(i), ip: `192.0.2.${10 + i}`, mac: "00:00:5E:00:53:0" + i }));
 
-createGrid(host, {
+type CbInfo = { state: string; bg: string; border: string; afterContent: string; afterBorder: string; afterBg: string; rowBg: string; rowBefore: string };
+
+function cbInfo(wrapper: HTMLElement, row: HTMLElement | null): CbInfo {
+  const s = getComputedStyle(wrapper);
+  const a = getComputedStyle(wrapper, "::after");
+  return {
+    state: wrapper.classList.contains("ag-checked") ? "checked" : wrapper.classList.contains("ag-indeterminate") ? "indeterminate" : "unchecked",
+    bg: s.backgroundColor,
+    border: s.borderTopColor,
+    afterContent: a.content,
+    afterBorder: a.borderRightColor,
+    afterBg: a.backgroundColor,
+    rowBg: row ? getComputedStyle(row).backgroundColor : getComputedStyle(document.querySelector(".ag-header")!).backgroundColor,
+    rowBefore: row ? getComputedStyle(row, "::before").backgroundColor : "rgba(0, 0, 0, 0)",
+  };
+}
+
+function probeRows() {
+  const rows = [...document.querySelectorAll<HTMLElement>(".ag-center-cols-container .ag-row")];
+  return rows.map((row) => {
+    const before = getComputedStyle(row, "::before");
+    const texts = [...row.querySelectorAll<HTMLElement>(".ag-cell, .ag-cell *")]
+      .filter((n) => [...n.childNodes].some((c) => c.nodeType === Node.TEXT_NODE && c.textContent!.trim()))
+      .map((n) => ({ cls: n.className || n.tagName.toLowerCase(), text: n.textContent!.trim(), color: getComputedStyle(n).color }));
+    return {
+      selected: row.classList.contains("ag-row-selected"),
+      rowBg: getComputedStyle(row).backgroundColor,
+      beforeBg: before.backgroundColor,
+      beforeImage: before.backgroundImage,
+      texts,
+    };
+  });
+}
+
+/** Checkbox wrappers: header + one per row (pinned selection column), tagged for screenshots. */
+function probeCheckboxes() {
+  const header = document.querySelector<HTMLElement>(".ag-header .ag-checkbox-input-wrapper")!;
+  header.dataset.tmCb = "header";
+  const out: Record<string, CbInfo> = { header: cbInfo(header, null) };
+  for (const row of document.querySelectorAll<HTMLElement>(".ag-pinned-left-cols-container .ag-row")) {
+    const w = row.querySelector<HTMLElement>(".ag-checkbox-input-wrapper")!;
+    const id = row.getAttribute("row-id")!;
+    w.dataset.tmCb = `row-${id}`;
+    out[`row-${id}`] = cbInfo(w, row);
+  }
+  return out;
+}
+
+type Row = (typeof rowData)[number];
+let api: GridApi<Row>;
+const settle = () => new Promise((r) => setTimeout(r, 250));
+(window as unknown as { __tm: unknown }).__tm = {
+  async selectIds(ids: string[]) {
+    api.deselectAll();
+    const nodes: IRowNode<Row>[] = [];
+    for (let i = 0; i < api.getDisplayedRowCount(); i++) {
+      const n = api.getDisplayedRowAtIndex(i);
+      if (n && ids.includes(String(n.id))) nodes.push(n);
+    }
+    api.setNodesSelected({ nodes, newValue: true });
+    await settle();
+  },
+  async selectAll() {
+    api.selectAll();
+    await settle();
+  },
+  probeRows,
+  probeCheckboxes,
+};
+
+api = createGrid<Row>(host, {
   ...RESULTS_GRID_SELECTION_OPTIONS,
   rowData,
   getRowId: (p) => p.data.id,
@@ -58,26 +130,5 @@ createGrid(host, {
       },
     },
   ],
-  onFirstDataRendered: (e) => {
-    e.api.selectAll();
-    // Let the selection classes paint.
-    setTimeout(() => {
-      const rows = [...document.querySelectorAll<HTMLElement>(".ag-center-cols-container .ag-row")];
-      const result = rows.map((row) => {
-        const before = getComputedStyle(row, "::before");
-        const texts = [...row.querySelectorAll<HTMLElement>(".ag-cell, .ag-cell *")]
-          .filter((n) => [...n.childNodes].some((c) => c.nodeType === Node.TEXT_NODE && c.textContent!.trim()))
-          .map((n) => ({ cls: n.className || n.tagName.toLowerCase(), text: n.textContent!.trim(), color: getComputedStyle(n).color }));
-        return {
-          selected: row.classList.contains("ag-row-selected"),
-          rowBg: getComputedStyle(row).backgroundColor,
-          beforeBg: before.backgroundColor,
-          beforeImage: before.backgroundImage,
-          texts,
-        };
-      });
-      (window as unknown as { __gridTheme: unknown }).__gridTheme = result;
-      document.title = "READY";
-    }, 300);
-  },
+  onFirstDataRendered: () => setTimeout(() => (document.title = "READY"), 200),
 });

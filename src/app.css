@@ -67,7 +67,74 @@ body {
  * tint. Contrast is checked in a real browser by gridSelectedRow.browser.test.ts.
  */
 .ag-theme-quartz-dark .ag-root-wrapper {
-  --ag-selected-row-background-color: #0e2013;
+  /* Opaque neutral grey: lightest grey that keeps every in-row text colour
+     >= 4.5:1 and the accent up-ticker no worse than before (see browser test). */
+  --ag-selected-row-background-color: #1c1c1c;
+}
+
+/*
+ * Selection checkboxes. The Theming API's checkbox colours are shadowed by the
+ * same legacy [class*=ag-theme-] defaults, so checked boxes rendered as hollow
+ * outlines. Draw them explicitly: unchecked = dark box with grey border,
+ * checked = light fill with a dark tick, indeterminate = light fill with a bar.
+ */
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper {
+  position: relative;
+  box-sizing: border-box;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 1.5px solid #a1a1aa;
+  border-radius: 3px;
+  background-color: #09090b;
+  box-shadow: none;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper::before {
+  content: none;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper::after {
+  content: none;
+  -webkit-mask-image: none;
+  mask-image: none;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper.ag-checked,
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper.ag-indeterminate {
+  border-color: #e4e4e7;
+  background-color: #e4e4e7;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper.ag-checked::after {
+  content: "";
+  position: absolute;
+  left: 3.5px;
+  top: 0.5px;
+  width: 4px;
+  height: 8px;
+  border: solid #09090b;
+  border-width: 0 2px 2px 0;
+  background: transparent;
+  transform: rotate(45deg);
+  opacity: 1;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper.ag-indeterminate::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 4.25px;
+  width: 7px;
+  height: 2px;
+  border: 0;
+  background: #09090b;
+  transform: none;
+  opacity: 1;
+}
+.ag-theme-quartz-dark .ag-root-wrapper .ag-checkbox-input-wrapper input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
 }
 
 .ag-theme-quartz-dark,
