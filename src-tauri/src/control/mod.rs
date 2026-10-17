@@ -4,6 +4,7 @@ pub mod creds;
 pub mod driver;
 pub mod job;
 pub mod overrides;
+pub mod safety;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -103,6 +104,19 @@ pub fn job_config(req: &ActionRequest) -> JobConfig {
     }
 }
 
+/// Audit file: `<app data dir>/audit/actions.jsonl`.
+pub const AUDIT_FILE: &str = "audit/actions.jsonl";
+
+fn audit_sink(app: &AppHandle) -> Arc<dyn safety::AuditSink> {
+    match app.path().app_data_dir() {
+        Ok(dir) => Arc::new(safety::JsonlAudit::new(dir.join(AUDIT_FILE))),
+        Err(e) => {
+            eprintln!("audit: no app data dir ({e}); audit disabled for this run");
+            Arc::new(safety::NullAudit)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn miner_capabilities(ips: Vec<String>) -> Result<Vec<CapsRow>, String> {
     let ips = parse_ips(&ips)?;
@@ -131,7 +145,8 @@ pub async fn run_miner_action(app: AppHandle, state: State<'_, ControlState>, re
         let sink: job::Sink = Arc::new(move |e| {
             let _ = app2.emit(EVENT_ROW, e);
         });
-        let results = job::run_action(ips, cfg, factory, cancel, sink).await;
+        let ctx = job::SafetyCtx { run_id: rid.clone(), audit: audit_sink(&app) };
+        let results = job::run_action_guarded(ips, cfg, factory, cancel, sink, ctx).await;
         runs.lock().await.remove(&rid);
         let _ = app.emit(EVENT_DONE, DoneEvent { run_id: rid, results });
     });

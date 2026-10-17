@@ -18,6 +18,7 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use super::overrides::{BitaxeDriver, DigestCredentials, S9StockDriver};
+use super::safety::DeviceProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -53,6 +54,10 @@ pub trait MinerDriver: Send + Sync {
     /// Current state used for post-action verification.
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
         Box::pin(async { anyhow::bail!("status not supported") })
+    }
+    /// Identity for the safety layer (limits, path selection, audit).
+    fn profile(&self) -> DeviceProfile {
+        DeviceProfile::unknown()
     }
 }
 
@@ -108,6 +113,10 @@ impl MinerDriver for AsicRsDriver {
             let d = self.miner.get_data().await;
             Ok(MinerStatus { uptime_s: d.uptime.map(|u| u.as_secs()), paused: Some(!d.is_mining) })
         })
+    }
+    fn profile(&self) -> DeviceProfile {
+        let i = self.miner.get_device_info();
+        DeviceProfile::classify(&i.make, &i.model, &i.firmware, None)
     }
 }
 
