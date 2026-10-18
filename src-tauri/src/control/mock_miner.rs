@@ -21,6 +21,15 @@
 //! frequency/voltage differ from the known-good values, which is what the
 //! rollback tests exercise.
 //! Every request is logged so tests can prove which endpoints were hit.
+//!
+//! Fault light: the S9 mock serves the stock `blink.cgi` /
+//! `get_blink_status.cgi` pair; AxeOS 2.15 serves `POST
+//! /api/system/identify` (a 30 s toggle with no readable state, like
+//! ESP-Miner). [`MockKind::AsicRs`] stands in for asic-rs firmware
+//! backends TerraMine has no hardware for (Antminer stock, Braiins,
+//! Whatsminer): asic-rs hardcodes real ports, so the stand-in driver
+//! carries that backend's `supports_*()` flags and talks to this server on
+//! `/asic-rs/...` paths instead, which keeps every call countable.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -63,6 +72,43 @@ pub enum MockKind {
     AxeOs210,
     AxeOs215,
     S9Stock { miner_mode: bool },
+    /// An asic-rs firmware backend (see [`MockFirmware`]).
+    AsicRs(MockFirmware),
+}
+
+/// asic-rs 0.8.6 backends mirrored by flag (values read from each
+/// backend's `supports_*()` in asic-rs-firmwares-* 0.8.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockFirmware {
+    /// Antminer stock, `antminer/v2020` (S19 class): light yes.
+    AntminerV2020,
+    /// Braiins OS `braiins/v25_07`: light yes.
+    Braiins2507,
+    /// Whatsminer `whatsminer/v3`: light yes.
+    WhatsminerV3,
+    /// Whatsminer `whatsminer/v1`: no light (all setters false).
+    WhatsminerV1,
+}
+
+impl MockFirmware {
+    pub fn flags(self) -> super::driver::NativeFlags {
+        use super::driver::NativeFlags;
+        match self {
+            Self::AntminerV2020 => NativeFlags { resume: true, pause: true, restart: true, fault_light: true },
+            Self::Braiins2507 => NativeFlags { resume: true, pause: true, restart: true, fault_light: true },
+            Self::WhatsminerV3 => NativeFlags { resume: true, pause: true, restart: true, fault_light: true },
+            Self::WhatsminerV1 => NativeFlags::default(),
+        }
+    }
+    /// (make, model, firmware) as asic-rs would report them.
+    pub fn identity(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::AntminerV2020 => ("AntMiner", "Antminer S19", "Stock v2020"),
+            Self::Braiins2507 => ("AntMiner", "Antminer S19", "BraiinsOS 25.07"),
+            Self::WhatsminerV3 => ("WhatsMiner", "M50", "Whatsminer v3"),
+            Self::WhatsminerV1 => ("WhatsMiner", "M20", "Whatsminer v1"),
+        }
+    }
 }
 
 struct State {
@@ -99,6 +145,10 @@ struct State {
     mac: String,
     /// Simulated network/pool outage: reachable but hashing at 0.
     outage: bool,
+    /// Fault light (S9 blink / asic-rs stand-ins).
+    light: bool,
+    /// AxeOS identify ("Hi!") active until.
+    identify_until: Option<Instant>,
 }
 
 impl State {
@@ -210,6 +260,14 @@ impl MockMiner {
     pub fn requests(&self) -> Vec<String> {
         self.state.lock().unwrap().requests.clone()
     }
+    /// Fault light as the mock sees it.
+    pub fn light(&self) -> bool {
+        self.state.lock().unwrap().light
+    }
+    /// AxeOS identify currently showing "Hi!".
+    pub fn identifying(&self) -> bool {
+        self.state.lock().unwrap().identify_until.is_some_and(|t| Instant::now() < t)
+    }
     /// Count of setting writes (PATCH) received.
     pub fn writes(&self) -> usize {
         self.requests().iter().filter(|r| r.starts_with("PATCH ")).count()
@@ -241,6 +299,8 @@ impl MockMiner {
             requests: Vec::new(),
             mac: String::new(),
             outage: false,
+            light: false,
+            identify_until: None,
         }));
         let stop = CancellationToken::new();
         let l = TcpListener::bind("127.0.0.1:0").await?;
@@ -476,6 +536,12 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     s.paused = false;
                     http("200 OK", "", r#"{"message":"Mining resumed"}"#)
                 }
+                // ESP-Miner >= 2.12: toggles a 30 s on-screen "Hi!".
+                ("POST", "/api/system/identify") if new => {
+                    let on = s.identify_until.is_some_and(|t| Instant::now() < t);
+                    s.identify_until = (!on).then(|| Instant::now() + Duration::from_secs(30));
+                    http("200 OK", "", r#"{"message":"The device says \"Hi!\" for 30 seconds."}"#)
+                }
                 _ => http("404 Not Found", "", "{}"),
             }
         }
@@ -501,6 +567,16 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     s.reboot();
                     http("200 OK", "", "{}")
                 }
+                "/cgi-bin/blink.cgi" if m == "POST" => {
+                    let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+                    match v.get("blink").and_then(|b| b.as_str()) {
+                        Some("true") => s.light = true,
+                        Some("false") => s.light = false,
+                        _ => return http("400 Bad Request", "", "{}"),
+                    }
+                    http("200 OK", "", r#"{"code":"B000"}"#)
+                }
+                "/cgi-bin/get_blink_status.cgi" => http("200 OK", "", &format!(r#"{{"blink":{}}}"#, s.light)),
                 "/cgi-bin/set_miner_conf.cgi" if miner_mode && m == "POST" => {
                     // {"miner-mode":"1"} = sleep, "0" = normal.
                     let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -514,6 +590,90 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                 _ => http("404 Not Found", "", "{}"),
             }
         }
+        MockKind::AsicRs(fw) => match (m, p) {
+            ("GET", "/asic-rs/data") => {
+                let hr = if s.paused || s.outage { 0.0 } else { 100_000.0 };
+                http("200 OK", "", &format!(r#"{{"light":{},"paused":{},"uptime":{},"hashrate_ghs":{hr}}}"#, s.light, s.paused, s.uptime()))
+            }
+            ("POST", "/asic-rs/fault_light") if fw.flags().fault_light => {
+                let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+                let Some(on) = v.get("on").and_then(|b| b.as_bool()) else { return http("400 Bad Request", "", "{}") };
+                s.light = on;
+                http("200 OK", "", "{}")
+            }
+            ("POST", "/asic-rs/pause") if fw.flags().pause => {
+                s.paused = true;
+                http("200 OK", "", "{}")
+            }
+            ("POST", "/asic-rs/resume") if fw.flags().resume => {
+                s.paused = false;
+                http("200 OK", "", "{}")
+            }
+            ("POST", "/asic-rs/restart") if fw.flags().restart => {
+                s.reboot();
+                http("200 OK", "", "{}")
+            }
+            _ => http("404 Not Found", "", "{}"),
+        },
+    }
+}
+
+/// Stand-in for an asic-rs firmware backend (see [`MockFirmware`]): same
+/// routing rule as [`super::driver::AsicRsDriver`] (`NativeFlags::caps`),
+/// same verbs, sent to the mock's `/asic-rs/...` paths.
+pub struct MockAsicRs {
+    ip: IpAddr,
+    fw: MockFirmware,
+    base: String,
+    client: reqwest::Client,
+}
+
+impl MockAsicRs {
+    async fn post(&self, path: &str, body: serde_json::Value) -> anyhow::Result<bool> {
+        self.client.post(format!("{}/asic-rs/{path}", self.base)).json(&body).send().await?.error_for_status()?;
+        Ok(true)
+    }
+    async fn data(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(self.client.get(format!("{}/asic-rs/data", self.base)).send().await?.error_for_status()?.json().await?)
+    }
+}
+
+impl MinerDriver for MockAsicRs {
+    fn ip(&self) -> IpAddr {
+        self.ip
+    }
+    fn caps(&self) -> Capabilities {
+        self.fw.flags().caps()
+    }
+    fn execute(&self, action: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move {
+            // asic-rs's own default for an unsupported setter is an error.
+            anyhow::ensure!(self.caps().supports(action), "{} is not supported on this platform", action.name());
+            match action {
+                MinerAction::Start => self.post("resume", serde_json::json!({})).await,
+                MinerAction::Stop => self.post("pause", serde_json::json!({})).await,
+                MinerAction::Reboot => self.post("restart", serde_json::json!({})).await,
+                MinerAction::LightOn => self.post("fault_light", serde_json::json!({"on": true})).await,
+                MinerAction::LightOff => self.post("fault_light", serde_json::json!({"on": false})).await,
+            }
+        })
+    }
+    fn status(&self) -> BoxFuture<'_, anyhow::Result<super::driver::MinerStatus>> {
+        Box::pin(async move {
+            let d = self.data().await?;
+            Ok(super::driver::MinerStatus { uptime_s: d["uptime"].as_u64(), paused: d["paused"].as_bool() })
+        })
+    }
+    fn light_state(&self) -> BoxFuture<'_, anyhow::Result<Option<bool>>> {
+        Box::pin(async move { Ok(self.data().await?["light"].as_bool()) })
+    }
+    fn profile(&self) -> DeviceProfile {
+        let (make, model, fw) = self.fw.identity();
+        DeviceProfile::classify(make, model, fw, None)
+    }
+    fn paths_tried(&self, action: MinerAction) -> Vec<String> {
+        let (make, model, fw) = self.fw.identity();
+        vec![format!("{} on {make} {model} ({fw})", self.fw.flags().explain(action))]
     }
 }
 
@@ -536,12 +696,17 @@ impl MinerDriver for MockNativeBitaxe {
     fn caps(&self) -> Capabilities {
         Capabilities::flags(true, true, false, Route::AsicRs)
     }
+    fn paths_tried(&self, action: MinerAction) -> Vec<String> {
+        let f = super::driver::NativeFlags { resume: true, pause: true, restart: false, fault_light: false };
+        vec![format!("{} on Bitaxe (AxeOS 2.15.3)", f.explain(action))]
+    }
     fn execute(&self, action: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>> {
         Box::pin(async move {
             let path = match action {
                 MinerAction::Stop => "system/pause",
                 MinerAction::Start => "system/resume",
                 MinerAction::Reboot => anyhow::bail!("restart not supported by asic-rs v2_14_0"),
+                MinerAction::LightOn | MinerAction::LightOff => anyhow::bail!("fault light not supported by asic-rs v2_14_0"),
             };
             self.client.post(format!("{}/api/{path}", self.base)).send().await?.error_for_status()?;
             Ok(true)
@@ -582,6 +747,10 @@ impl MockMinerFactory {
             MockKind::AxeOs210 => (DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS 2.10.1", Some("BM1370")), DriverKind::AxeOs, "v2.10.1"),
             MockKind::AxeOs215 => (DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS 2.15.3", Some("BM1370")), DriverKind::AxeOs, "v2.15.3"),
             MockKind::S9Stock { .. } => (DeviceProfile::classify("AntMiner", "Antminer S9", "Stock", None), DriverKind::S9Stock, "Thu May 31 2018"),
+            MockKind::AsicRs(f) => {
+                let (make, model, fw) = f.identity();
+                (DeviceProfile::classify(make, model, fw, None), DriverKind::AsicRs, fw)
+            }
         };
         Some(CachedDevice {
             profile,
@@ -619,6 +788,7 @@ impl DriverFactory for MockMinerFactory {
                         None => d,
                     }) as Box<dyn MinerDriver>
                 }
+                MockKind::AsicRs(fw) => Box::new(MockAsicRs { ip, fw, base, client }) as Box<dyn MinerDriver>,
             }))
         })
     }
@@ -647,6 +817,10 @@ impl DriverFactory for MockMinerFactory {
                         };
                         Box::new(d) as Box<dyn MinerDriver>
                     }),
+                MockKind::AsicRs(fw) => {
+                    let client = reqwest::Client::builder().timeout(self.timeout).no_proxy().build()?;
+                    Some(Box::new(MockAsicRs { ip, fw, base, client }) as Box<dyn MinerDriver>)
+                }
             })
         })
     }

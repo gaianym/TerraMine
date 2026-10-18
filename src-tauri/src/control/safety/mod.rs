@@ -22,6 +22,8 @@ pub mod batch;
 pub mod engine;
 pub mod health;
 pub mod limits;
+#[cfg(any(test, feature = "mock-miner"))]
+pub mod mock_native;
 pub mod policy;
 pub mod profile;
 pub mod settings;
@@ -32,6 +34,8 @@ mod tests;
 mod e2e_tests;
 #[cfg(test)]
 mod axeos_e2e_tests;
+#[cfg(test)]
+mod power_e2e_tests;
 
 pub use audit::{AuditRecord, AuditSink, JsonlAudit, MemoryAudit, NullAudit};
 pub use engine::{SafeWriteRequest, SafetyEngine, SafetyOptions, Target, WriteOutcome, WriteStatus};

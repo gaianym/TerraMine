@@ -47,7 +47,7 @@ fn setup(miners: Vec<(u8, Capabilities, MockBehavior)>, delay_ms: u64) -> (Arc<M
 }
 
 fn cfg(action: MinerAction) -> JobConfig {
-    JobConfig { action, concurrency: 4, stagger: Duration::ZERO, timeout: Duration::from_secs(1), dry_run: false, verify: None }
+    JobConfig { action, concurrency: 4, stagger: Duration::ZERO, timeout: Duration::from_secs(1), dry_run: false, verify: None, allow_unconfirmed: false }
 }
 
 fn collecting_sink() -> (Sink, Arc<Mutex<Vec<ActionRowEvent>>>) {

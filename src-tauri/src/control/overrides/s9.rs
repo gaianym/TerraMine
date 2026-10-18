@@ -7,6 +7,10 @@
 //!   pluggable — see [`DigestCredentials`]).
 //! - Start/stop stay unsupported unless `miner-mode` /
 //!   `bitmain-work-mode` is present on `get_miner_conf.cgi`.
+//! - Fault light: the stock Antminer CGI documented by asic-rs (its
+//!   `v2020` backend): `POST /cgi-bin/blink.cgi {"blink":"true"|"false"}`
+//!   and `GET /cgi-bin/get_blink_status.cgi` → `{"blink": true|false}`.
+//!   Not confirmed on the 2018 S9 build yet, so it is dry-run only.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -134,6 +138,8 @@ impl S9StockDriver {
 
     pub fn caps_for(has_miner_mode: bool) -> Capabilities {
         Capabilities::flags(has_miner_mode, has_miner_mode, true, Route::S9Cgi)
+            .with_unconfirmed(MinerAction::LightOn, Route::S9Cgi)
+            .with_unconfirmed(MinerAction::LightOff, Route::S9Cgi)
     }
 
     async fn digest_get(&self, path: &str) -> anyhow::Result<(StatusCode, Option<Value>)> {
@@ -225,8 +231,32 @@ impl MinerDriver for S9StockDriver {
                     .await
                 }
                 MinerAction::Start | MinerAction::Stop => Ok(false),
+                MinerAction::LightOn | MinerAction::LightOff => {
+                    let on = action == MinerAction::LightOn;
+                    self.digest_post_json("/cgi-bin/blink.cgi", serde_json::json!({ "blink": on.to_string() })).await
+                }
             }
         })
+    }
+
+    fn light_state(&self) -> BoxFuture<'_, anyhow::Result<Option<bool>>> {
+        Box::pin(async move {
+            let (st, body) = self.digest_get("/cgi-bin/get_blink_status.cgi").await?;
+            anyhow::ensure!(st.is_success(), "get_blink_status.cgi: {st}");
+            Ok(body.as_ref().and_then(parse_blink_status))
+        })
+    }
+
+    fn paths_tried(&self, action: MinerAction) -> Vec<String> {
+        vec![match action {
+            MinerAction::LightOn | MinerAction::LightOff => {
+                "s9-cgi: POST /cgi-bin/blink.cgi (not yet confirmed on stock S9 firmware)".to_string()
+            }
+            MinerAction::Start | MinerAction::Stop if !self.has_miner_mode => {
+                "s9-cgi: no miner-mode on this firmware (no sleep API)".to_string()
+            }
+            a => format!("s9-cgi: {} available", a.name()),
+        }]
     }
 
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
@@ -241,6 +271,16 @@ impl MinerDriver for S9StockDriver {
             Ok(MinerStatus { uptime_s, paused })
         })
     }
+}
+
+/// `{"blink": true}` (bool or "true"/"false" string).
+pub fn parse_blink_status(body: &Value) -> Option<bool> {
+    let b = body.get("blink")?;
+    b.as_bool().or_else(|| match b.as_str()?.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    })
 }
 
 /// MAC and firmware build from stock `get_system_info.cgi`.

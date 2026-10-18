@@ -20,6 +20,10 @@ pub struct Settings {
     pub auto_fan: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power_limit_w: Option<u32>,
+    /// Manual tuning percent of full power (100 = unthrottled), asic-rs
+    /// `set_tuning_percent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning_pct: Option<u32>,
 }
 
 impl Settings {
@@ -37,6 +41,7 @@ impl Settings {
             temp_target_c: mask.temp_target_c.and(self.temp_target_c),
             auto_fan: mask.auto_fan.and(self.auto_fan),
             power_limit_w: mask.power_limit_w.and(self.power_limit_w),
+            tuning_pct: mask.tuning_pct.and(self.tuning_pct),
         }
     }
 
@@ -56,6 +61,7 @@ impl Settings {
         cmp(&mut out, "temp_target_c", self.temp_target_c, want.temp_target_c);
         cmp(&mut out, "auto_fan", self.auto_fan, want.auto_fan);
         cmp(&mut out, "power_limit_w", self.power_limit_w, want.power_limit_w);
+        cmp(&mut out, "tuning_pct", self.tuning_pct, want.tuning_pct);
         out
     }
 
@@ -74,6 +80,7 @@ impl Settings {
         f("temp_target_c", s(self.temp_target_c), s(to.temp_target_c));
         f("auto_fan", self.auto_fan.map(|b| b.to_string()), to.auto_fan.map(|b| b.to_string()));
         f("power_limit_w", s(self.power_limit_w), s(to.power_limit_w));
+        f("tuning_pct", s(self.tuning_pct), s(to.tuning_pct));
         parts.join(", ")
     }
 }

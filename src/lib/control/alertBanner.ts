@@ -9,6 +9,7 @@ export type Settings = {
   temp_target_c?: number | null;
   auto_fan?: boolean | null;
   power_limit_w?: number | null;
+  tuning_pct?: number | null;
 };
 
 export type FailureCause =
@@ -57,6 +58,7 @@ const FIELDS: Array<[keyof Settings, string]> = [
   ["fan_pct", "% fan"],
   ["temp_target_c", "°C target"],
   ["power_limit_w", "W"],
+  ["tuning_pct", "% tuning"],
 ];
 
 function fieldValue(s: Settings | null, k: keyof Settings): string {

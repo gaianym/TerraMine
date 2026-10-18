@@ -25,12 +25,17 @@
   import SafetyAlertBanner from "$lib/control/SafetyAlertBanner.svelte";
   import {
     ACTION_LABEL,
+    ALL_ACTIONS,
+    DRY_RUN_ONLY_NOTE,
+    affectsHashing,
+    dryRunOnly,
     unsupportedReason,
     type MinerAction,
   } from "$lib/control/types";
   import { ipsNeedingRefresh, missingAgGridModules } from "$lib/control/statusLabel";
   import { statusChipSpec } from "$lib/control/statusChip";
   import { refreshUntilSettled, type RefreshTarget } from "$lib/control/postActionRefresh";
+  import PowerTuningButton from "$lib/control/PowerTuningButton.svelte";
   import { formatEfficiency, formatGridValue } from "$lib/format";
   import { formatHashRateDelta, formatMetricDelta } from "$lib/deltaFormat";
   import { formatHashRateValue, getNormalizedHashRateDisplay, parseHashRateToHs } from "$lib/hashrate";
@@ -2367,7 +2372,7 @@
     colId: CONTROL_COL_ID,
     headerName: "Control",
     pinned: "right",
-    width: 230,
+    width: 380,
     sortable: false,
     filter: false,
     cellRenderer: (params: ICellRendererParams<GridRow>) => {
@@ -2375,14 +2380,15 @@
       const wrap = document.createElement("span");
       wrap.className = "tm-control-cell";
       if (!ip) return wrap;
-      for (const a of ["start", "stop", "reboot"] as MinerAction[]) {
+      for (const a of ALL_ACTIONS) {
         const b = document.createElement("button");
         b.type = "button";
         b.className = "tm-control-btn";
         b.textContent = ACTION_LABEL[a];
         const reason = unsupportedReason(control.capsByIp[ip], a);
         b.disabled = !!reason || !!control.activeRunId;
-        b.title = reason ?? `${ACTION_LABEL[a]} ${ip}`;
+        b.title =
+          reason ?? `${ACTION_LABEL[a]} ${ip}${dryRunOnly(control.capsByIp[ip], a) ? ` (${DRY_RUN_ONLY_NOTE})` : ""}`;
         b.addEventListener("click", (ev) => {
           ev.stopPropagation();
           requestAction([ip], a);
@@ -2446,7 +2452,7 @@
     lastEnrichedDoneId = done.run_id;
     const ips = new Set(ipsNeedingRefresh(done.results));
     const targets: RefreshTarget[] = done.results
-      .filter((r) => ips.has(r.ip))
+      .filter((r) => ips.has(r.ip) && affectsHashing(r.action))
       .map((r) => ({ ip: r.ip, action: r.action }));
     if (!targets.length) return;
     void refreshUntilSettled(targets, {
@@ -2998,6 +3004,7 @@
       <span>Results</span>
       <TuneButton {selectedIps} />
       <ControlToolbar {selectedIps} onrequest={requestAction} />
+      <PowerTuningButton {selectedIps} />
     </div>
     <div class="relative min-h-0 w-full flex-1">
       <div

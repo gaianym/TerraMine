@@ -522,15 +522,37 @@ fn cache_others_excludes_job_and_orders_by_recency() {
 
 #[test]
 fn asic_rs_accepts_only_what_it_supports() {
+    use super::asic::NativeSettingsFlags as F;
     let power = Settings { power_limit_w: Some(3000), ..Default::default() };
+    let pct = Settings { tuning_pct: Some(80), ..Default::default() };
     let fan = Settings { fan_pct: Some(70), ..Default::default() };
-    assert!(asic_accepts(&power, true, false, false).is_ok());
-    assert!(asic_accepts(&power, false, true, false).is_ok());
-    assert!(asic_accepts(&power, false, false, true).unwrap_err().contains("power target not supported"));
-    assert!(asic_accepts(&fan, true, true, true).is_ok());
-    assert!(asic_accepts(&fan, true, true, false).unwrap_err().contains("fan config not supported"));
-    assert!(asic_accepts(&freq(500), true, true, true).unwrap_err().contains("no manual frequency"));
-    assert!(asic_accepts(&Settings { auto_fan: Some(true), ..Default::default() }, true, true, true).is_err());
+    let all = F { power_limit: true, tuning_percent: true, fan: true };
+    assert!(asic_accepts(&power, F { power_limit: true, ..F::default() }).is_ok());
+    assert!(asic_accepts(&power, F { tuning_percent: true, fan: true, ..F::default() })
+        .unwrap_err()
+        .contains("supports_set_power_limit() = false"));
+    assert!(asic_accepts(&pct, F { tuning_percent: true, ..F::default() }).is_ok());
+    assert!(asic_accepts(&pct, F { power_limit: true, fan: true, ..F::default() })
+        .unwrap_err()
+        .contains("supports_set_tuning_percent() = false"));
+    assert!(asic_accepts(&fan, all).is_ok());
+    assert!(asic_accepts(&fan, F { fan: false, ..all }).unwrap_err().contains("fan config not supported"));
+    assert!(asic_accepts(&freq(500), all).unwrap_err().contains("no manual frequency"));
+    assert!(asic_accepts(&Settings { auto_fan: Some(true), ..Default::default() }, all).is_err());
+}
+
+/// Permanent (bug fixed in PR C): stock Antminer reports
+/// `supports_tuning_config() = true` but its `set_tuning_config` rejects a
+/// power target, and `supports_set_power_limit() = false`. The old
+/// selector accepted a power change there and only failed at write time,
+/// after the snapshot. Power now needs `supports_set_power_limit()`.
+#[test]
+fn power_limit_needs_set_power_limit_not_tuning_config() {
+    use super::asic::NativeSettingsFlags as F;
+    let power = Settings { power_limit_w: Some(3000), ..Default::default() };
+    // Antminer stock v2020 / v2023 in asic-rs 0.8.6: tuning_config yes, power limit no, fan yes.
+    let antminer = F { power_limit: false, tuning_percent: false, fan: true };
+    assert!(asic_accepts(&power, antminer).is_err());
 }
 
 #[test]

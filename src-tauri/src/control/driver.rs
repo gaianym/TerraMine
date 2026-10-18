@@ -1,4 +1,4 @@
-//! Miner driver abstraction for start / stop / reboot.
+//! Miner driver abstraction for start / stop / reboot / fault light.
 //!
 //! Assumptions:
 //! - "stop" = pause/sleep (miner stays reachable), "start" = resume.
@@ -10,7 +10,7 @@
 //! - A reboot often drops the connection before replying, so a transport
 //!   error or timeout on reboot is reported as "probably rebooting".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 #[cfg(test)]
@@ -29,15 +29,79 @@ use super::safety::settings::{HealthSample, SettingsDriver};
 use super::safety::DeviceProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum MinerAction {
     Start,
     Stop,
     Reboot,
+    /// Fault / locate light on (blink).
+    LightOn,
+    /// Fault / locate light off.
+    LightOff,
 }
 
 impl MinerAction {
-    pub const ALL: [MinerAction; 3] = [MinerAction::Start, MinerAction::Stop, MinerAction::Reboot];
+    pub const ALL: [MinerAction; 5] =
+        [MinerAction::Start, MinerAction::Stop, MinerAction::Reboot, MinerAction::LightOn, MinerAction::LightOff];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Reboot => "reboot",
+            Self::LightOn => "light_on",
+            Self::LightOff => "light_off",
+        }
+    }
+
+    /// `Some(wanted light state)` for the fault-light actions.
+    pub fn light_target(self) -> Option<bool> {
+        match self {
+            Self::LightOn => Some(true),
+            Self::LightOff => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// asic-rs `supports_*()` flags that decide native routes. Kept as plain
+/// data so the routing rule is one function, shared with the test doubles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NativeFlags {
+    pub resume: bool,
+    pub pause: bool,
+    pub restart: bool,
+    pub fault_light: bool,
+}
+
+impl NativeFlags {
+    pub fn of(m: &dyn asic_rs_core::traits::miner::Miner) -> Self {
+        Self {
+            resume: m.supports_resume(),
+            pause: m.supports_pause(),
+            restart: m.supports_restart(),
+            fault_light: m.supports_set_fault_light(),
+        }
+    }
+
+    pub fn caps(self) -> Capabilities {
+        let mut c = Capabilities::flags(self.resume, self.pause, self.restart, Route::AsicRs);
+        if self.fault_light {
+            c = c.with(MinerAction::LightOn, Route::AsicRs).with(MinerAction::LightOff, Route::AsicRs);
+        }
+        c
+    }
+
+    /// The asic-rs flag behind `action`, for "paths tried" messages.
+    pub fn explain(self, action: MinerAction) -> String {
+        let (flag, on) = match action {
+            MinerAction::Start => ("supports_resume", self.resume),
+            MinerAction::Stop => ("supports_pause", self.pause),
+            MinerAction::Reboot => ("supports_restart", self.restart),
+            MinerAction::LightOn | MinerAction::LightOff => ("supports_set_fault_light", self.fault_light),
+        };
+        format!("asic-rs: {flag}() = {on}")
+    }
 }
 
 /// How an action reaches the miner.
@@ -54,13 +118,26 @@ pub enum Route {
     Mock,
 }
 
+impl Route {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AsicRs => "asic-rs",
+            Self::Axeos => "axeos",
+            Self::S9Cgi => "s9-cgi",
+            Self::Mock => "mock",
+        }
+    }
+}
+
 /// Per-action capability map: an action is supported iff it has a route.
 ///
-/// Serialized for the UI as `{start, stop, reboot}` booleans (unchanged
-/// shape) plus `routes: {action: route}`.
+/// Serialized for the UI as `{start, stop, reboot, light_on, light_off}`
+/// booleans plus `routes: {action: route}` and `unconfirmed: [action]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capabilities {
     routes: BTreeMap<MinerAction, Route>,
+    /// Routes not yet confirmed on real hardware: dry run only.
+    unconfirmed: BTreeSet<MinerAction>,
 }
 
 impl Capabilities {
@@ -81,7 +158,20 @@ impl Capabilities {
 
     pub fn with(mut self, action: MinerAction, route: Route) -> Self {
         self.routes.insert(action, route);
+        self.unconfirmed.remove(&action);
         self
+    }
+
+    /// Like [`Self::with`], but the route is not hardware-confirmed yet, so
+    /// the job runner only dry-runs it.
+    pub fn with_unconfirmed(mut self, action: MinerAction, route: Route) -> Self {
+        self.routes.insert(action, route);
+        self.unconfirmed.insert(action);
+        self
+    }
+
+    pub fn confirmed(&self, action: MinerAction) -> bool {
+        self.supports(action) && !self.unconfirmed.contains(&action)
     }
 
     pub fn supports(&self, action: MinerAction) -> bool {
@@ -106,6 +196,11 @@ impl Capabilities {
         let mut c = fallback.clone();
         for (a, r) in &native.routes {
             c.routes.insert(*a, *r);
+            if native.unconfirmed.contains(a) {
+                c.unconfirmed.insert(*a);
+            } else {
+                c.unconfirmed.remove(a);
+            }
         }
         c
     }
@@ -113,11 +208,12 @@ impl Capabilities {
 
 impl Serialize for Capabilities {
     fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        let mut m = ser.serialize_map(Some(4))?;
-        m.serialize_entry("start", &self.supports(MinerAction::Start))?;
-        m.serialize_entry("stop", &self.supports(MinerAction::Stop))?;
-        m.serialize_entry("reboot", &self.supports(MinerAction::Reboot))?;
+        let mut m = ser.serialize_map(Some(MinerAction::ALL.len() + 2))?;
+        for a in MinerAction::ALL {
+            m.serialize_entry(a.name(), &self.supports(a))?;
+        }
         m.serialize_entry("routes", &self.routes)?;
+        m.serialize_entry("unconfirmed", &self.unconfirmed)?;
         m.end()
     }
 }
@@ -131,6 +227,15 @@ pub trait MinerDriver: Send + Sync {
     /// Current state used for post-action verification.
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
         Box::pin(async { anyhow::bail!("status not supported") })
+    }
+    /// Fault-light read-back: `Ok(None)` = the firmware does not report it.
+    fn light_state(&self) -> BoxFuture<'_, anyhow::Result<Option<bool>>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Every path considered for `action` and why it was or was not
+    /// usable, for "not supported, paths tried" messages.
+    fn paths_tried(&self, action: MinerAction) -> Vec<String> {
+        vec![format!("{}: no route for {}", self.kind().label(), action.name())]
     }
     /// Identity for the safety layer (limits, path selection, audit).
     fn profile(&self) -> DeviceProfile {
@@ -246,12 +351,7 @@ impl MinerDriver for AsicRsDriver {
         self.ip
     }
     fn caps(&self) -> Capabilities {
-        Capabilities::flags(
-            self.miner.supports_resume(),
-            self.miner.supports_pause(),
-            self.miner.supports_restart(),
-            Route::AsicRs,
-        )
+        NativeFlags::of(self.miner.as_ref()).caps()
     }
     fn execute(&self, action: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>> {
         Box::pin(async move {
@@ -259,8 +359,17 @@ impl MinerDriver for AsicRsDriver {
                 MinerAction::Start => self.miner.resume(None).await,
                 MinerAction::Stop => self.miner.pause(None).await,
                 MinerAction::Reboot => self.miner.restart().await,
+                MinerAction::LightOn => self.miner.set_fault_light(true).await,
+                MinerAction::LightOff => self.miner.set_fault_light(false).await,
             }
         })
+    }
+    fn light_state(&self) -> BoxFuture<'_, anyhow::Result<Option<bool>>> {
+        Box::pin(async move { Ok(self.miner.get_light_flashing().await) })
+    }
+    fn paths_tried(&self, action: MinerAction) -> Vec<String> {
+        let i = self.miner.get_device_info();
+        vec![format!("{} on {} {} ({})", NativeFlags::of(self.miner.as_ref()).explain(action), i.make, i.model, i.firmware)]
     }
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
         Box::pin(async move {
@@ -341,6 +450,19 @@ impl MinerDriver for CompositeDriver {
         } else {
             self.fallback.execute(action)
         }
+    }
+    /// Read the light back on the same path that set it.
+    fn light_state(&self) -> BoxFuture<'_, anyhow::Result<Option<bool>>> {
+        if self.native.caps().supports(MinerAction::LightOn) {
+            self.native.light_state()
+        } else {
+            self.fallback.light_state()
+        }
+    }
+    fn paths_tried(&self, action: MinerAction) -> Vec<String> {
+        let mut v = self.native.paths_tried(action);
+        v.extend(self.fallback.paths_tried(action));
+        v
     }
     /// The override's status read is the one verification was built on.
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {

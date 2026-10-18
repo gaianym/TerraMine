@@ -3,7 +3,9 @@
   import { defaultActionOptions } from "./actionDefaults";
   import {
     ACTION_LABEL,
+    DRY_RUN_ONLY_NOTE,
     TYPED_CONFIRM_THRESHOLD,
+    dryRunOnly,
     unsupportedReason,
     type MinerAction,
   } from "./types";
@@ -26,8 +28,15 @@
     void control.refreshCaps(ips);
   });
 
+  // Unconfirmed routes can be dry-run but are left out of a live send
+  // (the backend refuses them too).
   const rows = $derived(
-    ips.map((ip) => ({ ip, reason: unsupportedReason(control.capsByIp[ip], action) })),
+    ips.map((ip) => {
+      const caps = control.capsByIp[ip];
+      const reason = unsupportedReason(caps, action) ?? (!dryRun && dryRunOnly(caps, action) ? DRY_RUN_ONLY_NOTE : null);
+      const note = !reason && dryRunOnly(caps, action) ? DRY_RUN_ONLY_NOTE : null;
+      return { ip, reason, note };
+    }),
   );
   const supported = $derived(rows.filter((r) => !r.reason).map((r) => r.ip));
   const needsTyped = $derived(supported.length > TYPED_CONFIRM_THRESHOLD && !dryRun);
@@ -55,12 +64,17 @@
       <p class="mb-2 text-xs text-amber-300">Rebooting interrupts hashing for a minute or more.</p>
     {:else if action === "stop"}
       <p class="mb-2 text-xs text-amber-300">Stopped miners stop hashing until started again.</p>
+    {:else if action === "light_on" || action === "light_off"}
+      <p class="mb-2 text-xs text-zinc-400" data-testid="tm-light-note">
+        Fault / locate light. Hashing is not affected. Sent through asic-rs where the firmware supports it; miners
+        with no path are listed with the paths tried.
+      </p>
     {/if}
     <ul class="mb-3 max-h-48 overflow-auto rounded border border-zinc-800 font-mono text-xs">
       {#each rows as r (r.ip)}
         <li class="flex justify-between gap-2 px-2 py-1 {r.reason ? 'text-zinc-500' : ''}">
           <span>{r.ip}</span>
-          <span class="truncate text-right">{r.reason ?? (control.capsByIp[r.ip] ? "ready" : "checking…")}</span>
+          <span class="truncate text-right" title={r.reason ?? r.note ?? ""}>{r.reason ?? r.note ?? (control.capsByIp[r.ip] ? "ready" : "checking…")}</span>
         </li>
       {/each}
     </ul>

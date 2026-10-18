@@ -2,7 +2,7 @@
 //!
 //! - Start / stop / reboot keep their existing behaviour (dry run is
 //!   chosen by the caller; the UI defaults it on).
-//! - Every new write class defaults to dry run.
+//! - Every new write class defaults to dry run (fault light included).
 //! - Irreversible actions (factory reset, firmware, password) are refused
 //!   unless the operator typed the action name exactly AND set
 //!   `allow_irreversible`, and only for one device at a time.
@@ -17,6 +17,8 @@ pub enum ActionKind {
     Start,
     Stop,
     Reboot,
+    LightOn,
+    LightOff,
     ApplySettings,
     FactoryReset,
     FirmwareUpdate,
@@ -24,10 +26,12 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
-    pub const ALL: [ActionKind; 7] = [
+    pub const ALL: [ActionKind; 9] = [
         Self::Start,
         Self::Stop,
         Self::Reboot,
+        Self::LightOn,
+        Self::LightOff,
         Self::ApplySettings,
         Self::FactoryReset,
         Self::FirmwareUpdate,
@@ -40,6 +44,8 @@ impl ActionKind {
             Self::Start => "start",
             Self::Stop => "stop",
             Self::Reboot => "reboot",
+            Self::LightOn => "light_on",
+            Self::LightOff => "light_off",
             Self::ApplySettings => "apply_settings",
             Self::FactoryReset => "factory_reset",
             Self::FirmwareUpdate => "firmware_update",
@@ -69,6 +75,8 @@ impl From<MinerAction> for ActionKind {
             MinerAction::Start => Self::Start,
             MinerAction::Stop => Self::Stop,
             MinerAction::Reboot => Self::Reboot,
+            MinerAction::LightOn => Self::LightOn,
+            MinerAction::LightOff => Self::LightOff,
         }
     }
 }

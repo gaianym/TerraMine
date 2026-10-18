@@ -182,11 +182,15 @@ fn caps_prefer_native_then_fallback_and_serialize_for_ui() {
     let v = serde_json::to_value(&c).unwrap();
     assert_eq!(
         v,
-        serde_json::json!({"start": true, "stop": true, "reboot": true,
-            "routes": {"start": "asic-rs", "stop": "asic-rs", "reboot": "axeos"}})
+        serde_json::json!({"start": true, "stop": true, "reboot": true, "light_on": false, "light_off": false,
+            "routes": {"start": "asic-rs", "stop": "asic-rs", "reboot": "axeos"}, "unconfirmed": []})
     );
     let none = serde_json::to_value(Capabilities::none()).unwrap();
-    assert_eq!(none, serde_json::json!({"start": false, "stop": false, "reboot": false, "routes": {}}));
+    assert_eq!(
+        none,
+        serde_json::json!({"start": false, "stop": false, "reboot": false, "light_on": false, "light_off": false,
+            "routes": {}, "unconfirmed": []})
+    );
     // Native wins where both can do it.
     let both = Capabilities::prefer(&native, &Capabilities::flags(true, true, true, Route::Axeos));
     assert_eq!(both.route(MinerAction::Stop), Some(Route::AsicRs));
@@ -215,7 +219,7 @@ async fn composite_sends_each_action_on_its_route() {
         Box::new(mk(Capabilities::flags(true, true, false, Route::AsicRs), &nlog)),
         Box::new(mk(Capabilities::flags(true, true, true, Route::Axeos), &flog)),
     );
-    for a in MinerAction::ALL {
+    for a in [MinerAction::Start, MinerAction::Stop, MinerAction::Reboot] {
         assert!(d.execute(a).await.unwrap());
     }
     let calls = |l: &Arc<MockLog>| l.calls.lock().unwrap().iter().map(|c| c.1).collect::<Vec<_>>();

@@ -148,8 +148,14 @@ impl SettingsDriver for AxeOsSettings {
         if p.class != DeviceClass::AxeOs {
             return Err(format!("device class {:?} is not AxeOS", p.class));
         }
+        if change.tuning_pct.is_some() {
+            return Err("tuning_pct has no AxeOS equivalent; use a power target (mapped to frequency) or a frequency".into());
+        }
         if change.power_limit_w.is_some() && change.frequency_mhz.is_some() {
             return Err("power_limit_w is mapped to a frequency on AxeOS; send either power_limit_w or frequency_mhz".into());
+        }
+        if change.tuning_pct.is_some() {
+            return Err("tuning_pct is not writable over AxeOS".into());
         }
         Ok(())
     }

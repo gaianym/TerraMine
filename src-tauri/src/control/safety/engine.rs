@@ -493,6 +493,7 @@ fn missing_fields(change: &Settings, snap: &Settings) -> Vec<String> {
     f("temp_target_c", change.temp_target_c.is_some(), snap.temp_target_c.is_some());
     f("auto_fan", change.auto_fan.is_some(), snap.auto_fan.is_some());
     f("power_limit_w", change.power_limit_w.is_some(), snap.power_limit_w.is_some());
+    f("tuning_pct", change.tuning_pct.is_some(), snap.tuning_pct.is_some());
     out
 }
 
