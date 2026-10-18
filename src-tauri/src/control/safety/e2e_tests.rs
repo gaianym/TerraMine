@@ -169,7 +169,7 @@ async fn e2e_dry_run_and_limit_refusal_send_no_writes() {
     assert_eq!(o.status, WriteStatus::DryRun);
     assert_eq!(
         o.msg.as_deref(),
-        Some("would set frequency_mhz 525 → 575 with a restart to apply via axeos-http; frequency raise 525 → 575 MHz is held: needs an explicit OK (allow_frequency_raise)")
+        Some("would set frequency_mhz 525 → 575 via axeos-http; frequency raise 525 → 575 MHz is held: needs an explicit OK (allow_frequency_raise)")
     );
     let before = r.axe.requests().len();
     let o = r.engine.apply_settings("run", &t, &apply(freq(900))).await;
@@ -235,13 +235,15 @@ async fn e2e_total_failure_reports_paths_tried() {
     assert_eq!(r.audit.records().last().unwrap().paths_tried, o.paths_tried);
 }
 
-/// Default options: no backend is hardware-confirmed, so nothing is written.
+/// Default options: changes not hardware-confirmed (here core voltage on
+/// AxeOS 2.15) are never written.
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_default_options_never_write_through_unconfirmed_paths() {
     let r = rig_with(false).await;
     let t = target(&r, AXE).await;
     let before = r.axe.requests().len();
-    let o = r.engine.apply_settings("run", &t, &apply(freq(575))).await;
+    let volt = Settings { core_voltage_mv: Some(1100), ..Default::default() };
+    let o = r.engine.apply_settings("run", &t, &apply(volt)).await;
     assert_eq!(o.status, WriteStatus::NoPath, "{o:?}");
     assert!(o.paths_tried[0].contains("not yet confirmed on real hardware"));
     assert_eq!(r.axe.requests().len(), before);

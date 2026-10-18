@@ -11,10 +11,14 @@
 //!
 //! AxeOS mocks also hold settings (frequency, core voltage, fan, target
 //! temperature) behind `PATCH /api/system` and report `temp` / `power`.
-//! Frequency and core voltage are restart-to-apply: PATCH only stores
-//! them (`frequency` / `coreVoltage` report the stored value at once) and
-//! the running values (`actualFrequency`, health, faults) change only
-//! after `POST /api/system/restart`. Fan settings apply immediately. On
+//! Frequency and core voltage: on 2.10 they are restart-to-apply (PATCH
+//! only stores them; `frequency` / `coreVoltage` report the stored value at
+//! once and the running values — `actualFrequency`, health, faults — change
+//! only after `POST /api/system/restart`). On 2.15 PATCH applies them live,
+//! as ESP-Miner's power-management loop does (hardware-checked for
+//! frequency on v2.15.3); a restart re-applies the stored values. A bad
+//! live config with `Fault::Unreachable` crashes the miner once. Fan
+//! settings apply immediately. On
 //! 2.15 the manual fan speed is `manualFanSpeed` and `fanspeed` is the
 //! measured fan % (as in AxeOS ≥ 2.11); 2.10 uses `fanspeed` for both.
 //! A [`Fault`] simulates a miner that turns unhealthy whenever its running
@@ -174,6 +178,17 @@ impl State {
                     self.offline_until = Some(Instant::now() + self.downtime);
                 }
             }
+        }
+    }
+    /// AxeOS 2.15: stored frequency / core voltage take effect without a
+    /// restart (the firmware applies NVS changes from its power loop).
+    fn apply_live(&mut self) {
+        self.frequency = self.freq_cap.map_or(self.nvs_frequency, |c| self.nvs_frequency.min(c));
+        self.core_voltage = self.nvs_core_voltage;
+        let running = (self.frequency, self.core_voltage);
+        if self.degraded() == Some(Fault::Unreachable) && self.crashed_on != Some(running) {
+            self.crashed_on = Some(running);
+            self.reboot();
         }
     }
     fn reboot(&mut self) {
@@ -502,12 +517,17 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     };
                     if !s.ignore_writes {
                         let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as u32);
-                        // Stored only; applied by the next restart.
-                        if let Some(f) = num("frequency") {
+                        // 2.10: stored only, applied by the next restart.
+                        // 2.15: applied live as well.
+                        let (f, c) = (num("frequency"), num("coreVoltage"));
+                        if let Some(f) = f {
                             s.nvs_frequency = f;
                         }
-                        if let Some(c) = num("coreVoltage") {
+                        if let Some(c) = c {
                             s.nvs_core_voltage = c;
+                        }
+                        if new && (f.is_some() || c.is_some()) {
+                            s.apply_live();
                         }
                         // Unknown keys are ignored, as on AxeOS.
                         if let Some(f) = num(if new { "manualFanSpeed" } else { "fanspeed" }) {

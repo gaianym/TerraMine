@@ -226,9 +226,9 @@ impl SafetyEngine {
         for b in backends {
             if let Err(reason) = b.accepts(&t.profile, change) {
                 tried.push(format!("{}: skipped ({reason})", b.id()));
-            } else if !b.hardware_confirmed() && !self.opts.allow_unconfirmed_paths && !dry_run {
+            } else if !b.confirmed_for(change) && !self.opts.allow_unconfirmed_paths && !dry_run {
                 tried.push(format!("{}: skipped (not yet confirmed on real hardware)", b.id()));
-            } else if !b.hardware_confirmed() && !self.opts.allow_unconfirmed_paths {
+            } else if !b.confirmed_for(change) && !self.opts.allow_unconfirmed_paths {
                 tried.push(format!("{}: selected for dry run only (not yet confirmed on real hardware)", b.id()));
                 return (Some(b), tried);
             } else {
@@ -279,7 +279,7 @@ impl SafetyEngine {
 
         if req.dry_run {
             let via = format!("via {}", drv.id());
-            let unconfirmed = if drv.hardware_confirmed() || self.opts.allow_unconfirmed_paths {
+            let unconfirmed = if drv.confirmed_for(&req.change) || self.opts.allow_unconfirmed_paths {
                 String::new()
             } else {
                 "; path not yet confirmed on real hardware, a live write is refused".into()

@@ -1,6 +1,7 @@
 //! Plan PR H: AxeOS (Bitaxe) frequency / core voltage / fan / target
-//! temperature through the safety engine, against the restart-to-apply
-//! AxeOS mock (no real hardware).
+//! temperature through the safety engine, against the AxeOS mocks: 2.10
+//! is restart-to-apply, 2.15 applies frequency / voltage live (as checked
+//! on a real v2.15.3, see `tests/hw_axeos_settings.rs`).
 
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,8 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::audit::MemoryAudit;
-use super::axeos::{fan_key, frequency_applied, parse_axeos_settings, power_stand_in};
+use super::axeos::{confirmed_fields, confirmed_line, fan_key, frequency_applied, parse_axeos_settings, power_stand_in, AxeOsSettings};
+use super::settings::SettingsDriver;
 use super::batch::{run_settings_job, BatchOptions};
 use super::engine::{raise_hold, SafeWriteRequest, SafetyEngine, SafetyOptions, Target, WriteOutcome, WriteStatus};
 use super::health::{FailureCause, HealthPolicy};
@@ -89,21 +91,77 @@ fn api_calls(m: &MockMiner) -> Vec<String> {
 
 const HEALTHY: (u32, u32) = (MOCK_FREQ_MHZ, MOCK_CORE_MV);
 
-/// The mock applies frequency / voltage only on restart, like AxeOS.
+/// The 2.10 mock applies frequency / voltage only on restart.
 #[tokio::test(flavor = "multi_thread")]
 async fn mock_axeos_applies_frequency_only_after_restart() {
-    let m = MockMiner::spawn(MockKind::AxeOs215, Duration::from_millis(200)).await.unwrap();
+    let m = MockMiner::spawn(MockKind::AxeOs210, Duration::from_millis(200)).await.unwrap();
     let c = reqwest::Client::builder().no_proxy().build().unwrap();
     c.patch(format!("{}/api/system", m.base())).json(&json!({"frequency": 500, "coreVoltage": 1100})).send().await.unwrap();
     assert_eq!(m.stored(), (500, 1100));
     assert_eq!(m.settings(), HEALTHY, "not running before the restart");
     let info: serde_json::Value = c.get(format!("{}/api/system/info", m.base())).send().await.unwrap().json().await.unwrap();
-    assert_eq!((info["frequency"].as_u64(), info["actualFrequency"].as_u64()), (Some(500), Some(525)));
+    assert_eq!(info["frequency"].as_u64(), Some(500));
     c.post(format!("{}/api/system/restart", m.base())).send().await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     let info: serde_json::Value = c.get(format!("{}/api/system/info", m.base())).send().await.unwrap().json().await.unwrap();
-    assert_eq!(info["actualFrequency"].as_u64(), Some(500));
+    assert_eq!(info["frequency"].as_u64(), Some(500));
     assert_eq!(m.settings(), (500, 1100));
+}
+
+/// The 2.15 mock applies a PATCHed frequency / voltage live, like
+/// ESP-Miner 2.15.3's power-management loop (hardware-checked).
+#[tokio::test(flavor = "multi_thread")]
+async fn mock_axeos_215_applies_frequency_live() {
+    let m = MockMiner::spawn(MockKind::AxeOs215, Duration::from_millis(200)).await.unwrap();
+    let c = reqwest::Client::builder().no_proxy().build().unwrap();
+    c.patch(format!("{}/api/system", m.base())).json(&json!({"frequency": 500})).send().await.unwrap();
+    assert_eq!(m.stored(), (500, MOCK_CORE_MV));
+    assert_eq!(m.settings(), (500, MOCK_CORE_MV), "running without a restart");
+    let info: serde_json::Value = c.get(format!("{}/api/system/info", m.base())).send().await.unwrap().json().await.unwrap();
+    assert_eq!((info["frequency"].as_u64(), info["actualFrequency"].as_u64()), (Some(500), Some(500)));
+    assert_eq!(m.reboots(), 0);
+}
+
+/// Permanent (hardware finding, AxeOS v2.15.3): a frequency-only change on
+/// 2.15.x applies live, so no restart is sent; `actualFrequency` still
+/// has to confirm it, and the health watch runs as usual.
+#[tokio::test(flavor = "multi_thread")]
+async fn frequency_only_on_2_15_applies_live_without_restart() {
+    let r = rig_with(true).await;
+    let t = target(&r, AXE).await;
+    let o = r.engine.apply_settings("h", &t, &req(freq(500), true, false)).await;
+    assert_eq!(o.msg.as_deref(), Some("would set frequency_mhz 525 → 500 via axeos-http"), "no restart in the plan");
+    let o = r.engine.apply_settings("h", &t, &req(freq(500), false, false)).await;
+    assert_eq!(o.status, WriteStatus::Verified, "{o:?}");
+    assert_eq!(r.axe.settings(), (500, MOCK_CORE_MV));
+    assert_eq!(r.axe.reboots(), 0);
+    assert_eq!(api_calls(&r.axe), ["PATCH /api/system"]);
+    // Core voltage is not hardware-checked live: it still restarts.
+    let v = Settings { core_voltage_mv: Some(1100), ..Default::default() };
+    let o = r.engine.apply_settings("h", &t, &req(v, true, false)).await;
+    assert!(o.msg.as_deref().unwrap().contains("with a restart to apply"), "{o:?}");
+    // 2.10 keeps the restart for frequency too.
+    let t = target(&r, OLD).await;
+    let o = r.engine.apply_settings("h", &t, &req(freq(500), false, false)).await;
+    assert_eq!(o.status, WriteStatus::Verified, "{o:?}");
+    assert_eq!(r.old.reboots(), 1);
+}
+
+/// On 2.15.x a bad live frequency is caught by the health watch and rolled
+/// back with a PATCH alone (no restart either way).
+#[tokio::test(flavor = "multi_thread")]
+async fn rollback_on_2_15_patches_snapshot_without_restart() {
+    let r = rig_with(true).await;
+    r.axe.set_fault(Some(Fault::Overheat));
+    let t = target(&r, AXE).await;
+    let o = r.engine.apply_settings("h", &t, &req(freq(500), false, false)).await;
+    assert_eq!(o.status, WriteStatus::RolledBack, "{o:?}");
+    assert_eq!(o.cause, Some(FailureCause::Overheat));
+    assert!(o.msg.as_deref().unwrap().contains("temperature 95.0°C above 70.0°C"), "{o:?}");
+    assert_eq!(r.axe.settings(), HEALTHY);
+    assert_eq!(r.axe.stored(), HEALTHY);
+    assert_eq!(r.axe.reboots(), 0);
+    assert_eq!(api_calls(&r.axe), ["PATCH /api/system", "PATCH /api/system"]);
 }
 
 /// Frequency + voltage: PATCH, restart as part of the write, wait, read
@@ -123,22 +181,23 @@ async fn frequency_and_voltage_restart_to_apply_then_verified() {
     assert!(o.msg.unwrap().contains("applied frequency_mhz 525 → 500, core_voltage_mv 1150 → 1100"));
 }
 
-/// Rollback = PATCH the snapshot + restart again; the health watch spans
-/// the restart (overheat while coming back up is caught there).
+/// Restart-to-apply firmware (2.10): rollback = PATCH the snapshot +
+/// restart again; the health watch spans the restart (overheat while
+/// coming back up is caught there).
 #[tokio::test(flavor = "multi_thread")]
 async fn rollback_patches_snapshot_and_restarts() {
     let r = rig_with(true).await;
-    r.axe.set_fault(Some(Fault::Overheat));
-    let t = target(&r, AXE).await;
+    r.old.set_fault(Some(Fault::Overheat));
+    let t = target(&r, OLD).await;
     let o = r.engine.apply_settings("h", &t, &req(freq(500), false, false)).await;
     assert_eq!(o.status, WriteStatus::RolledBack, "{o:?}");
     assert_eq!(o.cause, Some(FailureCause::Overheat));
     assert!(o.msg.as_deref().unwrap().contains("during restart: temperature 95.0°C above 70.0°C"), "{o:?}");
-    assert_eq!(r.axe.settings(), HEALTHY);
-    assert_eq!(r.axe.stored(), HEALTHY);
-    assert_eq!(r.axe.reboots(), 2, "restart to apply + restart to roll back");
+    assert_eq!(r.old.settings(), HEALTHY);
+    assert_eq!(r.old.stored(), HEALTHY);
+    assert_eq!(r.old.reboots(), 2, "restart to apply + restart to roll back");
     assert_eq!(
-        api_calls(&r.axe),
+        api_calls(&r.old),
         ["PATCH /api/system", "POST /api/system/restart", "PATCH /api/system", "POST /api/system/restart"]
     );
 }
@@ -164,14 +223,14 @@ async fn read_back_checks_running_frequency_after_restart() {
 #[tokio::test(flavor = "multi_thread")]
 async fn restart_not_observed_fails_the_write() {
     let r = rig_with(true).await;
-    r.axe.set_ignore_restart(true);
-    let t = target(&r, AXE).await;
+    r.old.set_ignore_restart(true);
+    let t = target(&r, OLD).await;
     let o = r.engine.apply_settings("h", &t, &req(freq(500), false, false)).await;
     assert_eq!(o.status, WriteStatus::RolledBack, "{o:?}");
     assert_eq!(o.cause, Some(FailureCause::WriteFailed));
     assert!(o.msg.as_deref().unwrap().contains("restart to apply not observed (uptime did not reset)"), "{o:?}");
-    assert_eq!(r.axe.stored(), HEALTHY);
-    assert_eq!(r.axe.settings(), HEALTHY);
+    assert_eq!(r.old.stored(), HEALTHY);
+    assert_eq!(r.old.settings(), HEALTHY);
 }
 
 /// Permanent (bug): on AxeOS >= 2.11 the manual fan setting is
@@ -262,7 +321,7 @@ async fn power_request_maps_to_frequency_stand_in() {
     assert_eq!(o.status, WriteStatus::DryRun, "{o:?}");
     assert_eq!(
         o.msg.as_deref(),
-        Some("power_limit_w 15 W: AxeOS has no power limit; stand-in frequency 525 → 445 MHz (estimated from 17.6 W at 525 MHz, core voltage unchanged); would set frequency_mhz 525 → 445 with a restart to apply via axeos-http")
+        Some("power_limit_w 15 W: AxeOS has no power limit; stand-in frequency 525 → 445 MHz (estimated from 17.6 W at 525 MHz, core voltage unchanged); would set frequency_mhz 525 → 445 via axeos-http")
     );
     assert_eq!(o.attempted, Some(freq(445)));
     let o = r.engine.apply_settings("h", &t, &req(power(15), false, false)).await;
@@ -283,23 +342,55 @@ async fn power_request_maps_to_frequency_stand_in() {
     assert!(o.msg.unwrap().contains("power_w 60 outside 0..=40"));
 }
 
-/// Same gate as every other path: with default options (nothing confirmed
-/// on hardware) a dry run shows the plan, a live write sends nothing.
+/// Same gate as every other path, with default options: on AxeOS 2.15.x
+/// only frequency and fan changes are hardware-confirmed; core voltage,
+/// the power stand-in and every other AxeOS version stay dry run only.
 #[tokio::test(flavor = "multi_thread")]
 async fn live_axeos_writes_blocked_until_hardware_confirmed() {
     let r = rig_with(false).await;
     let t = target(&r, AXE).await;
-    let o = r.engine.apply_settings("h", &t, &req(freq(500), true, false)).await;
+    let volt = Settings { core_voltage_mv: Some(1100), ..Default::default() };
+    let o = r.engine.apply_settings("h", &t, &req(volt.clone(), true, false)).await;
     assert_eq!(o.status, WriteStatus::DryRun);
     let msg = o.msg.unwrap();
     assert!(msg.ends_with("path not yet confirmed on real hardware, a live write is refused"), "{msg}");
     assert_eq!(o.paths_tried, ["axeos-http: selected for dry run only (not yet confirmed on real hardware)"]);
-    for change in [freq(500), power(15), Settings { fan_pct: Some(80), ..Default::default() }] {
+    let mixed = Settings { frequency_mhz: Some(500), core_voltage_mv: Some(1100), ..Default::default() };
+    for change in [volt, mixed, power(15)] {
         let o = r.engine.apply_settings("h", &t, &req(change, false, true)).await;
         assert_eq!(o.status, WriteStatus::NoPath, "{o:?}");
         assert_eq!(o.paths_tried, ["axeos-http: skipped (not yet confirmed on real hardware)"]);
     }
     assert!(api_calls(&r.axe).is_empty());
+    // Older AxeOS: nothing is confirmed.
+    let t = target(&r, OLD).await;
+    for change in [freq(500), Settings { fan_pct: Some(80), auto_fan: Some(false), ..Default::default() }] {
+        let o = r.engine.apply_settings("h", &t, &req(change, false, false)).await;
+        assert_eq!(o.status, WriteStatus::NoPath, "{o:?}");
+    }
+    assert!(api_calls(&r.old).is_empty());
+}
+
+/// Permanent (hardware-confirmed on AxeOS v2.15.3): with default options
+/// a frequency or fan change on 2.15.x is written live, through the full
+/// pipeline, and the dry run carries no "not confirmed" warning.
+#[tokio::test(flavor = "multi_thread")]
+async fn axeos_2_15_frequency_and_fan_are_hardware_confirmed() {
+    let r = rig_with(false).await;
+    let t = target(&r, AXE).await;
+    let o = r.engine.apply_settings("h", &t, &req(freq(500), true, false)).await;
+    assert_eq!(o.paths_tried, ["axeos-http: selected"]);
+    assert!(!o.msg.unwrap().contains("not yet confirmed"));
+    let o = r.engine.apply_settings("h", &t, &req(freq(500), false, false)).await;
+    assert_eq!(o.status, WriteStatus::Verified, "{o:?}");
+    let fan = Settings { fan_pct: Some(80), auto_fan: Some(false), ..Default::default() };
+    let o = r.engine.apply_settings("h", &t, &req(fan, false, false)).await;
+    assert_eq!(o.status, WriteStatus::Verified, "{o:?}");
+    let back = Settings { fan_pct: Some(60), auto_fan: Some(true), temp_target_c: Some(60), ..Default::default() };
+    let o = r.engine.apply_settings("h", &t, &req(back, false, false)).await;
+    assert_eq!(o.status, WriteStatus::Verified, "{o:?}");
+    assert_eq!(r.axe.fan(), (true, 60, 60));
+    assert_eq!(r.axe.reboots(), 0);
 }
 
 /// Permanent: AxeOS calls only ever reach AxeOS devices, and the S9 gets
@@ -319,12 +410,13 @@ async fn mixed_fleet_job_sends_axeos_calls_only_to_axeos() {
     assert_eq!(out[1].status, WriteStatus::Verified, "{:?}", out[1]);
     assert_eq!(out[2].status, WriteStatus::NoPath, "{:?}", out[2]);
     assert!(alert.is_none(), "no rollbacks, no alert");
-    assert_eq!((r.axe.reboots(), r.old.reboots()), (1, 1));
+    assert_eq!((r.axe.reboots(), r.old.reboots()), (0, 1), "2.15 applies live, 2.10 restarts");
     assert!(!r.s9.requests().iter().any(|q| q.contains("/api/")), "{:?}", r.s9.requests());
     assert!(!r.axe.requests().iter().any(|q| q.contains("cgi")));
 }
 
-/// Canary: a bad first wave halts the rest; each rollback restarts.
+/// Canary: a bad first wave halts the rest; on restart-to-apply firmware
+/// (2.10) each write and rollback restarts.
 #[tokio::test(flavor = "multi_thread")]
 async fn canary_halts_after_restart_rollbacks() {
     let down = Duration::from_millis(300);
@@ -332,7 +424,7 @@ async fn canary_halts_after_restart_rollbacks() {
     let mut f = MockMinerFactory::new(Duration::from_secs(2));
     let mut ips = Vec::new();
     for i in 0..4u8 {
-        let m = MockMiner::spawn(MockKind::AxeOs215, down).await.unwrap();
+        let m = MockMiner::spawn(MockKind::AxeOs210, down).await.unwrap();
         let ip = IpAddr::from([198, 51, 100, 60 + i]);
         f.add(ip, &m);
         ips.push(ip);
@@ -375,4 +467,40 @@ fn axeos_parsing_and_helpers() {
     assert!(raise_hold(&freq(525), &freq(550), &c).is_some());
     assert!(raise_hold(&Settings::default(), &freq(500), &c).unwrap().contains("current frequency unknown"));
     assert!(raise_hold(&freq(525), &freq(550), &Confirmation { allow_frequency_raise: true, ..Default::default() }).is_none());
+}
+
+/// Permanent: which AxeOS changes are hardware-confirmed and which need a
+/// restart. Confirmed: frequency and fan settings on the 2.15.x line only.
+#[test]
+fn axeos_confirmation_and_restart_by_version_and_field() {
+    use crate::control::overrides::bitaxe::parse_loose_version;
+    let v = |s: &str| parse_loose_version(s);
+    for s in ["v2.15.0", "v2.15.3", "2.15.9"] {
+        assert!(confirmed_line(v(s).as_ref()), "{s}");
+    }
+    for s in ["v2.10.1", "v2.14.1", "v2.16.0", "v3.15.0"] {
+        assert!(!confirmed_line(v(s).as_ref()), "{s}");
+    }
+    assert!(!confirmed_line(None));
+    let fan = Settings { fan_pct: Some(50), auto_fan: Some(false), ..Default::default() };
+    let auto = Settings { auto_fan: Some(true), temp_target_c: Some(60), fan_pct: Some(49), ..Default::default() };
+    let volt = Settings { core_voltage_mv: Some(1100), ..Default::default() };
+    let both = Settings { frequency_mhz: Some(500), core_voltage_mv: Some(1100), ..Default::default() };
+    assert!(confirmed_fields(&freq(500)) && confirmed_fields(&fan) && confirmed_fields(&auto));
+    assert!(!confirmed_fields(&volt) && !confirmed_fields(&both) && !confirmed_fields(&power(15)));
+    assert!(!confirmed_fields(&Settings::default()));
+
+    let c = reqwest::Client::new();
+    let new = AxeOsSettings::new("http://192.0.2.1".into(), c.clone()).with_version(v("v2.15.3"));
+    let old = AxeOsSettings::new("http://192.0.2.1".into(), c.clone()).with_version(v("v2.14.1"));
+    let unknown = AxeOsSettings::new("http://192.0.2.1".into(), c);
+    assert!(!new.hardware_confirmed(), "never backend-wide");
+    assert!(new.confirmed_for(&freq(500)) && new.confirmed_for(&fan) && new.confirmed_for(&auto));
+    assert!(!new.confirmed_for(&volt) && !new.confirmed_for(&both) && !new.confirmed_for(&power(15)));
+    assert!(!old.confirmed_for(&freq(500)) && !unknown.confirmed_for(&fan));
+    // Restart: none for frequency on 2.15.x, kept for core voltage; always
+    // for frequency / voltage elsewhere; never for fan.
+    assert!(!new.restart_needed(&freq(500)) && new.restart_needed(&volt) && new.restart_needed(&both));
+    assert!(old.restart_needed(&freq(500)) && unknown.restart_needed(&freq(500)));
+    assert!(!new.restart_needed(&fan) && !old.restart_needed(&fan));
 }
