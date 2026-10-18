@@ -53,6 +53,25 @@ pub struct JobConfig {
     pub dry_run: bool,
     /// Re-poll after the command; None = fire-and-forget.
     pub verify: Option<VerifyConfig>,
+    /// Send on routes not yet confirmed on real hardware. Never set by the
+    /// app; mock tests only.
+    pub allow_unconfirmed: bool,
+}
+
+impl JobConfig {
+    /// Defaults for `action`: dry run follows the action class (on for
+    /// every class newer than start/stop/reboot), verify on.
+    pub fn new(action: MinerAction) -> Self {
+        Self {
+            action,
+            concurrency: 4,
+            stagger: Duration::from_millis(500),
+            timeout: Duration::from_secs(10),
+            dry_run: ActionKind::from(action).default_dry_run(),
+            verify: Some(VerifyConfig { interval: Duration::from_secs(5), timeout: Duration::from_secs(180) }),
+            allow_unconfirmed: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -214,14 +233,27 @@ async fn one(
         Resolved::NotFound(msg) => return ev(ip, action, ActionStatus::NotFound, msg),
         Resolved::Failed(e) => return ev(ip, action, ActionStatus::Failed, Some(e)),
     };
-    trace.profile = Some(driver.profile());
+    let profile = driver.profile();
+    trace.profile = Some(profile.clone());
     // Capability gate: the per-action route decides whether (and how) the
     // action is sent.
-    let Some(route) = driver.caps().route(action) else {
-        return ev(ip, action, ActionStatus::Unsupported, None);
+    let caps = driver.caps();
+    let Some(route) = caps.route(action) else {
+        let msg = format!("not supported on {:?}; paths tried: {}", profile.class, driver.paths_tried(action).join("; "));
+        return ev(ip, action, ActionStatus::Unsupported, Some(msg));
     };
+    let confirmed = caps.confirmed(action);
     if cfg.dry_run {
-        return ev(ip, action, ActionStatus::DryRun, None).via(route);
+        let msg = (!confirmed).then(|| format!("would send via {}; route not yet confirmed on real hardware (live send refused)", route.label()));
+        return ev(ip, action, ActionStatus::DryRun, msg).via(route);
+    }
+    if !confirmed && !cfg.allow_unconfirmed {
+        let msg = format!(
+            "{} via {} is not yet confirmed on real hardware; dry run only until a hardware check",
+            action.name(),
+            route.label()
+        );
+        return ev(ip, action, ActionStatus::Refused, Some(msg)).via(route);
     }
     // Baseline uptime so a reboot can be proven by a lower value afterwards
     // (reuses the identity read when it carried uptime).
@@ -255,7 +287,44 @@ async fn one(
     }
     sink(ev(ip, action, ActionStatus::Verifying, None).via(route));
     // Same driver for every poll: no reconnect / re-identification.
+    if let Some(want) = action.light_target() {
+        return verify_light(ip, action, want, vcfg, cfg.timeout, driver.as_ref()).await.via(route);
+    }
     verify(ip, action, before, vcfg, cfg.timeout, driver.as_ref()).await.via(route)
+}
+
+#[allow(unused_assignments)]
+/// Poll the light state until it reads `want`. Firmware that cannot
+/// report it ends as `unverified` with that reason.
+async fn verify_light(
+    ip: IpAddr,
+    action: MinerAction,
+    want: bool,
+    v: &VerifyConfig,
+    probe_timeout: Duration,
+    driver: &dyn MinerDriver,
+) -> ActionRowEvent {
+    let deadline = tokio::time::Instant::now() + v.timeout;
+    let mut last: Option<String> = None;
+    loop {
+        tokio::time::sleep(v.interval).await;
+        match tokio::time::timeout(probe_timeout, driver.light_state()).await {
+            Ok(Ok(Some(on))) if on == want => return ev(ip, action, ActionStatus::Verified, None),
+            Ok(Ok(Some(on))) => last = Some(format!("light still reads {}", if on { "on" } else { "off" })),
+            Ok(Ok(None)) => {
+                return ev(ip, action, ActionStatus::Unverified, Some("firmware does not report the light state".into()))
+            }
+            Ok(Err(e)) => last = Some(e.to_string()),
+            Err(_) => last = Some("light read timeout".into()),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let msg = match last {
+                Some(e) => format!("not confirmed before timeout: {e}"),
+                None => "not confirmed before timeout".into(),
+            };
+            return ev(ip, action, ActionStatus::Unverified, Some(msg));
+        }
+    }
 }
 
 /// Outcome of comparing a fresh status against what the action should produce.
@@ -282,6 +351,8 @@ pub fn check_status(action: MinerAction, before: Option<MinerStatus>, now: Miner
                 None => Check::Impossible("miner does not report pause state".into()),
             }
         }
+        // Verified through `light_state`, not the status read.
+        MinerAction::LightOn | MinerAction::LightOff => Check::Impossible("light state is not part of status".into()),
     }
 }
 
