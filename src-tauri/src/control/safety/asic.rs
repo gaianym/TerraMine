@@ -20,7 +20,7 @@ pub fn health_from_miner_data(d: &MinerData) -> HealthSample {
     let temps = d
         .hashboards
         .iter()
-        .flat_map(|b| [b.board_temperature, b.intake_temperature, b.outlet_temperature])
+        .flat_map(|b| [b.board_temperature, b.inlet_chip_temperature, b.outlet_chip_temperature])
         .chain([d.average_temperature])
         .flatten()
         .map(|t| t.as_celsius());

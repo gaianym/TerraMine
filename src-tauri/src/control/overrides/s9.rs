@@ -17,7 +17,7 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 
 use crate::control::cache::DriverKind;
-use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, MinerStatus, Observation};
+use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, MinerStatus, Observation, Route};
 use crate::control::safety::settings::HealthSample;
 use crate::control::safety::DeviceProfile;
 use crate::control::overrides::auth::DigestCredentials;
@@ -133,11 +133,7 @@ impl S9StockDriver {
     }
 
     pub fn caps_for(has_miner_mode: bool) -> Capabilities {
-        Capabilities {
-            start: has_miner_mode,
-            stop: has_miner_mode,
-            reboot: true,
-        }
+        Capabilities::flags(has_miner_mode, has_miner_mode, true, Route::S9Cgi)
     }
 
     async fn digest_get(&self, path: &str) -> anyhow::Result<(StatusCode, Option<Value>)> {

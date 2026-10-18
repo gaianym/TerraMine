@@ -21,14 +21,16 @@ impl DriverFactory for MockFactory {
     fn connect(&self, ip: IpAddr) -> BoxFuture<'_, anyhow::Result<Option<Box<dyn MinerDriver>>>> {
         Box::pin(async move {
             Ok(self.miners.get(&ip).map(|(caps, b)| {
-                Box::new(MockDriver { ip, caps: *caps, behavior: *b, delay: self.delay, log: self.log.clone(), status: None })
+                Box::new(MockDriver { ip, caps: caps.clone(), behavior: *b, delay: self.delay, log: self.log.clone(), status: None })
                     as Box<dyn MinerDriver>
             }))
         })
     }
 }
 
-const ALL: Capabilities = Capabilities { start: true, stop: true, reboot: true };
+fn all_caps() -> Capabilities {
+    Capabilities::flags(true, true, true, Route::Mock)
+}
 
 fn ip(n: u8) -> IpAddr {
     IpAddr::from([192, 0, 2, n])
@@ -65,7 +67,7 @@ async fn start_stop_reboot_success_map_to_driver_calls() {
         (MinerAction::Stop, ActionStatus::Ok),
         (MinerAction::Reboot, ActionStatus::Rebooting),
     ] {
-        let (f, log) = setup(vec![(1, ALL, MockBehavior::Ok)], 0);
+        let (f, log) = setup(vec![(1, all_caps(), MockBehavior::Ok)], 0);
         let (sink, _) = collecting_sink();
         let r = run_action(vec![ip(1)], cfg(action), f, CancellationToken::new(), sink).await;
         assert_eq!(statuses(&r), vec![expected]);
@@ -77,7 +79,7 @@ async fn start_stop_reboot_success_map_to_driver_calls() {
 
 #[tokio::test]
 async fn unsupported_action_is_not_sent() {
-    let caps = Capabilities { start: false, stop: false, reboot: true };
+    let caps = Capabilities::flags(false, false, true, Route::Mock);
     let (f, log) = setup(vec![(1, caps, MockBehavior::Ok)], 0);
     let (sink, _) = collecting_sink();
     let r = run_action(vec![ip(1)], cfg(MinerAction::Stop), f, CancellationToken::new(), sink).await;
@@ -87,7 +89,7 @@ async fn unsupported_action_is_not_sent() {
 
 #[tokio::test]
 async fn dry_run_sends_nothing() {
-    let (f, log) = setup(vec![(1, ALL, MockBehavior::Ok)], 0);
+    let (f, log) = setup(vec![(1, all_caps(), MockBehavior::Ok)], 0);
     let (sink, _) = collecting_sink();
     let mut c = cfg(MinerAction::Reboot);
     c.dry_run = true;
@@ -98,7 +100,7 @@ async fn dry_run_sends_nothing() {
 
 #[tokio::test]
 async fn missing_refused_and_errors() {
-    let (f, _) = setup(vec![(1, ALL, MockBehavior::Refuse), (2, ALL, MockBehavior::Error)], 0);
+    let (f, _) = setup(vec![(1, all_caps(), MockBehavior::Refuse), (2, all_caps(), MockBehavior::Error)], 0);
     let (sink, _) = collecting_sink();
     let r = run_action(vec![ip(1), ip(2), ip(3)], cfg(MinerAction::Stop), f, CancellationToken::new(), sink).await;
     assert_eq!(statuses(&r), vec![ActionStatus::Refused, ActionStatus::Failed, ActionStatus::NotFound]);
@@ -106,7 +108,7 @@ async fn missing_refused_and_errors() {
 
 #[tokio::test(start_paused = true)]
 async fn timeout_on_stop_fails_but_on_reboot_assumes_rebooting() {
-    let (f, _) = setup(vec![(1, ALL, MockBehavior::Hang)], 0);
+    let (f, _) = setup(vec![(1, all_caps(), MockBehavior::Hang)], 0);
     let (sink, _) = collecting_sink();
     let r = run_action(vec![ip(1)], cfg(MinerAction::Stop), f.clone(), CancellationToken::new(), sink.clone()).await;
     assert_eq!(statuses(&r), vec![ActionStatus::Failed]);
@@ -116,7 +118,7 @@ async fn timeout_on_stop_fails_but_on_reboot_assumes_rebooting() {
 
 #[tokio::test]
 async fn reboot_connection_drop_assumes_rebooting() {
-    let (f, _) = setup(vec![(1, ALL, MockBehavior::Error)], 0);
+    let (f, _) = setup(vec![(1, all_caps(), MockBehavior::Error)], 0);
     let (sink, _) = collecting_sink();
     let r = run_action(vec![ip(1)], cfg(MinerAction::Reboot), f, CancellationToken::new(), sink).await;
     assert_eq!(statuses(&r), vec![ActionStatus::Rebooting]);
@@ -124,7 +126,7 @@ async fn reboot_connection_drop_assumes_rebooting() {
 
 #[tokio::test(start_paused = true)]
 async fn concurrency_is_bounded() {
-    let miners = (1..=10).map(|n| (n, ALL, MockBehavior::Ok)).collect();
+    let miners = (1..=10).map(|n| (n, all_caps(), MockBehavior::Ok)).collect();
     let (f, log) = setup(miners, 100);
     let (sink, _) = collecting_sink();
     let mut c = cfg(MinerAction::Start);
@@ -136,7 +138,7 @@ async fn concurrency_is_bounded() {
 
 #[tokio::test(start_paused = true)]
 async fn dispatches_are_staggered() {
-    let miners = (1..=4).map(|n| (n, ALL, MockBehavior::Ok)).collect();
+    let miners = (1..=4).map(|n| (n, all_caps(), MockBehavior::Ok)).collect();
     let (f, log) = setup(miners, 0);
     let (sink, _) = collecting_sink();
     let mut c = cfg(MinerAction::Stop);
@@ -151,7 +153,7 @@ async fn dispatches_are_staggered() {
 
 #[tokio::test(start_paused = true)]
 async fn cancel_stops_pending_miners() {
-    let miners = (1..=5).map(|n| (n, ALL, MockBehavior::Ok)).collect();
+    let miners = (1..=5).map(|n| (n, all_caps(), MockBehavior::Ok)).collect();
     let (f, log) = setup(miners, 0);
     let (sink, _) = collecting_sink();
     let mut c = cfg(MinerAction::Reboot);
@@ -169,7 +171,7 @@ async fn cancel_stops_pending_miners() {
 
 #[tokio::test]
 async fn events_queued_then_sent_then_terminal_in_input_order() {
-    let (f, _) = setup(vec![(1, ALL, MockBehavior::Ok), (2, ALL, MockBehavior::Ok)], 0);
+    let (f, _) = setup(vec![(1, all_caps(), MockBehavior::Ok), (2, all_caps(), MockBehavior::Ok)], 0);
     let (sink, events) = collecting_sink();
     let r = run_action(vec![ip(2), ip(1)], cfg(MinerAction::Start), f, CancellationToken::new(), sink).await;
     assert_eq!(r[0].ip, "192.0.2.2");

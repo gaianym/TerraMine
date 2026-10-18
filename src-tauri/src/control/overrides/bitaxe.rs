@@ -1,10 +1,12 @@
 //! Bitaxe / AxeOS HTTP override.
 //!
-//! asic-rs 0.4.2 reports `supports_restart = false` for Bitaxe backends,
-//! but live hardware accepts `POST /api/system/restart` (200). Pause and
-//! resume arrived later as `POST /api/system/pause` and `/api/system/resume`
-//! and need AxeOS >= [`PAUSE_RESUME_MIN`] (2.14). Fleet devices still on
-//! 2.10 therefore advertise reboot only.
+//! asic-rs (0.8.6, `v2_14_0` backend) reports `supports_restart = false`
+//! for Bitaxe, but live hardware accepts `POST /api/system/restart` (200),
+//! so reboot stays on this override. Pause/resume (`POST /api/system/pause`
+//! and `/resume`, AxeOS >= [`PAUSE_RESUME_MIN`] = 2.14) are sent natively
+//! through asic-rs when it has a backend for the firmware (fleet devices
+//! are on 2.15.3); this override covers them only as a fallback. Devices
+//! below 2.14 advertise reboot only.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -15,7 +17,7 @@ use semver::Version;
 use serde_json::Value;
 
 use crate::control::cache::DriverKind;
-use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, MinerStatus, Observation};
+use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, MinerStatus, Observation, Route};
 use crate::control::safety::axeos::{health_from_info, AxeOsSettings};
 use crate::control::safety::settings::{HealthSample, SettingsDriver};
 use crate::control::safety::DeviceProfile;
@@ -113,6 +115,17 @@ impl BitaxeDriver {
         Ok(status.is_success() || status.as_u16() == 204)
     }
 }
+
+impl BitaxeDriver {
+    /// asic-rs 0.8.6 has a native backend (`v2_14_0`) for this firmware:
+    /// it parses `version` strictly, so require a clean >= 2.14 version.
+    pub fn native_backend_available(&self) -> bool {
+        self.version.as_ref().is_some_and(|v| *v >= ASIC_RS_NATIVE_MIN)
+    }
+}
+
+/// First AxeOS version asic-rs 0.8.6 drives natively (pause/resume).
+pub const ASIC_RS_NATIVE_MIN: Version = Version::new(2, 14, 0);
 
 impl MinerDriver for BitaxeDriver {
     fn ip(&self) -> IpAddr {
@@ -229,11 +242,8 @@ pub fn parse_loose_version(s: &str) -> Option<Version> {
 /// Capability matrix used by the driver and by unit tests.
 pub fn axeos_caps(version: Option<&Version>, pause_probe_ok: bool) -> Capabilities {
     let pause = pause_probe_ok || version.map(|v| *v >= PAUSE_RESUME_MIN).unwrap_or(false);
-    Capabilities {
-        start: pause,
-        stop: pause,
-        reboot: true, // live: POST /api/system/restart returns 200 even on 2.10
-    }
+    // Reboot: live POST /api/system/restart returns 200 even on 2.10.
+    Capabilities::flags(pause, pause, true, Route::Axeos)
 }
 
 /// Convenience: build caps for a version string.

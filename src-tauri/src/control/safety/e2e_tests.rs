@@ -519,3 +519,26 @@ async fn e2e_device_failures_not_flagged_external_when_controls_healthy() {
     assert!(!a.likely_external && a.external_note.is_none());
     assert_eq!(a.headline, "1 of 2 rolled back");
 }
+
+/// Permanent: a 2.15 Bitaxe rebuilt from the discovery cache keeps native
+/// (asic-rs) pause/resume, reboot on the AxeOS override, and AxeOS
+/// identity / health / settings, with no identification.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_cached_bitaxe_215_keeps_native_route_and_axeos_identity() {
+    use crate::control::cache::DriverKind;
+    use crate::control::driver::Route;
+    let r = rig().await;
+    r.cache.put(IpAddr::from(AXE), r.factory.discovered(IpAddr::from(AXE)).unwrap());
+    let t = target(&r, AXE).await;
+    let caps = t.driver.caps();
+    assert_eq!(caps.route(MinerAction::Stop), Some(Route::AsicRs));
+    assert_eq!(caps.route(MinerAction::Start), Some(Route::AsicRs));
+    assert_eq!(caps.route(MinerAction::Reboot), Some(Route::Axeos));
+    assert_eq!(t.driver.kind(), DriverKind::AxeOs, "cache rebuilds the same composite");
+    assert_eq!(t.profile.class, DeviceClass::AxeOs);
+    assert!(t.driver.health().await.hashrate_ghs.is_some(), "health from AxeOS info");
+    assert_eq!(r.factory.connects(), 0);
+    let o = r.engine.apply_settings("run", &t, &apply(freq(575))).await;
+    assert_eq!(o.status, WriteStatus::Verified, "{o:?}");
+    assert_eq!(o.paths_tried, ["axeos-http: selected"]);
+}

@@ -265,7 +265,7 @@ impl MinerDriver for DevMiner {
         self.ip
     }
     fn caps(&self) -> Capabilities {
-        Capabilities { start: true, stop: true, reboot: true }
+        Capabilities::flags(true, true, true, crate::control::driver::Route::Mock)
     }
     fn execute(&self, _: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>> {
         Box::pin(async { Ok(true) })

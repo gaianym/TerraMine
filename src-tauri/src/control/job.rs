@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use super::cache::{DeviceCache, Resolved, Resolver};
-use super::driver::{DriverFactory, MinerAction, MinerDriver, MinerStatus};
+use super::driver::{DriverFactory, MinerAction, MinerDriver, MinerStatus, Route};
 use super::safety::audit::{now_ms, AuditRecord, AuditSink, NullAudit};
 use super::safety::{preflight, ActionKind, Confirmation, DeviceProfile};
 
@@ -38,6 +38,9 @@ pub struct ActionRowEvent {
     pub action: MinerAction,
     pub status: ActionStatus,
     pub msg: Option<String>,
+    /// Route the action was sent on (set once the capability gate passed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<Route>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +114,14 @@ fn audit(ctx: &SafetyCtx, cfg: &JobConfig, e: &ActionRowEvent, t: &Trace, phase:
 }
 
 fn ev(ip: IpAddr, action: MinerAction, status: ActionStatus, msg: Option<String>) -> ActionRowEvent {
-    ActionRowEvent { ip: ip.to_string(), action, status, msg }
+    ActionRowEvent { ip: ip.to_string(), action, status, msg, route: None }
+}
+
+impl ActionRowEvent {
+    fn via(mut self, route: Route) -> Self {
+        self.route = Some(route);
+        self
+    }
 }
 
 /// Runs `cfg.action` against every IP. Returns the final event per IP, in input order.
@@ -205,11 +215,13 @@ async fn one(
         Resolved::Failed(e) => return ev(ip, action, ActionStatus::Failed, Some(e)),
     };
     trace.profile = Some(driver.profile());
-    if !driver.caps().supports(action) {
+    // Capability gate: the per-action route decides whether (and how) the
+    // action is sent.
+    let Some(route) = driver.caps().route(action) else {
         return ev(ip, action, ActionStatus::Unsupported, None);
-    }
+    };
     if cfg.dry_run {
-        return ev(ip, action, ActionStatus::DryRun, None);
+        return ev(ip, action, ActionStatus::DryRun, None).via(route);
     }
     // Baseline uptime so a reboot can be proven by a lower value afterwards
     // (reuses the identity read when it carried uptime).
@@ -222,7 +234,7 @@ async fn one(
         None
     };
     trace.pre_state = before;
-    let sent_ev = ev(ip, action, ActionStatus::Sent, None);
+    let sent_ev = ev(ip, action, ActionStatus::Sent, None).via(route);
     audit(ctx, cfg, &sent_ev, trace, "attempt");
     sink(sent_ev);
     let reboot = action == MinerAction::Reboot;
@@ -235,14 +247,15 @@ async fn one(
         Ok(Err(e)) => ev(ip, action, ActionStatus::Failed, Some(e.to_string())),
         Err(_) if reboot => ev(ip, action, ActionStatus::Rebooting, Some("assumed rebooting: timeout".into())),
         Err(_) => ev(ip, action, ActionStatus::Failed, Some("timeout".into())),
-    };
+    }
+    .via(route);
     let Some(vcfg) = &cfg.verify else { return sent };
     if !matches!(sent.status, ActionStatus::Ok | ActionStatus::Rebooting) {
         return sent;
     }
-    sink(ev(ip, action, ActionStatus::Verifying, None));
+    sink(ev(ip, action, ActionStatus::Verifying, None).via(route));
     // Same driver for every poll: no reconnect / re-identification.
-    verify(ip, action, before, vcfg, cfg.timeout, driver.as_ref()).await
+    verify(ip, action, before, vcfg, cfg.timeout, driver.as_ref()).await.via(route)
 }
 
 /// Outcome of comparing a fresh status against what the action should produce.

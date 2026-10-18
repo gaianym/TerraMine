@@ -4,9 +4,13 @@
 //! - "stop" = pause/sleep (miner stays reachable), "start" = resume.
 //! - Default path is asic-rs via [`AsicRsDriver`]. Live overrides for
 //!   Bitaxe/AxeOS and stock Antminer S9 live in [`super::overrides`].
+//! - Capabilities are a per-action map of routes. asic-rs (native) is
+//!   preferred; an override is used only for actions asic-rs does not
+//!   support on that firmware (e.g. Bitaxe reboot on asic-rs 0.8.6).
 //! - A reboot often drops the connection before replying, so a transport
 //!   error or timeout on reboot is reported as "probably rebooting".
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 #[cfg(test)]
@@ -16,14 +20,15 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::cache::{CachedDevice, DriverKind};
 use super::overrides::{BitaxeDriver, DigestCredentials, S9StockDriver};
 use super::safety::settings::{HealthSample, SettingsDriver};
 use super::safety::DeviceProfile;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MinerAction {
     Start,
@@ -31,20 +36,89 @@ pub enum MinerAction {
     Reboot,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+impl MinerAction {
+    pub const ALL: [MinerAction; 3] = [MinerAction::Start, MinerAction::Stop, MinerAction::Reboot];
+}
+
+/// How an action reaches the miner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Route {
+    /// asic-rs native support (`supports_*()` is true).
+    AsicRs,
+    /// AxeOS HTTP override (Bitaxe / NerdAxe).
+    Axeos,
+    /// Stock Antminer S9 CGI override.
+    S9Cgi,
+    /// Test double.
+    Mock,
+}
+
+/// Per-action capability map: an action is supported iff it has a route.
+///
+/// Serialized for the UI as `{start, stop, reboot}` booleans (unchanged
+/// shape) plus `routes: {action: route}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capabilities {
-    pub start: bool,
-    pub stop: bool,
-    pub reboot: bool,
+    routes: BTreeMap<MinerAction, Route>,
 }
 
 impl Capabilities {
-    pub fn supports(&self, action: MinerAction) -> bool {
-        match action {
-            MinerAction::Start => self.start,
-            MinerAction::Stop => self.stop,
-            MinerAction::Reboot => self.reboot,
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Same route for every supported action.
+    pub fn flags(start: bool, stop: bool, reboot: bool, route: Route) -> Self {
+        let mut c = Self::none();
+        for (a, on) in [(MinerAction::Start, start), (MinerAction::Stop, stop), (MinerAction::Reboot, reboot)] {
+            if on {
+                c.routes.insert(a, route);
+            }
         }
+        c
+    }
+
+    pub fn with(mut self, action: MinerAction, route: Route) -> Self {
+        self.routes.insert(action, route);
+        self
+    }
+
+    pub fn supports(&self, action: MinerAction) -> bool {
+        self.routes.contains_key(&action)
+    }
+
+    pub fn route(&self, action: MinerAction) -> Option<Route> {
+        self.routes.get(&action).copied()
+    }
+
+    pub fn routes(&self) -> &BTreeMap<MinerAction, Route> {
+        &self.routes
+    }
+
+    /// (start, stop, reboot) support flags.
+    pub fn as_flags(&self) -> (bool, bool, bool) {
+        (self.supports(MinerAction::Start), self.supports(MinerAction::Stop), self.supports(MinerAction::Reboot))
+    }
+
+    /// Per action: `native` when it supports it, else `fallback`.
+    pub fn prefer(native: &Self, fallback: &Self) -> Self {
+        let mut c = fallback.clone();
+        for (a, r) in &native.routes {
+            c.routes.insert(*a, *r);
+        }
+        c
+    }
+}
+
+impl Serialize for Capabilities {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let mut m = ser.serialize_map(Some(4))?;
+        m.serialize_entry("start", &self.supports(MinerAction::Start))?;
+        m.serialize_entry("stop", &self.supports(MinerAction::Stop))?;
+        m.serialize_entry("reboot", &self.supports(MinerAction::Reboot))?;
+        m.serialize_entry("routes", &self.routes)?;
+        m.end()
     }
 }
 
@@ -172,11 +246,12 @@ impl MinerDriver for AsicRsDriver {
         self.ip
     }
     fn caps(&self) -> Capabilities {
-        Capabilities {
-            start: self.miner.supports_resume(),
-            stop: self.miner.supports_pause(),
-            reboot: self.miner.supports_restart(),
-        }
+        Capabilities::flags(
+            self.miner.supports_resume(),
+            self.miner.supports_pause(),
+            self.miner.supports_restart(),
+            Route::AsicRs,
+        )
     }
     fn execute(&self, action: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>> {
         Box::pin(async move {
@@ -238,6 +313,87 @@ impl DriverFactory for AsicRsFactory {
     }
 }
 
+// ---------------- composite: native first, override for the gaps ----------------
+
+/// asic-rs for every action it supports; the override for the rest.
+pub struct CompositeDriver {
+    ip: IpAddr,
+    native: Box<dyn MinerDriver>,
+    fallback: Box<dyn MinerDriver>,
+}
+
+impl CompositeDriver {
+    pub fn new(ip: IpAddr, native: Box<dyn MinerDriver>, fallback: Box<dyn MinerDriver>) -> Self {
+        Self { ip, native, fallback }
+    }
+}
+
+impl MinerDriver for CompositeDriver {
+    fn ip(&self) -> IpAddr {
+        self.ip
+    }
+    fn caps(&self) -> Capabilities {
+        Capabilities::prefer(&self.native.caps(), &self.fallback.caps())
+    }
+    fn execute(&self, action: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>> {
+        if self.native.caps().supports(action) {
+            self.native.execute(action)
+        } else {
+            self.fallback.execute(action)
+        }
+    }
+    /// The override's status read is the one verification was built on.
+    fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
+        Box::pin(async move {
+            match self.fallback.status().await {
+                Ok(s) => Ok(s),
+                Err(_) => self.native.status().await,
+            }
+        })
+    }
+    // Identity, health and cache kind come from the override (one cheap
+    // read with MAC, version, temp and hashrate), so the cache rebuilds
+    // this same composite.
+    fn profile(&self) -> DeviceProfile {
+        self.fallback.profile()
+    }
+    fn kind(&self) -> DriverKind {
+        self.fallback.kind()
+    }
+    fn observe(&self) -> BoxFuture<'_, anyhow::Result<Option<Observation>>> {
+        self.fallback.observe()
+    }
+    fn health(&self) -> BoxFuture<'_, HealthSample> {
+        self.fallback.health()
+    }
+    /// asic-rs backends first, then the override's.
+    fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
+        let mut v = self.native.settings_backends();
+        v.extend(self.fallback.settings_backends());
+        v
+    }
+}
+
+/// asic-rs 0.8.6 native Bitaxe miner for AxeOS >= 2.14 (`v2_14_0`
+/// backend: native pause/resume, no restart). Two GETs, no full scan.
+async fn native_bitaxe(ip: IpAddr, timeout: Duration) -> Option<Box<dyn MinerDriver>> {
+    use asic_rs::core::traits::entry::FirmwareEntry;
+    let fw = asic_rs::bitaxe::firmware::BitaxeFirmware {};
+    let m = tokio::time::timeout(timeout, fw.build_miner(ip, None)).await.ok()?.ok()?;
+    Some(Box::new(AsicRsDriver::new(ip, m)))
+}
+
+/// Wrap a Bitaxe override with the asic-rs native driver when the
+/// firmware has one; otherwise the override alone.
+pub async fn bitaxe_with_native(ip: IpAddr, d: BitaxeDriver, timeout: Duration) -> Box<dyn MinerDriver> {
+    if d.native_backend_available() {
+        if let Some(native) = native_bitaxe(ip, timeout).await {
+            return Box::new(CompositeDriver::new(ip, native, Box::new(d)));
+        }
+    }
+    Box::new(d)
+}
+
 // ---------------- overlay factory (asic-rs + live overrides) ----------------
 
 /// Tries Bitaxe HTTP and stock-S9 CGI overrides first, then asic-rs.
@@ -287,10 +443,16 @@ impl DriverFactory for OverlayFactory {
                 DriverKind::AxeOs => {
                     let client = reqwest::Client::builder().timeout(self.timeout).no_proxy().build()?;
                     let version = c.firmware().and_then(super::overrides::bitaxe::parse_loose_version);
-                    Some(Box::new(
-                        BitaxeDriver::from_parts(ip, format!("http://{ip}"), client, version, false)
-                            .with_asic_model(c.profile.chip.clone()),
-                    ) as Box<dyn MinerDriver>)
+                    let d = BitaxeDriver::from_parts(ip, format!("http://{ip}"), client, version, false)
+                        .with_asic_model(c.profile.chip.clone());
+                    // Native first: reuse discovery's asic-rs miner when it has one.
+                    match &c.miner {
+                        Some(m) if d.native_backend_available() => {
+                            let native = Box::new(AsicRsDriver::from_shared(ip, m.clone()));
+                            Some(Box::new(CompositeDriver::new(ip, native, Box::new(d))) as Box<dyn MinerDriver>)
+                        }
+                        _ => Some(bitaxe_with_native(ip, d, self.timeout).await),
+                    }
                 }
                 DriverKind::S9Stock => S9StockDriver::probe(ip, self.s9_creds.clone(), self.timeout)
                     .await?
@@ -306,7 +468,7 @@ impl DriverFactory for OverlayFactory {
     fn connect(&self, ip: IpAddr) -> BoxFuture<'_, anyhow::Result<Option<Box<dyn MinerDriver>>>> {
         Box::pin(async move {
             if let Some(d) = BitaxeDriver::probe(ip, self.timeout).await? {
-                return Ok(Some(Box::new(d) as Box<dyn MinerDriver>));
+                return Ok(Some(bitaxe_with_native(ip, d, self.timeout).await));
             }
             if let Some(d) =
                 S9StockDriver::probe(ip, self.s9_creds.clone(), self.timeout).await?
@@ -320,7 +482,9 @@ impl DriverFactory for OverlayFactory {
                 let model = info.model.to_ascii_lowercase();
                 if make.contains("bitaxe") || make.contains("nerdaxe") {
                     if let Some(d) = BitaxeDriver::probe(ip, self.timeout).await? {
-                        return Ok(Some(Box::new(d) as Box<dyn MinerDriver>));
+                        // Reuse the miner asic-rs already identified.
+                        let native = Box::new(AsicRsDriver::new(ip, m));
+                        return Ok(Some(Box::new(CompositeDriver::new(ip, native, Box::new(d))) as Box<dyn MinerDriver>));
                     }
                 }
                 if make.contains("antminer") && model.contains("s9") {
@@ -372,7 +536,7 @@ impl MinerDriver for MockDriver {
         self.ip
     }
     fn caps(&self) -> Capabilities {
-        self.caps
+        self.caps.clone()
     }
     fn execute(&self, action: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>> {
         Box::pin(async move {
