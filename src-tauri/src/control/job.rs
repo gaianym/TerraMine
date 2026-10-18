@@ -9,7 +9,7 @@ use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use super::driver::{DriverFactory, MinerAction, MinerStatus};
+use super::driver::{DriverFactory, MinerAction, MinerStatus, Route};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -35,6 +35,9 @@ pub struct ActionRowEvent {
     pub action: MinerAction,
     pub status: ActionStatus,
     pub msg: Option<String>,
+    /// Route the action was sent on (set once the capability gate passed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<Route>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,7 +62,14 @@ pub struct VerifyConfig {
 pub type Sink = Arc<dyn Fn(ActionRowEvent) + Send + Sync>;
 
 fn ev(ip: IpAddr, action: MinerAction, status: ActionStatus, msg: Option<String>) -> ActionRowEvent {
-    ActionRowEvent { ip: ip.to_string(), action, status, msg }
+    ActionRowEvent { ip: ip.to_string(), action, status, msg, route: None }
+}
+
+impl ActionRowEvent {
+    fn via(mut self, route: Route) -> Self {
+        self.route = Some(route);
+        self
+    }
 }
 
 /// Runs `cfg.action` against every IP. Returns the final event per IP, in input order.
@@ -115,11 +125,13 @@ async fn one(ip: IpAddr, cfg: &JobConfig, factory: &dyn DriverFactory, sink: &Si
         Ok(Err(e)) => return ev(ip, action, ActionStatus::Failed, Some(e.to_string())),
         Err(_) => return ev(ip, action, ActionStatus::NotFound, Some("connect timeout".into())),
     };
-    if !driver.caps().supports(action) {
+    // Capability gate: the per-action route decides whether (and how) the
+    // action is sent.
+    let Some(route) = driver.caps().route(action) else {
         return ev(ip, action, ActionStatus::Unsupported, None);
-    }
+    };
     if cfg.dry_run {
-        return ev(ip, action, ActionStatus::DryRun, None);
+        return ev(ip, action, ActionStatus::DryRun, None).via(route);
     }
     // Baseline uptime so a reboot can be proven by a lower value afterwards.
     let before = if cfg.verify.is_some() && action == MinerAction::Reboot {
@@ -127,7 +139,7 @@ async fn one(ip: IpAddr, cfg: &JobConfig, factory: &dyn DriverFactory, sink: &Si
     } else {
         None
     };
-    sink(ev(ip, action, ActionStatus::Sent, None));
+    sink(ev(ip, action, ActionStatus::Sent, None).via(route));
     let reboot = action == MinerAction::Reboot;
     let sent = match tokio::time::timeout(cfg.timeout, driver.execute(action)).await {
         Ok(Ok(true)) if reboot => ev(ip, action, ActionStatus::Rebooting, None),
@@ -138,14 +150,15 @@ async fn one(ip: IpAddr, cfg: &JobConfig, factory: &dyn DriverFactory, sink: &Si
         Ok(Err(e)) => ev(ip, action, ActionStatus::Failed, Some(e.to_string())),
         Err(_) if reboot => ev(ip, action, ActionStatus::Rebooting, Some("assumed rebooting: timeout".into())),
         Err(_) => ev(ip, action, ActionStatus::Failed, Some("timeout".into())),
-    };
+    }
+    .via(route);
     drop(driver);
     let Some(vcfg) = &cfg.verify else { return sent };
     if !matches!(sent.status, ActionStatus::Ok | ActionStatus::Rebooting) {
         return sent;
     }
-    sink(ev(ip, action, ActionStatus::Verifying, None));
-    verify(ip, action, before, vcfg, cfg.timeout, factory).await
+    sink(ev(ip, action, ActionStatus::Verifying, None).via(route));
+    verify(ip, action, before, vcfg, cfg.timeout, factory).await.via(route)
 }
 
 /// Outcome of comparing a fresh status against what the action should produce.

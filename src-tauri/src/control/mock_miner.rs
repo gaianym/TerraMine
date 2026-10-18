@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::driver::{DriverFactory, MinerDriver};
+use super::driver::{Capabilities, CompositeDriver, DriverFactory, MinerAction, MinerDriver, Route};
 use super::overrides::{BitaxeDriver, DigestCredentials, S9StockDriver};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,6 +322,38 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
     }
 }
 
+/// Stand-in for the asic-rs 0.8.6 `v2_14_0` Bitaxe backend on a mock.
+/// asic-rs hardcodes port 80, so it cannot reach a mock on a random local
+/// port; this mirrors that backend exactly: `supports_pause/resume() =
+/// true`, `supports_restart() = false`, and the same `POST
+/// /api/system/pause|resume` calls (asic-rs-firmwares-bitaxe 0.8.6,
+/// backends/v2_14_0/{mod.rs,web.rs}).
+pub struct MockNativeBitaxe {
+    ip: IpAddr,
+    base: String,
+    client: reqwest::Client,
+}
+
+impl MinerDriver for MockNativeBitaxe {
+    fn ip(&self) -> IpAddr {
+        self.ip
+    }
+    fn caps(&self) -> Capabilities {
+        Capabilities::flags(true, true, false, Route::AsicRs)
+    }
+    fn execute(&self, action: MinerAction) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move {
+            let path = match action {
+                MinerAction::Stop => "system/pause",
+                MinerAction::Start => "system/resume",
+                MinerAction::Reboot => anyhow::bail!("restart not supported by asic-rs v2_14_0"),
+            };
+            self.client.post(format!("{}/api/{path}", self.base)).send().await?.error_for_status()?;
+            Ok(true)
+        })
+    }
+}
+
 /// Factory that maps fake IPs to mock miners on 127.0.0.1 ports.
 pub struct MockMinerFactory {
     pub timeout: Duration,
@@ -342,9 +374,16 @@ impl DriverFactory for MockMinerFactory {
         Box::pin(async move {
             let Some((kind, base, cg, creds)) = self.miners.get(&ip).cloned() else { return Ok(None) };
             Ok(match kind {
-                MockKind::AxeOs210 | MockKind::AxeOs215 => BitaxeDriver::probe_at(ip, base, self.timeout)
-                    .await?
-                    .map(|d| Box::new(d) as Box<dyn MinerDriver>),
+                MockKind::AxeOs210 | MockKind::AxeOs215 => match BitaxeDriver::probe_at(ip, base.clone(), self.timeout).await? {
+                    // Same composition as the app: native first, AxeOS override for the gaps.
+                    Some(d) if d.native_backend_available() => {
+                        let client = reqwest::Client::builder().timeout(self.timeout).no_proxy().build()?;
+                        let native = Box::new(MockNativeBitaxe { ip, base, client });
+                        Some(Box::new(CompositeDriver::new(ip, native, Box::new(d))) as Box<dyn MinerDriver>)
+                    }
+                    Some(d) => Some(Box::new(d) as Box<dyn MinerDriver>),
+                    None => None,
+                },
                 MockKind::S9Stock { .. } => S9StockDriver::probe_at(ip, base, creds, self.timeout)
                     .await?
                     .map(|d| {

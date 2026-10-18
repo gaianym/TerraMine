@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::driver::MinerAction;
+use super::driver::{DriverFactory, MinerAction, Route};
 use super::job::{run_action, ActionRowEvent, ActionStatus, JobConfig, Sink, VerifyConfig};
 use super::mock_miner::{MockKind, MockMiner, MockMinerFactory};
 
@@ -128,4 +128,72 @@ async fn e2e_s9_wrong_password_never_reboots() {
     let r = run_action(vec![IpAddr::from(S9)], cfg(MinerAction::Reboot), Arc::new(f), CancellationToken::new(), s).await;
     assert!(matches!(r[0].status, ActionStatus::NotFound | ActionStatus::Failed), "{:?}", r[0]);
     assert_eq!(m.reboots(), 0);
+}
+
+// ---------------- capability map (asic-rs 0.8.6) ----------------
+
+fn final_for(r: &[ActionRowEvent], ip: [u8; 4]) -> ActionRowEvent {
+    by_ip(r, ip)
+}
+
+/// Permanent regression: fleet Bitaxes on AxeOS 2.15.3 use the asic-rs
+/// `v2_14_0` backend natively for pause/resume (no longer reboot-only);
+/// reboot, which asic-rs does not support there, stays on the AxeOS
+/// override.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_axeos_215_pause_resume_native_reboot_via_override() {
+    let f = fleet().await;
+    let caps = f.factory.connect(IpAddr::from(AXE215)).await.unwrap().unwrap().caps();
+    assert_eq!(caps.route(MinerAction::Stop), Some(Route::AsicRs));
+    assert_eq!(caps.route(MinerAction::Start), Some(Route::AsicRs));
+    assert_eq!(caps.route(MinerAction::Reboot), Some(Route::Axeos));
+
+    for (action, paused) in [(MinerAction::Stop, true), (MinerAction::Start, false)] {
+        let (s, events) = sink();
+        let r = run_action(vec![IpAddr::from(AXE215)], cfg(action), f.factory.clone(), CancellationToken::new(), s).await;
+        let e = final_for(&r, AXE215);
+        assert_eq!(e.status, ActionStatus::Verified, "{action:?}: {e:?}");
+        assert_eq!(e.route, Some(Route::AsicRs), "{action:?} sent natively");
+        assert!(events.lock().unwrap().iter().filter(|e| e.status == ActionStatus::Sent).all(|e| e.route == Some(Route::AsicRs)));
+        assert_eq!(f.axe215.paused(), paused);
+    }
+    let (s, _) = sink();
+    let r = run_action(vec![IpAddr::from(AXE215)], cfg(MinerAction::Reboot), f.factory.clone(), CancellationToken::new(), s).await;
+    let e = final_for(&r, AXE215);
+    assert_eq!(e.status, ActionStatus::Verified, "{e:?}");
+    assert_eq!(e.route, Some(Route::Axeos), "reboot stays on the override");
+    assert_eq!(f.axe215.reboots(), 1);
+}
+
+/// AxeOS 2.10 has no asic-rs native backend for pause: still reboot-only,
+/// and stop/start are refused before anything is sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_axeos_210_stays_reboot_only_via_override() {
+    let f = fleet().await;
+    for action in [MinerAction::Stop, MinerAction::Start] {
+        let (s, _) = sink();
+        let r = run_action(vec![IpAddr::from(AXE210)], cfg(action), f.factory.clone(), CancellationToken::new(), s).await;
+        let e = final_for(&r, AXE210);
+        assert_eq!(e.status, ActionStatus::Unsupported, "{e:?}");
+        assert_eq!(e.route, None);
+    }
+    assert!(!f.axe210.paused());
+    let (s, _) = sink();
+    let r = run_action(vec![IpAddr::from(AXE210)], cfg(MinerAction::Reboot), f.factory.clone(), CancellationToken::new(), s).await;
+    assert_eq!(final_for(&r, AXE210).route, Some(Route::Axeos));
+    assert_eq!(f.axe210.reboots(), 1);
+}
+
+/// Stock S9 keeps its CGI override for every action.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_s9_routes_through_cgi_override() {
+    let f = fleet().await;
+    let caps = f.factory.connect(IpAddr::from(S9_MODE)).await.unwrap().unwrap().caps();
+    assert!(MinerAction::ALL.iter().all(|a| caps.route(*a) == Some(Route::S9Cgi)), "{caps:?}");
+    let caps = f.factory.connect(IpAddr::from(S9)).await.unwrap().unwrap().caps();
+    assert_eq!(caps.as_flags(), (false, false, true));
+    let (s, _) = sink();
+    let r = run_action(vec![IpAddr::from(S9_MODE)], cfg(MinerAction::Stop), f.factory.clone(), CancellationToken::new(), s).await;
+    assert_eq!(final_for(&r, S9_MODE).route, Some(Route::S9Cgi));
+    assert!(f.s9_mode.paused());
 }

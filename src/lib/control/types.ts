@@ -15,7 +15,16 @@ export type ActionStatus =
   | "verified"
   | "unverified";
 
-export type Capabilities = { start: boolean; stop: boolean; reboot: boolean };
+/** How an action reaches the miner: asic-rs natively, or an override. */
+export type Route = "asic-rs" | "axeos" | "s9-cgi" | "mock";
+
+/** Support flags plus the per-action route (absent = unsupported). */
+export type Capabilities = {
+  start: boolean;
+  stop: boolean;
+  reboot: boolean;
+  routes?: Partial<Record<MinerAction, Route>>;
+};
 
 export type CapsRow = { ip: string; found: boolean; caps: Capabilities };
 
@@ -24,6 +33,8 @@ export type ActionRowEvent = {
   action: MinerAction;
   status: ActionStatus;
   msg: string | null;
+  /** Route the action was sent on, once the capability gate passed. */
+  route?: Route;
 };
 
 export type DoneEvent = { run_id: string; results: ActionRowEvent[] };
