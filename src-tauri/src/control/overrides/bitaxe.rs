@@ -14,7 +14,10 @@
 //! openapi.yaml): the screen says "Hi!" for 30 s. It is a toggle with no
 //! readable state, so TerraMine only offers it as "light on" (never as
 //! "off": a second call would toggle, and it expires by itself), cannot
-//! read it back, and keeps it dry-run only until confirmed on hardware.
+//! read it back. It is hardware-confirmed on AxeOS 2.15.x (one Bitaxe
+//! Gamma on v2.15.3, Oct 17 2026: HTTP 2xx, still hashing, no pause, no
+//! reboot; see `tests/hw_bitaxe_identify.rs`) and stays dry-run only on
+//! every other version until checked there.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -34,6 +37,8 @@ use crate::control::safety::DeviceProfile;
 pub const PAUSE_RESUME_MIN: Version = Version::new(2, 14, 0);
 /// First ESP-Miner release with `POST /api/system/identify`.
 pub const IDENTIFY_MIN: Version = Version::new(2, 12, 0);
+/// AxeOS `major.minor` lines where identify is confirmed on real hardware.
+pub const IDENTIFY_HW_CONFIRMED: [(u64, u64); 1] = [(2, 15)];
 
 #[derive(Debug, Clone)]
 pub struct BitaxeDriver {
@@ -169,9 +174,14 @@ impl MinerDriver for BitaxeDriver {
 
     fn paths_tried(&self, action: MinerAction) -> Vec<String> {
         let msg = match action {
-            MinerAction::LightOn if self.identify_supported() => {
-                "axeos-http: POST /api/system/identify (30 s on-screen \"Hi!\", no read-back; not yet confirmed on hardware)".to_string()
-            }
+            MinerAction::LightOn if self.identify_supported() => format!(
+                "axeos-http: POST /api/system/identify (30 s on-screen \"Hi!\", no read-back; {})",
+                if identify_hw_confirmed(self.version.as_ref()) {
+                    "hardware-confirmed on this AxeOS line"
+                } else {
+                    "not yet confirmed on hardware"
+                }
+            ),
             MinerAction::LightOn => format!(
                 "axeos-http: no identify endpoint before AxeOS {IDENTIFY_MIN} (device reports {})",
                 self.version.as_ref().map_or("no version".to_string(), |v| v.to_string())
@@ -280,11 +290,18 @@ pub fn axeos_caps(version: Option<&Version>, pause_probe_ok: bool) -> Capabiliti
     let pause = pause_probe_ok || version.map(|v| *v >= PAUSE_RESUME_MIN).unwrap_or(false);
     // Reboot: live POST /api/system/restart returns 200 even on 2.10.
     let c = Capabilities::flags(pause, pause, true, Route::Axeos);
-    if identify_supported(version) {
+    if identify_hw_confirmed(version) {
+        c.with(MinerAction::LightOn, Route::Axeos)
+    } else if identify_supported(version) {
         c.with_unconfirmed(MinerAction::LightOn, Route::Axeos)
     } else {
         c
     }
+}
+
+/// Identify has been sent live and checked on this firmware line.
+pub fn identify_hw_confirmed(version: Option<&Version>) -> bool {
+    identify_supported(version) && version.is_some_and(|v| IDENTIFY_HW_CONFIRMED.contains(&(v.major, v.minor)))
 }
 
 pub fn identify_supported(version: Option<&Version>) -> bool {

@@ -496,10 +496,23 @@ async fn e2e_external_outage_is_flagged() {
     let mut o = batch_opts(2, None);
     o.controls = controls.to_vec();
     let ctl: Vec<Arc<MockMiner>> = fl.miners[2..].to_vec();
+    let changed: Vec<Arc<MockMiner>> = fl.miners[..2].to_vec();
     let outage = tokio::spawn(async move {
-        // After the controls' baseline sample (40 ms interval), well inside
-        // the job (the write includes a restart).
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Start the outage from events, not a fixed delay (a fixed 300 ms
+        // flaked on a slow CI runner): once both job miners were written
+        // (inside their watch windows) and the control sampler has polled
+        // every control at least twice more (so its pre-outage baseline is
+        // taken and the loop is running).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while changed.iter().any(|m| m.writes() == 0) {
+            assert!(tokio::time::Instant::now() < deadline, "job miners never written");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let seen: Vec<usize> = ctl.iter().map(|m| m.requests().len()).collect();
+        while ctl.iter().zip(&seen).any(|(m, n)| m.requests().len() < n + 2) {
+            assert!(tokio::time::Instant::now() < deadline, "controls never sampled");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         for m in &ctl {
             m.set_outage(true);
         }
