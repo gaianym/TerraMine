@@ -16,7 +16,7 @@ use futures::future::BoxFuture;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 
-use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus};
+use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus, Route};
 use crate::control::overrides::auth::DigestCredentials;
 
 #[derive(Debug, Clone)]
@@ -125,11 +125,7 @@ impl S9StockDriver {
     }
 
     pub fn caps_for(has_miner_mode: bool) -> Capabilities {
-        Capabilities {
-            start: has_miner_mode,
-            stop: has_miner_mode,
-            reboot: true,
-        }
+        Capabilities::flags(has_miner_mode, has_miner_mode, true, Route::S9Cgi)
     }
 
     async fn digest_get(&self, path: &str) -> anyhow::Result<(StatusCode, Option<Value>)> {
