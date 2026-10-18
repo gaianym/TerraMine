@@ -76,3 +76,45 @@ describe("SafetyAlertBanner", () => {
     expect(body).not.toContain("tm-safety-alert");
   });
 });
+
+describe("fault light (PR B)", () => {
+  for (const action of ["light_on", "light_off"] as const) {
+    it(`${action} dialog opens with Dry run checked and explains the light`, () => {
+      const { body } = render(ActionDialog, { props: { ips: ["192.0.2.30", "192.0.2.31"], action, onclose: () => {} } });
+      expect(dryRunInput(body)).toMatch(/\schecked(\s|=|>|\/)/);
+      expect(body).toMatch(/>\s*Dry run\s*<\/button>/);
+      expect(body).toContain('data-testid="tm-light-note"');
+    });
+  }
+
+  it("lists unsupported miners with the paths tried and flags dry-run-only routes", () => {
+    control.capsByIp = {
+      "192.0.2.40": {
+        ip: "192.0.2.40",
+        found: true,
+        caps: { start: true, stop: true, reboot: true, light_on: false, light_off: false },
+        why: { light_on: "asic-rs: supports_set_fault_light() = false on WhatsMiner M20 (Whatsminer v1)" },
+      },
+      "192.0.2.41": {
+        ip: "192.0.2.41",
+        found: true,
+        caps: { start: false, stop: false, reboot: true, light_on: true, light_off: true, unconfirmed: ["light_on", "light_off"] },
+      },
+    };
+    const { body } = render(ActionDialog, {
+      props: { ips: ["192.0.2.40", "192.0.2.41"], action: "light_on", onclose: () => {} },
+    });
+    expect(body).toContain("No fault-light path; tried: asic-rs: supports_set_fault_light() = false");
+    expect(body).toContain("dry run only: route not yet confirmed on real hardware");
+    expect(body).toMatch(/Light on 1 of 2 miners/);
+    control.capsByIp = {};
+  });
+
+  it("toolbar offers Light on / Light off as bulk actions", () => {
+    control.activeRunId = null;
+    control.lastDone = null;
+    const { body } = render(ControlToolbar, { props: { selectedIps: ["192.0.2.50"], onrequest: () => {} } });
+    expect(body).toContain("Light on");
+    expect(body).toContain("Light off");
+  });
+});

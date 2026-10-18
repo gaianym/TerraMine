@@ -16,10 +16,14 @@ export function formatActionStatusLabel(row: Pick<ActionRowEvent, "action" | "st
       if (action === "reboot") return "back online";
       if (action === "stop") return "verified paused";
       if (action === "start") return "verified running";
+      if (action === "light_on") return "light on";
+      if (action === "light_off") return "light off";
       return "verified";
     case "ok":
       if (action === "stop") return "paused";
       if (action === "start") return "running";
+      if (action === "light_on") return "light on (sent)";
+      if (action === "light_off") return "light off (sent)";
       return "ok";
     case "unverified":
       return "unverified";

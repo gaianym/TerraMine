@@ -1,4 +1,4 @@
-//! Phase 1 miner control: start (resume), stop (pause), reboot.
+//! Miner control: start (resume), stop (pause), reboot, fault light.
 
 pub mod cache;
 pub mod creds;
@@ -18,6 +18,8 @@ mod e2e_tests;
 pub mod mock_miner;
 #[cfg(test)]
 mod verify_tests;
+#[cfg(test)]
+mod light_e2e_tests;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -54,8 +56,10 @@ pub struct ActionRequest {
     pub concurrency: usize,
     #[serde(default = "default_timeout")]
     pub timeout_sec: u64,
+    /// Absent = the action class default (off for start/stop/reboot, on
+    /// for every newer class such as the fault light).
     #[serde(default)]
-    pub dry_run: bool,
+    pub dry_run: Option<bool>,
     #[serde(default = "default_true")]
     pub verify: bool,
     #[serde(default = "default_verify_timeout")]
@@ -78,6 +82,22 @@ pub struct CapsRow {
     pub ip: String,
     pub found: bool,
     pub caps: Capabilities,
+    /// Per unsupported action: every path considered and why it was not usable.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub why: std::collections::BTreeMap<MinerAction, String>,
+}
+
+pub fn caps_row(ip: IpAddr, d: Option<&dyn driver::MinerDriver>) -> CapsRow {
+    let Some(d) = d else {
+        return CapsRow { ip: ip.to_string(), found: false, caps: Capabilities::none(), why: Default::default() };
+    };
+    let caps = d.caps();
+    let why = MinerAction::ALL
+        .into_iter()
+        .filter(|a| !caps.supports(*a))
+        .map(|a| (a, d.paths_tried(a).join("; ")))
+        .collect();
+    CapsRow { ip: ip.to_string(), found: true, caps, why }
 }
 
 pub fn parse_ips(ips: &[String]) -> Result<Vec<IpAddr>, String> {
@@ -100,11 +120,12 @@ pub fn job_config(req: &ActionRequest) -> JobConfig {
         concurrency: req.concurrency.clamp(1, MAX_CONCURRENCY),
         stagger: Duration::from_millis(req.stagger_ms),
         timeout: Duration::from_secs(req.timeout_sec.max(1)),
-        dry_run: req.dry_run,
+        dry_run: req.dry_run.unwrap_or_else(|| safety::ActionKind::from(req.action).default_dry_run()),
         verify: req.verify.then(|| job::VerifyConfig {
             interval: Duration::from_secs(5),
             timeout: Duration::from_secs(req.verify_timeout_sec.clamp(10, 900)),
         }),
+        allow_unconfirmed: false,
     }
 }
 
@@ -134,7 +155,7 @@ pub async fn miner_capabilities(ips: Vec<String>) -> Result<Vec<CapsRow>, String
             cache::Resolved::Ready { driver, .. } => Some(driver),
             _ => None,
         };
-        out.push(CapsRow { ip: ip.to_string(), found: d.is_some(), caps: d.map(|d| d.caps()).unwrap_or_default() });
+        out.push(caps_row(ip, d.as_deref()));
     }
     Ok(out)
 }

@@ -251,6 +251,7 @@ fn cfg(action: MinerAction, dry_run: bool) -> JobConfig {
         timeout: Duration::from_secs(2),
         dry_run,
         verify: Some(VerifyConfig { interval: Duration::from_millis(200), timeout: Duration::from_secs(10) }),
+        allow_unconfirmed: false,
     }
 }
 
