@@ -5,9 +5,11 @@
 //!   stock v2020, Braiins 25.07, Whatsminer v3) are sent and read back.
 //! - Whatsminer v1 and AxeOS 2.10 have no path: `unsupported`, with every
 //!   path tried and why.
+//! - AxeOS `identify` is hardware-confirmed on 2.15.x: sent live once,
+//!   with nothing to read back (`unverified`).
 //! - Fallbacks not yet confirmed on hardware (stock S9 `blink.cgi`, AxeOS
-//!   `identify`) are dry-run only: a live run refuses them and sends
-//!   nothing.
+//!   `identify` outside 2.15.x) are dry-run only: a live run refuses them
+//!   and sends nothing.
 //! - Each fallback only ever reaches its own device class.
 
 use std::collections::HashMap;
@@ -131,20 +133,24 @@ async fn light_fleetwide_live_routes_per_class() {
     assert_eq!(r[&AXE210].status, ActionStatus::Unsupported);
     assert!(msg(&r[&AXE210]).contains("no identify endpoint before AxeOS 2.12"), "{}", msg(&r[&AXE210]));
     assert_eq!(f.hits(AXE210, "POST"), 0);
-    // Unconfirmed fallbacks: refused live, nothing sent.
-    for (ip, route) in [(AXE215, Route::Axeos), (S9, Route::S9Cgi)] {
-        assert_eq!(r[&ip].status, ActionStatus::Refused, "{ip:?}: {:?}", r[&ip]);
-        assert_eq!(r[&ip].route, Some(route));
-        assert!(msg(&r[&ip]).contains("not yet confirmed on real hardware"), "{}", msg(&r[&ip]));
-    }
-    assert_eq!(f.hits(AXE215, "identify"), 0);
+    // AxeOS 2.15.x identify is hardware-confirmed: sent live exactly once
+    // (a second call would toggle), nothing to read back.
+    assert_eq!(r[&AXE215].status, ActionStatus::Unverified, "{:?}", r[&AXE215]);
+    assert_eq!(r[&AXE215].route, Some(Route::Axeos));
+    assert!(msg(&r[&AXE215]).contains("does not report the light state"), "{}", msg(&r[&AXE215]));
+    assert_eq!(f.hits(AXE215, "POST /api/system/identify"), 1);
+    assert!(f.m(AXE215).identifying());
+    // Unconfirmed fallback: refused live, nothing sent.
+    assert_eq!(r[&S9].status, ActionStatus::Refused, "{:?}", r[&S9]);
+    assert_eq!(r[&S9].route, Some(Route::S9Cgi));
+    assert!(msg(&r[&S9]).contains("not yet confirmed on real hardware"), "{}", msg(&r[&S9]));
     assert_eq!(f.hits(S9, "blink"), 0);
-    assert!(!f.m(S9).light() && !f.m(AXE215).identifying());
+    assert!(!f.m(S9).light());
 
     // Audit: one attempt per send and one outcome per miner, under the light action name.
     let recs = audit.records();
     assert!(recs.iter().all(|r| r.action == "light_on" && r.run_id == "light-run"));
-    assert_eq!(recs.iter().filter(|r| r.phase == "attempt").count(), NATIVE_LIGHT.len());
+    assert_eq!(recs.iter().filter(|r| r.phase == "attempt").count(), NATIVE_LIGHT.len() + 1);
     assert_eq!(recs.iter().filter(|r| r.phase == "outcome").count(), ALL.len());
 
     // And off again, read back on the same path.
@@ -226,14 +232,16 @@ async fn caps_rows_explain_unsupported_light() {
     assert!(row.why[&MinerAction::LightOn].contains("supports_set_fault_light() = false"), "{:?}", row.why);
     let axe = get(AXE215).await;
     let row = super::caps_row(IpAddr::from(AXE215), Some(axe.as_ref()));
-    // Composite: native first (asic-rs says no), then the AxeOS override (identify, unconfirmed).
+    // Composite: native first (asic-rs says no), then the AxeOS override
+    // (identify, hardware-confirmed on 2.15.x).
     assert_eq!(row.caps.route(MinerAction::LightOn), Some(Route::Axeos));
-    assert!(!row.caps.confirmed(MinerAction::LightOn));
+    assert!(row.caps.confirmed(MinerAction::LightOn));
+    assert!(!row.why.contains_key(&MinerAction::LightOn));
     let off = &row.why[&MinerAction::LightOff];
     assert!(off.contains("asic-rs: supports_set_fault_light() = false") && off.contains("no off command"), "{off}");
     let v = serde_json::to_value(&row).unwrap();
     assert_eq!(v["caps"]["light_on"], true);
-    assert_eq!(v["caps"]["unconfirmed"], serde_json::json!(["light_on"]));
+    assert_eq!(v["caps"]["unconfirmed"], serde_json::json!([]));
     let none = super::caps_row(IpAddr::from(WM1), None);
     assert!(!none.found && none.why.is_empty());
 }
@@ -269,6 +277,25 @@ fn axeos_identify_only_from_2_12() {
     assert_eq!(c.route(MinerAction::LightOn), Some(Route::Axeos));
     assert!(!c.confirmed(MinerAction::LightOn), "identify is dry-run only until a hardware check");
     assert!(!caps_for_version_str("v2.15.3").supports(MinerAction::LightOff));
+}
+
+/// Identify was sent live on a Bitaxe running v2.15.3 (hw_bitaxe_identify):
+/// only the 2.15.x line is confirmed; others stay dry-run only.
+#[test]
+fn axeos_identify_hardware_confirmed_on_2_15_only() {
+    use super::overrides::bitaxe::caps_for_version_str;
+    for v in ["v2.15.0", "v2.15.3", "2.15.9"] {
+        let c = caps_for_version_str(v);
+        assert_eq!(c.route(MinerAction::LightOn), Some(Route::Axeos), "{v}");
+        assert!(c.confirmed(MinerAction::LightOn), "{v} is hardware-confirmed");
+        assert!(!c.supports(MinerAction::LightOff), "{v}: still no off command");
+    }
+    for v in ["v2.12.0", "v2.14.1", "v2.16.0", "v3.15.0"] {
+        let c = caps_for_version_str(v);
+        assert_eq!(c.route(MinerAction::LightOn), Some(Route::Axeos), "{v}");
+        assert!(!c.confirmed(MinerAction::LightOn), "{v} stays dry-run only");
+    }
+    assert!(!caps_for_version_str("v2.11.0").supports(MinerAction::LightOn));
 }
 
 #[test]
