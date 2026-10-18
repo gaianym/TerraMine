@@ -214,8 +214,10 @@ fn default_halt() -> f64 {
     0.2
 }
 
-/// Batch settings write. Dry run unless explicitly turned off. No backend
-/// is hardware-confirmed yet, so live writes report `no_path`.
+/// Batch settings write (frequency / voltage / fan / power limit / tuning
+/// percent). Dry run unless explicitly turned off. No backend is
+/// hardware-confirmed yet, so live writes report `no_path`; dry runs show
+/// the path that would be used.
 #[derive(Debug, Deserialize)]
 pub struct SettingsJobRequest {
     pub ips: Vec<String>,
@@ -250,6 +252,83 @@ pub fn batch_options(req: &SettingsJobRequest, controls: Vec<IpAddr>) -> safety:
 pub struct SettingsDoneEvent {
     pub run_id: String,
     pub results: Vec<safety::WriteOutcome>,
+}
+
+/// Whether one settings field can be written on a device, and how.
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldSupport {
+    /// Backend that would take the write (`None` = not supported).
+    pub path: Option<String>,
+    /// False = the backend is not yet confirmed on real hardware (dry run only).
+    pub confirmed: bool,
+    /// Every path considered and why.
+    pub tried: Vec<String>,
+}
+
+/// Power / tuning support and limits for one device (dialog display).
+#[derive(Debug, Clone, Serialize)]
+pub struct SettingsSupportRow {
+    pub ip: String,
+    pub found: bool,
+    pub class: Option<safety::DeviceClass>,
+    pub model: Option<String>,
+    pub power_w: Option<safety::limits::Range>,
+    pub tuning_pct: Option<safety::limits::Range>,
+    pub power: FieldSupport,
+    pub tuning: FieldSupport,
+}
+
+pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: Option<Arc<dyn driver::MinerDriver>>) -> SettingsSupportRow {
+    let none = || FieldSupport { path: None, confirmed: false, tried: Vec::new() };
+    let Some(d) = driver else {
+        return SettingsSupportRow {
+            ip: ip.to_string(),
+            found: false,
+            class: None,
+            model: None,
+            power_w: None,
+            tuning_pct: None,
+            power: none(),
+            tuning: none(),
+        };
+    };
+    let t = safety::Target::new(ip, d);
+    let field = |change: safety::settings::Settings| {
+        let (b, tried) = engine.select(&t, &change, true);
+        FieldSupport { confirmed: b.as_ref().is_some_and(|b| b.hardware_confirmed()), path: b.map(|b| b.id().to_string()), tried }
+    };
+    let limits = engine.limits.lookup(&t.profile);
+    SettingsSupportRow {
+        ip: ip.to_string(),
+        found: true,
+        class: Some(t.profile.class),
+        model: Some(t.profile.model.clone()),
+        power_w: limits.and_then(|e| e.power_w),
+        tuning_pct: limits.and_then(|e| e.tuning_pct),
+        power: field(safety::settings::Settings { power_limit_w: Some(1), ..Default::default() }),
+        tuning: field(safety::settings::Settings { tuning_pct: Some(100), ..Default::default() }),
+    }
+}
+
+#[tauri::command]
+pub async fn settings_support(ips: Vec<String>) -> Result<Vec<SettingsSupportRow>, String> {
+    let ips = parse_ips(&ips)?;
+    let f: Arc<dyn DriverFactory> = Arc::new(OverlayFactory::with_store(Duration::from_secs(5), &creds::KeyringStore));
+    let resolver = cache::Resolver::new(f, cache::DeviceCache::global());
+    let engine = safety::SafetyEngine::new(
+        Arc::new(safety::NullAudit),
+        Arc::new(safety::snapshot::SnapshotStore::in_memory(1)),
+        safety::SafetyOptions::default(),
+    );
+    let mut out = Vec::new();
+    for ip in ips {
+        let d = match resolver.resolve(ip, Duration::from_secs(5)).await {
+            cache::Resolved::Ready { driver, .. } => Some(driver),
+            _ => None,
+        };
+        out.push(settings_support_row(&engine, ip, d));
+    }
+    Ok(out)
 }
 
 #[tauri::command]

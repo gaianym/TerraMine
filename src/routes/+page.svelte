@@ -30,6 +30,7 @@
   import { ipsNeedingRefresh, missingAgGridModules } from "$lib/control/statusLabel";
   import { statusChipSpec } from "$lib/control/statusChip";
   import { refreshUntilSettled, type RefreshTarget } from "$lib/control/postActionRefresh";
+  import PowerTuningButton from "$lib/control/PowerTuningButton.svelte";
   import { formatEfficiency, formatGridValue } from "$lib/format";
   import { formatHashRateDelta, formatMetricDelta } from "$lib/deltaFormat";
   import { formatHashRateValue, getNormalizedHashRateDisplay, parseHashRateToHs } from "$lib/hashrate";
@@ -2996,6 +2997,7 @@
     <div class="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2 text-sm text-zinc-400">
       <span>Results</span>
       <ControlToolbar {selectedIps} onrequest={requestAction} />
+      <PowerTuningButton {selectedIps} />
     </div>
     <div class="relative min-h-0 w-full flex-1">
       <div
