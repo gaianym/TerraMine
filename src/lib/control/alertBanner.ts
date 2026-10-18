@@ -8,6 +8,7 @@ export type Settings = {
   fan_pct?: number | null;
   auto_fan?: boolean | null;
   power_limit_w?: number | null;
+  tuning_pct?: number | null;
 };
 
 export type FailureCause =
@@ -55,6 +56,7 @@ const FIELDS: Array<[keyof Settings, string]> = [
   ["core_voltage_mv", "mV"],
   ["fan_pct", "% fan"],
   ["power_limit_w", "W"],
+  ["tuning_pct", "% tuning"],
 ];
 
 function fieldValue(s: Settings | null, k: keyof Settings): string {

@@ -33,6 +33,7 @@ pub fn parse_axeos_settings(v: &Value) -> Settings {
         fan_pct: as_u32(v.get("fanspeed")),
         auto_fan: v.get("autofanspeed").and_then(|a| a.as_bool().or_else(|| a.as_u64().map(|n| n != 0))),
         power_limit_w: None,
+        tuning_pct: None,
     }
 }
 
@@ -75,6 +76,9 @@ impl SettingsDriver for AxeOsSettings {
         }
         if change.power_limit_w.is_some() {
             return Err("power_limit_w is not writable over AxeOS".into());
+        }
+        if change.tuning_pct.is_some() {
+            return Err("tuning_pct is not writable over AxeOS".into());
         }
         Ok(())
     }

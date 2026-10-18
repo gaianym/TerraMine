@@ -162,7 +162,7 @@ async fn e2e_dry_run_and_limit_refusal_send_no_writes() {
     let dry = SafeWriteRequest { change: freq(575), dry_run: true, confirm: Confirmation::default() };
     let o = r.engine.apply_settings("run", &t, &dry).await;
     assert_eq!(o.status, WriteStatus::DryRun);
-    assert_eq!(o.msg.as_deref(), Some("would set frequency_mhz 525 → 575"));
+    assert_eq!(o.msg.as_deref(), Some("would set frequency_mhz 525 → 575 via axeos-http"));
     let before = r.axe.requests().len();
     let o = r.engine.apply_settings("run", &t, &apply(freq(900))).await;
     assert_eq!(o.status, WriteStatus::Refused);

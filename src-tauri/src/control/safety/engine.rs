@@ -1,8 +1,8 @@
 //! The guarded write sequence for settings changes:
 //!
-//! preflight → limits → pick backend (asic-rs if it supports the change,
-//! else the AxeOS override, else refuse with a reason) → [dry run stops
-//! here] → audit "attempt" → snapshot → write → read-back → health watch
+//! preflight → pick backend (asic-rs if it supports the change, else the
+//! AxeOS override, else `no_path` listing every path tried) → limits →
+//! [dry run stops here] → audit "attempt" → snapshot → write → read-back → health watch
 //! → (on any failure after the write) rollback to the snapshot → audit
 //! "outcome".
 
@@ -207,8 +207,10 @@ impl SafetyEngine {
     }
 
     /// asic-rs backend if it can do the change, else the AxeOS override,
-    /// else none — each skip is reported with its reason.
-    fn select(&self, t: &Target, change: &Settings) -> (Option<Box<dyn SettingsDriver>>, Vec<String>) {
+    /// else none — each skip is reported with its reason. A backend not yet
+    /// confirmed on real hardware is only selected for a dry run (or when
+    /// the options explicitly allow it: mock tests).
+    pub fn select(&self, t: &Target, change: &Settings, dry_run: bool) -> (Option<Box<dyn SettingsDriver>>, Vec<String>) {
         let mut tried = Vec::new();
         let backends = t.driver.settings_backends();
         if backends.is_empty() {
@@ -217,8 +219,11 @@ impl SafetyEngine {
         for b in backends {
             if let Err(reason) = b.accepts(&t.profile, change) {
                 tried.push(format!("{}: skipped ({reason})", b.id()));
-            } else if !b.hardware_confirmed() && !self.opts.allow_unconfirmed_paths {
+            } else if !b.hardware_confirmed() && !self.opts.allow_unconfirmed_paths && !dry_run {
                 tried.push(format!("{}: skipped (not yet confirmed on real hardware)", b.id()));
+            } else if !b.hardware_confirmed() && !self.opts.allow_unconfirmed_paths {
+                tried.push(format!("{}: selected for dry run only (not yet confirmed on real hardware)", b.id()));
+                return (Some(b), tried);
             } else {
                 tried.push(format!("{}: selected", b.id()));
                 return (Some(b), tried);
@@ -237,22 +242,30 @@ impl SafetyEngine {
         if req.change.is_empty() {
             return self.finish(c, WriteStatus::Refused, Some("nothing to change".into()));
         }
-        let entry = match self.limits.check(&t.profile, &req.change) {
-            Ok(e) => e.clone(),
-            Err(v) => return self.finish(c, WriteStatus::Refused, Some(v.join("; "))),
-        };
-        let (backend, tried) = self.select(t, &req.change);
+        // Path first: a device that cannot take the change at all reports
+        // "not supported" with every path tried, whatever the values.
+        let (backend, tried) = self.select(t, &req.change, req.dry_run);
         c.out.paths_tried = tried;
         let Some(drv) = backend else {
             let msg = format!("no write path accepted {}; tried: {}", t.ip, c.out.paths_tried.join("; "));
             return self.finish(c, WriteStatus::NoPath, Some(msg));
         };
         let drv = drv.as_ref();
+        let entry = match self.limits.check(&t.profile, &req.change) {
+            Ok(e) => e.clone(),
+            Err(v) => return self.finish(c, WriteStatus::Refused, Some(v.join("; "))),
+        };
 
         if req.dry_run {
+            let via = format!("via {}", drv.id());
+            let unconfirmed = if drv.hardware_confirmed() || self.opts.allow_unconfirmed_paths {
+                String::new()
+            } else {
+                "; path not yet confirmed on real hardware, a live write is refused".into()
+            };
             let msg = match timed(to, drv.read()).await {
-                Ok(cur) => format!("would set {}", cur.describe_change(&req.change)),
-                Err(e) => format!("would set {:?} (current unreadable: {e})", req.change),
+                Ok(cur) => format!("would set {} {via}{unconfirmed}", cur.describe_change(&req.change)),
+                Err(e) => format!("would set {:?} {via} (current unreadable: {e}){unconfirmed}", req.change),
             };
             return self.finish(c, WriteStatus::DryRun, Some(msg));
         }
@@ -382,6 +395,7 @@ fn missing_fields(change: &Settings, snap: &Settings) -> Vec<String> {
     f("fan_pct", change.fan_pct.is_some(), snap.fan_pct.is_some());
     f("auto_fan", change.auto_fan.is_some(), snap.auto_fan.is_some());
     f("power_limit_w", change.power_limit_w.is_some(), snap.power_limit_w.is_some());
+    f("tuning_pct", change.tuning_pct.is_some(), snap.tuning_pct.is_some());
     out
 }
 

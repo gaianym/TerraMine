@@ -15,6 +15,9 @@ pub enum DeviceClass {
     Whatsminer,
     Avalon,
     Epic,
+    Proto,
+    Sealminer,
+    Auradine,
     Unknown,
 }
 
@@ -40,6 +43,9 @@ const RULES: &[(Field, &str, DeviceClass)] = &[
     (Field::Firmware, "epic", DeviceClass::Epic),
     (Field::Make, "whatsminer", DeviceClass::Whatsminer),
     (Field::Make, "avalon", DeviceClass::Avalon),
+    (Field::Make, "proto", DeviceClass::Proto),
+    (Field::Make, "sealminer", DeviceClass::Sealminer),
+    (Field::Make, "auradine", DeviceClass::Auradine),
     (Field::Make, "antminer", DeviceClass::AntminerStock),
 ];
 

@@ -517,15 +517,37 @@ fn cache_others_excludes_job_and_orders_by_recency() {
 
 #[test]
 fn asic_rs_accepts_only_what_it_supports() {
+    use super::asic::NativeSettingsFlags as F;
     let power = Settings { power_limit_w: Some(3000), ..Default::default() };
+    let pct = Settings { tuning_pct: Some(80), ..Default::default() };
     let fan = Settings { fan_pct: Some(70), ..Default::default() };
-    assert!(asic_accepts(&power, true, false, false).is_ok());
-    assert!(asic_accepts(&power, false, true, false).is_ok());
-    assert!(asic_accepts(&power, false, false, true).unwrap_err().contains("power target not supported"));
-    assert!(asic_accepts(&fan, true, true, true).is_ok());
-    assert!(asic_accepts(&fan, true, true, false).unwrap_err().contains("fan config not supported"));
-    assert!(asic_accepts(&freq(500), true, true, true).unwrap_err().contains("no manual frequency"));
-    assert!(asic_accepts(&Settings { auto_fan: Some(true), ..Default::default() }, true, true, true).is_err());
+    let all = F { power_limit: true, tuning_percent: true, fan: true };
+    assert!(asic_accepts(&power, F { power_limit: true, ..F::default() }).is_ok());
+    assert!(asic_accepts(&power, F { tuning_percent: true, fan: true, ..F::default() })
+        .unwrap_err()
+        .contains("supports_set_power_limit() = false"));
+    assert!(asic_accepts(&pct, F { tuning_percent: true, ..F::default() }).is_ok());
+    assert!(asic_accepts(&pct, F { power_limit: true, fan: true, ..F::default() })
+        .unwrap_err()
+        .contains("supports_set_tuning_percent() = false"));
+    assert!(asic_accepts(&fan, all).is_ok());
+    assert!(asic_accepts(&fan, F { fan: false, ..all }).unwrap_err().contains("fan config not supported"));
+    assert!(asic_accepts(&freq(500), all).unwrap_err().contains("no manual frequency"));
+    assert!(asic_accepts(&Settings { auto_fan: Some(true), ..Default::default() }, all).is_err());
+}
+
+/// Permanent (bug fixed in PR C): stock Antminer reports
+/// `supports_tuning_config() = true` but its `set_tuning_config` rejects a
+/// power target, and `supports_set_power_limit() = false`. The old
+/// selector accepted a power change there and only failed at write time,
+/// after the snapshot. Power now needs `supports_set_power_limit()`.
+#[test]
+fn power_limit_needs_set_power_limit_not_tuning_config() {
+    use super::asic::NativeSettingsFlags as F;
+    let power = Settings { power_limit_w: Some(3000), ..Default::default() };
+    // Antminer stock v2020 / v2023 in asic-rs 0.8.6: tuning_config yes, power limit no, fan yes.
+    let antminer = F { power_limit: false, tuning_percent: false, fan: true };
+    assert!(asic_accepts(&power, antminer).is_err());
 }
 
 #[test]
@@ -548,7 +570,7 @@ fn asic_rs_configs_map_to_settings() {
 
 #[test]
 fn axeos_body_round_trip() {
-    let s = Settings { frequency_mhz: Some(575), core_voltage_mv: Some(1200), fan_pct: Some(70), auto_fan: Some(false), power_limit_w: None };
+    let s = Settings { frequency_mhz: Some(575), core_voltage_mv: Some(1200), fan_pct: Some(70), auto_fan: Some(false), ..Default::default() };
     let body = axeos_patch_body(&s);
     assert_eq!(body, serde_json::json!({"frequency":575,"coreVoltage":1200,"fanspeed":70,"autofanspeed":0}));
     assert_eq!(parse_axeos_settings(&body), s);
@@ -624,7 +646,7 @@ async fn engine_dry_run_and_refusals_touch_nothing() {
     let dry = SafeWriteRequest { change: freq(575), dry_run: true, confirm: Confirmation::default() };
     let o = e.apply_settings("r", &t, &dry).await;
     assert_eq!(o.status, WriteStatus::DryRun);
-    assert_eq!(o.msg.as_deref(), Some("would set frequency_mhz 525 → 575"));
+    assert_eq!(o.msg.as_deref(), Some("would set frequency_mhz 525 → 575 via fake-axeos"));
     for change in [freq(900), Settings::default(), Settings { core_voltage_mv: Some(2000), ..Default::default() }] {
         let o = e.apply_settings("r", &t, &apply(change)).await;
         assert_eq!(o.status, WriteStatus::Refused, "{o:?}");
