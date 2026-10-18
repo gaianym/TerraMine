@@ -13,6 +13,9 @@ pub struct Settings {
     pub core_voltage_mv: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fan_pct: Option<u32>,
+    /// Auto-fan target chip temperature (°C), AxeOS `temptarget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_target_c: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_fan: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +34,7 @@ impl Settings {
             frequency_mhz: mask.frequency_mhz.and(self.frequency_mhz),
             core_voltage_mv: mask.core_voltage_mv.and(self.core_voltage_mv),
             fan_pct: mask.fan_pct.and(self.fan_pct),
+            temp_target_c: mask.temp_target_c.and(self.temp_target_c),
             auto_fan: mask.auto_fan.and(self.auto_fan),
             power_limit_w: mask.power_limit_w.and(self.power_limit_w),
         }
@@ -49,6 +53,7 @@ impl Settings {
         cmp(&mut out, "frequency_mhz", self.frequency_mhz, want.frequency_mhz);
         cmp(&mut out, "core_voltage_mv", self.core_voltage_mv, want.core_voltage_mv);
         cmp(&mut out, "fan_pct", self.fan_pct, want.fan_pct);
+        cmp(&mut out, "temp_target_c", self.temp_target_c, want.temp_target_c);
         cmp(&mut out, "auto_fan", self.auto_fan, want.auto_fan);
         cmp(&mut out, "power_limit_w", self.power_limit_w, want.power_limit_w);
         out
@@ -66,6 +71,7 @@ impl Settings {
         f("frequency_mhz", s(self.frequency_mhz), s(to.frequency_mhz));
         f("core_voltage_mv", s(self.core_voltage_mv), s(to.core_voltage_mv));
         f("fan_pct", s(self.fan_pct), s(to.fan_pct));
+        f("temp_target_c", s(self.temp_target_c), s(to.temp_target_c));
         f("auto_fan", self.auto_fan.map(|b| b.to_string()), to.auto_fan.map(|b| b.to_string()));
         f("power_limit_w", s(self.power_limit_w), s(to.power_limit_w));
         parts.join(", ")
@@ -96,4 +102,23 @@ pub trait SettingsDriver: Send + Sync {
     fn accepts(&self, p: &super::profile::DeviceProfile, change: &Settings) -> Result<(), String>;
     fn read(&self) -> BoxFuture<'_, anyhow::Result<Settings>>;
     fn write(&self, s: &Settings) -> BoxFuture<'_, anyhow::Result<()>>;
+    /// Rewrite a request into what this backend actually writes (e.g. the
+    /// AxeOS power stand-in), plus a note for the plan text. Default: as is.
+    fn translate<'a>(&'a self, change: &'a Settings) -> BoxFuture<'a, Result<(Settings, Option<String>), String>> {
+        Box::pin(async move { Ok((change.clone(), None)) })
+    }
+    /// A restart this backend needs for `change` to take effect (AxeOS
+    /// frequency / core voltage); `None` = applies without a restart.
+    fn restart_to_apply(&self, _change: &Settings) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
+        None
+    }
+    /// Seconds since boot, used to prove a restart happened.
+    fn uptime_s(&self) -> BoxFuture<'_, anyhow::Result<Option<u64>>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Beyond the configured values read back by [`Self::read`]: is the
+    /// change actually running (e.g. AxeOS `actualFrequency`)? Default: yes.
+    fn check_applied<'a>(&'a self, _want: &'a Settings) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }

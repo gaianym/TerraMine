@@ -80,6 +80,10 @@ pub struct Confirmation {
     pub typed: Option<String>,
     #[serde(default)]
     pub allow_irreversible: bool,
+    /// Explicit OK to raise a miner's frequency above its current value
+    /// (e.g. units held low after overheat throttling stay held).
+    #[serde(default)]
+    pub allow_frequency_raise: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

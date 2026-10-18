@@ -40,6 +40,9 @@ pub fn asic_accepts(change: &Settings, tuning: bool, power_limit: bool, fan: boo
     if change.fan_pct.is_some() && !fan {
         return Err("asic-rs: fan config not supported on this firmware".into());
     }
+    if change.temp_target_c.is_some() {
+        return Err("asic-rs: target temperature is not modelled for this path yet".into());
+    }
     if change.auto_fan.is_some() {
         return Err("asic-rs: auto-fan needs a target temperature (not modelled yet)".into());
     }

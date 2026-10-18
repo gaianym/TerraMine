@@ -78,7 +78,12 @@ async fn target(r: &Rig, ip: [u8; 4]) -> Target {
 }
 
 fn apply(change: Settings) -> SafeWriteRequest {
-    SafeWriteRequest { change, dry_run: false, confirm: Confirmation::default() }
+    SafeWriteRequest { change, dry_run: false, confirm: raise_ok() }
+}
+
+/// These tests exercise other gates; the frequency-raise hold has its own.
+fn raise_ok() -> Confirmation {
+    Confirmation { allow_frequency_raise: true, ..Default::default() }
 }
 
 fn freq(f: u32) -> Settings {
@@ -162,7 +167,10 @@ async fn e2e_dry_run_and_limit_refusal_send_no_writes() {
     let dry = SafeWriteRequest { change: freq(575), dry_run: true, confirm: Confirmation::default() };
     let o = r.engine.apply_settings("run", &t, &dry).await;
     assert_eq!(o.status, WriteStatus::DryRun);
-    assert_eq!(o.msg.as_deref(), Some("would set frequency_mhz 525 → 575"));
+    assert_eq!(
+        o.msg.as_deref(),
+        Some("would set frequency_mhz 525 → 575 with a restart to apply via axeos-http; frequency raise 525 → 575 MHz is held: needs an explicit OK (allow_frequency_raise)")
+    );
     let before = r.axe.requests().len();
     let o = r.engine.apply_settings("run", &t, &apply(freq(900))).await;
     assert_eq!(o.status, WriteStatus::Refused);
@@ -211,9 +219,13 @@ async fn e2e_mislabeled_axeos_gets_no_write() {
 async fn e2e_total_failure_reports_paths_tried() {
     let r = rig().await;
     let t = target(&r, AXE).await;
-    let o = r.engine.apply_settings("run", &t, &apply(Settings { power_limit_w: Some(20), ..Default::default() })).await;
+    let both = Settings { power_limit_w: Some(20), frequency_mhz: Some(500), ..Default::default() };
+    let o = r.engine.apply_settings("run", &t, &apply(both)).await;
     assert_eq!(o.status, WriteStatus::NoPath, "{o:?}");
-    assert_eq!(o.paths_tried, ["axeos-http: skipped (power_limit_w is not writable over AxeOS)"]);
+    assert_eq!(
+        o.paths_tried,
+        ["axeos-http: skipped (power_limit_w is mapped to a frequency on AxeOS; send either power_limit_w or frequency_mhz)"]
+    );
     assert!(o.msg.unwrap().contains("tried: axeos-http: skipped (power_limit_w"));
     let t = target(&r, S9).await;
     let o = r.engine.apply_settings("run", &t, &apply(freq(600))).await;
@@ -484,7 +496,9 @@ async fn e2e_external_outage_is_flagged() {
     o.controls = controls.to_vec();
     let ctl: Vec<Arc<MockMiner>> = fl.miners[2..].to_vec();
     let outage = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // After the controls' baseline sample (40 ms interval), well inside
+        // the job (the write includes a restart).
+        tokio::time::sleep(Duration::from_millis(300)).await;
         for m in &ctl {
             m.set_outage(true);
         }

@@ -20,6 +20,7 @@
   import { ArrowLeft, Check, ChevronDown, Settings, X } from "lucide-svelte";
   import { control } from "$lib/control/controlState.svelte";
   import ControlToolbar from "$lib/control/ControlToolbar.svelte";
+  import TuneButton from "$lib/control/TuneButton.svelte";
   import ActionDialog from "$lib/control/ActionDialog.svelte";
   import SafetyAlertBanner from "$lib/control/SafetyAlertBanner.svelte";
   import {
@@ -2995,6 +2996,7 @@
   <div class="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800">
     <div class="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2 text-sm text-zinc-400">
       <span>Results</span>
+      <TuneButton {selectedIps} />
       <ControlToolbar {selectedIps} onrequest={requestAction} />
     </div>
     <div class="relative min-h-0 w-full flex-1">
