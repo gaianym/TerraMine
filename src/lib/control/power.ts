@@ -24,6 +24,10 @@ export type SettingsSupportRow = {
   tuning_pct: Range | null;
   power: FieldSupport;
   tuning: FieldSupport;
+  fan_pct?: [number, number] | null;
+  temp_target_c?: [number, number] | null;
+  fan?: FieldSupport;
+  fan_auto?: FieldSupport;
 };
 
 export type WriteOutcome = {

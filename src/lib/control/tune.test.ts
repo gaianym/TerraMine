@@ -1,7 +1,7 @@
 import { render } from "svelte/server";
 import { describe, expect, it, vi } from "vitest";
 import { describeChange } from "./alertBanner";
-import { EMPTY_TUNE, buildTuneChange, buildTuneRequest, restartsAxeOs } from "./tune";
+import { EMPTY_TUNE, buildTuneChange, buildTuneRequest, isLowFan, restartsAxeOs } from "./tune";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => "run") }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
@@ -34,6 +34,15 @@ describe("request", () => {
   it("dry run, raise flag and canary pass through", () => {
     const r = buildTuneRequest(["192.0.2.1", "192.0.2.2"], { frequency_mhz: 500 }, { dryRun: true, allowRaise: false, canarySize: 5 });
     expect(r).toMatchObject({ dry_run: true, confirm: { allow_frequency_raise: false }, canary_size: 2, change: { frequency_mhz: 500 } });
+  });
+  it("low manual fan needs an explicit force flag", () => {
+    expect(isLowFan({ auto_fan: false, fan_pct: 20 })).toBe(true);
+    expect(isLowFan({ auto_fan: false, fan_pct: 30 })).toBe(false);
+    expect(isLowFan({ auto_fan: true, temp_target_c: 60 })).toBe(false);
+    const r = buildTuneRequest(["192.0.2.1"], { auto_fan: false, fan_pct: 20 }, { dryRun: false, allowRaise: false, canarySize: 1 });
+    expect(r.confirm).toEqual({ allow_frequency_raise: false, force_low_fan: false });
+    const f = buildTuneRequest(["192.0.2.1"], { auto_fan: false, fan_pct: 20 }, { dryRun: false, allowRaise: false, canarySize: 1, forceLowFan: true });
+    expect(f.confirm.force_low_fan).toBe(true);
   });
   it("restart note for frequency / voltage / power only", () => {
     expect(restartsAxeOs({ frequency_mhz: 500 })).toBe(true);

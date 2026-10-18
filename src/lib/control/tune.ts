@@ -4,6 +4,10 @@
  * pipeline (`run_settings_job`); each miner's plan comes back as a dry-run
  * row (`safety:row`), including "not supported; tried …" and the Bitaxe
  * power stand-in.
+ *
+ * Fan / target temperature apply fleetwide (plan PR E): AxeOS over its HTTP
+ * API, other firmware through asic-rs fan config where it reports support.
+ * Thermal thresholds are read only in asic-rs 0.8.6.
  */
 import type { Settings } from "./alertBanner";
 
@@ -24,7 +28,7 @@ export type TuneJobRequest = {
   ips: string[];
   change: Settings;
   dry_run: boolean;
-  confirm: { allow_frequency_raise: boolean };
+  confirm: { allow_frequency_raise: boolean; force_low_fan: boolean };
   concurrency: number;
   stagger_ms: number;
   canary_size: number;
@@ -73,16 +77,23 @@ export function restartsAxeOs(change: Settings): boolean {
   return change.frequency_mhz != null || change.core_voltage_mv != null || change.power_limit_w != null;
 }
 
+/** Mirrors the backend `LOW_FAN_PCT`: manual fan below this needs an explicit OK. */
+export const LOW_FAN_PCT = 30;
+
+export function isLowFan(change: Settings): boolean {
+  return change.auto_fan !== true && change.fan_pct != null && change.fan_pct < LOW_FAN_PCT;
+}
+
 export function buildTuneRequest(
   ips: string[],
   change: Settings,
-  opts: { dryRun: boolean; allowRaise: boolean; canarySize: number },
+  opts: { dryRun: boolean; allowRaise: boolean; canarySize: number; forceLowFan?: boolean },
 ): TuneJobRequest {
   return {
     ips,
     change,
     dry_run: opts.dryRun,
-    confirm: { allow_frequency_raise: opts.allowRaise },
+    confirm: { allow_frequency_raise: opts.allowRaise, force_low_fan: opts.forceLowFan ?? false },
     concurrency: 4,
     stagger_ms: 1000,
     canary_size: Math.max(1, Math.min(opts.canarySize, ips.length || 1)),

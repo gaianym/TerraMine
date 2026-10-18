@@ -92,7 +92,13 @@ pub struct Confirmation {
     /// (e.g. units held low after overheat throttling stay held).
     #[serde(default)]
     pub allow_frequency_raise: bool,
+    /// Explicit OK for a manual fan speed below [`LOW_FAN_PCT`].
+    #[serde(default)]
+    pub force_low_fan: bool,
 }
+
+/// Manual fan speeds below this need `force_low_fan` (overheat risk).
+pub const LOW_FAN_PCT: u32 = 30;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {

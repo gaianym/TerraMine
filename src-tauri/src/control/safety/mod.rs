@@ -35,6 +35,8 @@ mod e2e_tests;
 #[cfg(test)]
 mod axeos_e2e_tests;
 #[cfg(test)]
+mod fan_e2e_tests;
+#[cfg(test)]
 mod power_e2e_tests;
 
 pub use audit::{AuditRecord, AuditSink, JsonlAudit, MemoryAudit, NullAudit};

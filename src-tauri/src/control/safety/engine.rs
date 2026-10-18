@@ -23,7 +23,7 @@ use tokio::time::Instant;
 use super::audit::{now_ms, AuditRecord, AuditSink};
 use super::health::{self, FailureCause, HealthPolicy, Unhealthy};
 use super::limits::LimitsTable;
-use super::policy::{preflight, ActionKind, Confirmation};
+use super::policy::{preflight, ActionKind, Confirmation, LOW_FAN_PCT};
 use super::profile::DeviceProfile;
 use super::settings::{HealthSample, Settings, SettingsDriver};
 use super::snapshot::{Snapshot, SnapshotStore};
@@ -287,7 +287,11 @@ impl SafetyEngine {
             let restart = if drv.restart_to_apply(&change).is_some() { " with a restart to apply" } else { "" };
             let msg = match timed(to, drv.read()).await {
                 Ok(cur) => {
-                    let hold = raise_hold(&cur, &change, &req.confirm).map(|h| format!("; {h}")).unwrap_or_default();
+                    let hold: String = [raise_hold(&cur, &change, &req.confirm), fan_hold(&change, &req.confirm)]
+                        .into_iter()
+                        .flatten()
+                        .map(|h| format!("; {h}"))
+                        .collect();
                     format!("{note}would set {}{restart} {via}{hold}{unconfirmed}", cur.describe_change(&change))
                 }
                 Err(e) => format!("{note}would set {change:?}{restart} {via} (current unreadable: {e}){unconfirmed}"),
@@ -303,11 +307,17 @@ impl SafetyEngine {
             Ok(s) => s,
             Err(e) => return self.finish(c, WriteStatus::Failed, Some(format!("cannot read settings for snapshot: {e}"))),
         };
-        if let Some(h) = raise_hold(&current, &change, &req.confirm) {
+        if let Some(h) = raise_hold(&current, &change, &req.confirm).or_else(|| fan_hold(&change, &req.confirm)) {
             return self.finish(c, WriteStatus::Refused, Some(h));
         }
-        let restore = current.restrict_to(&change);
-        let missing = missing_fields(&change, &restore);
+        // A fan change snapshots the whole fan state (mode, manual %, target).
+        let restore = current.restrict_to(&change.with_fan_group());
+        let mut missing = missing_fields(&change, &restore);
+        if restore.auto_fan == Some(true) || (restore.auto_fan == Some(false) && restore.fan_pct.is_some()) {
+            // The mode plus its own value restores the fan; the other mode's
+            // value may simply not be reported.
+            missing.retain(|f| f != "fan_pct" && f != "temp_target_c");
+        }
         if !missing.is_empty() {
             let msg = format!("cannot snapshot every field being changed ({}); refusing write", missing.join(", "));
             return self.finish(c, WriteStatus::Refused, Some(msg));
@@ -491,6 +501,8 @@ fn missing_fields(change: &Settings, snap: &Settings) -> Vec<String> {
     f("core_voltage_mv", change.core_voltage_mv.is_some(), snap.core_voltage_mv.is_some());
     f("fan_pct", change.fan_pct.is_some(), snap.fan_pct.is_some());
     f("temp_target_c", change.temp_target_c.is_some(), snap.temp_target_c.is_some());
+    f("temp_hot_c", change.temp_hot_c.is_some(), snap.temp_hot_c.is_some());
+    f("temp_danger_c", change.temp_danger_c.is_some(), snap.temp_danger_c.is_some());
     f("auto_fan", change.auto_fan.is_some(), snap.auto_fan.is_some());
     f("power_limit_w", change.power_limit_w.is_some(), snap.power_limit_w.is_some());
     f("tuning_pct", change.tuning_pct.is_some(), snap.tuning_pct.is_some());
@@ -510,6 +522,15 @@ pub fn raise_hold(current: &Settings, change: &Settings, c: &Confirmation) -> Op
         Some(cur) => Some(format!("frequency raise {cur} → {want} MHz is held: needs an explicit OK (allow_frequency_raise)")),
         None => Some(format!("frequency {want} MHz held: current frequency unknown, needs an explicit OK (allow_frequency_raise)")),
     }
+}
+
+/// A manual fan speed below [`LOW_FAN_PCT`] is held unless forced.
+pub fn fan_hold(change: &Settings, c: &Confirmation) -> Option<String> {
+    let p = change.fan_pct?;
+    if p >= LOW_FAN_PCT || change.auto_fan == Some(true) || c.force_low_fan {
+        return None;
+    }
+    Some(format!("manual fan {p}% below {LOW_FAN_PCT}% is held: needs force_low_fan (overheat risk)"))
 }
 
 async fn timed<T>(d: Duration, f: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {

@@ -103,6 +103,15 @@ impl LimitsTable {
         field("fan_pct", change.fan_pct, e.fan_pct);
         field("temp_target_c", change.temp_target_c, e.temp_target_c);
         field("tuning_pct", change.tuning_pct, e.tuning_pct);
+        // Fan mode needs the device's fan range; thresholds have no range (read only).
+        if change.auto_fan.is_some() && e.fan_pct.is_none() {
+            errs.push(format!("auto_fan is not writable on {}", e.model));
+        }
+        for (name, v) in [("temp_hot_c", change.temp_hot_c), ("temp_danger_c", change.temp_danger_c)] {
+            if v.is_some() {
+                errs.push(format!("{name} is not writable on {}", e.model));
+            }
+        }
         if errs.is_empty() {
             Ok(e)
         } else {

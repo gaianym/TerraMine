@@ -11,6 +11,10 @@
 //!   `v2020` backend): `POST /cgi-bin/blink.cgi {"blink":"true"|"false"}`
 //!   and `GET /cgi-bin/get_blink_status.cgi` → `{"blink": true|false}`.
 //!   Not confirmed on the 2018 S9 build yet, so it is dry-run only.
+//! - Fan / frequency / temperature: no safe partial write. The 2018 build's
+//!   `set_miner_conf.cgi` takes form fields and rewrites the whole miner
+//!   config (pools included); asic-rs only documents the JSON
+//!   read-modify-write of later (2020+) stock firmware.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -22,7 +26,10 @@ use serde_json::Value;
 
 use crate::control::cache::DriverKind;
 use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, MinerStatus, Observation, Route};
-use crate::control::safety::settings::HealthSample;
+use crate::control::safety::settings::{HealthSample, NoSettingsPath, SettingsDriver};
+
+/// Why the stock S9 has no settings write path (shown in "paths tried").
+pub const S9_NO_SETTINGS: &str = "stock S9 firmware: set_miner_conf.cgi replaces the whole miner config (pools included) from form fields; no documented partial fan / frequency / temperature route";
 use crate::control::safety::DeviceProfile;
 use crate::control::overrides::auth::DigestCredentials;
 
@@ -178,6 +185,11 @@ impl MinerDriver for S9StockDriver {
 
     fn kind(&self) -> DriverKind {
         DriverKind::S9Stock
+    }
+
+    /// No settings writes: see [`S9_NO_SETTINGS`].
+    fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
+        vec![Box::new(NoSettingsPath { id: "s9-cgi", reason: S9_NO_SETTINGS })]
     }
 
     /// `get_system_info.cgi` → MAC + firmware build (one digest read).
