@@ -16,7 +16,9 @@ use futures::future::BoxFuture;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 
-use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus};
+use crate::control::cache::DriverKind;
+use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, MinerStatus, Observation};
+use crate::control::safety::settings::HealthSample;
 use crate::control::safety::DeviceProfile;
 use crate::control::overrides::auth::DigestCredentials;
 
@@ -54,7 +56,7 @@ impl S9StockDriver {
         self
     }
 
-    async fn cgminer_elapsed(&self) -> anyhow::Result<u64> {
+    async fn cgminer_summary(&self) -> anyhow::Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut sock = tokio::time::timeout(
             Duration::from_secs(5),
@@ -64,6 +66,11 @@ impl S9StockDriver {
         sock.write_all(br#"{"command":"summary"}"#).await?;
         let mut buf = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf)).await??;
+        Ok(buf)
+    }
+
+    async fn cgminer_elapsed(&self) -> anyhow::Result<u64> {
+        let buf = self.cgminer_summary().await?;
         parse_cgminer_elapsed(&buf).ok_or_else(|| anyhow::anyhow!("no Elapsed in cgminer summary"))
     }
 
@@ -167,6 +174,29 @@ impl MinerDriver for S9StockDriver {
         DeviceProfile::classify("AntMiner", "Antminer S9", "Stock", None)
     }
 
+    fn kind(&self) -> DriverKind {
+        DriverKind::S9Stock
+    }
+
+    /// `get_system_info.cgi` → MAC + firmware build (one digest read).
+    fn observe(&self) -> BoxFuture<'_, anyhow::Result<Option<Observation>>> {
+        Box::pin(async move {
+            let (st, body) = self.digest_get("/cgi-bin/get_system_info.cgi").await?;
+            anyhow::ensure!(st.is_success(), "get_system_info.cgi: {st}");
+            let body = body.unwrap_or_default();
+            Ok(Some(Observation { status: None, identity: parse_s9_identity(&body) }))
+        })
+    }
+
+    fn health(&self) -> BoxFuture<'_, HealthSample> {
+        Box::pin(async move {
+            match self.cgminer_summary().await {
+                Ok(raw) => HealthSample { reachable: true, hashrate_ghs: parse_cgminer_ghs(&raw), temp_c: None },
+                Err(_) => HealthSample::unreachable(),
+            }
+        })
+    }
+
     fn caps(&self) -> Capabilities {
         Self::caps_for(self.has_miner_mode)
     }
@@ -215,6 +245,20 @@ impl MinerDriver for S9StockDriver {
             Ok(MinerStatus { uptime_s, paused })
         })
     }
+}
+
+/// MAC and firmware build from stock `get_system_info.cgi`.
+pub fn parse_s9_identity(body: &Value) -> Identity {
+    let s = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Identity { mac: s("macaddr"), firmware: s("system_filesystem_version") }
+}
+
+/// `GHS 5s` from a cgminer summary (string or number).
+pub fn parse_cgminer_ghs(raw: &[u8]) -> Option<f64> {
+    let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+    let v: Value = serde_json::from_slice(&raw[..end]).ok()?;
+    let g = v.get("SUMMARY")?.get(0)?.get("GHS 5s")?;
+    g.as_f64().or_else(|| g.as_str()?.trim().parse().ok())
 }
 
 /// cgminer replies are JSON, sometimes NUL-terminated.

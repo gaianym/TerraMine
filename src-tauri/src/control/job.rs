@@ -9,7 +9,8 @@ use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use super::driver::{DriverFactory, MinerAction, MinerStatus};
+use super::cache::{DeviceCache, Resolved, Resolver};
+use super::driver::{DriverFactory, MinerAction, MinerDriver, MinerStatus};
 use super::safety::audit::{now_ms, AuditRecord, AuditSink, NullAudit};
 use super::safety::{preflight, ActionKind, Confirmation, DeviceProfile};
 
@@ -60,16 +61,18 @@ pub struct VerifyConfig {
 
 pub type Sink = Arc<dyn Fn(ActionRowEvent) + Send + Sync>;
 
-/// Safety-layer context for a run: audit trail + run id.
+/// Safety-layer context for a run: audit trail, run id, device cache.
 #[derive(Clone)]
 pub struct SafetyCtx {
     pub run_id: String,
     pub audit: Arc<dyn AuditSink>,
+    /// Drivers are reused from here; identification only on miss/mismatch.
+    pub cache: Arc<DeviceCache>,
 }
 
 impl Default for SafetyCtx {
     fn default() -> Self {
-        Self { run_id: "local".into(), audit: Arc::new(NullAudit) }
+        Self { run_id: "local".into(), audit: Arc::new(NullAudit), cache: Arc::new(DeviceCache::default()) }
     }
 }
 
@@ -152,10 +155,11 @@ pub async fn run_action_guarded(
     let concurrency = cfg.concurrency.max(1);
     let stagger = cfg.stagger;
     let start = tokio::time::Instant::now();
+    let resolver = Arc::new(Resolver::new(factory, ctx.cache.clone()));
 
     let results = stream::iter(ips.into_iter().enumerate())
         .map(|(i, ip)| {
-            let factory = factory.clone();
+            let resolver = resolver.clone();
             let cancel = cancel.clone();
             let sink = sink.clone();
             let cfg = cfg.clone();
@@ -168,7 +172,7 @@ pub async fn run_action_guarded(
                     _ = cancel.cancelled() => ev(ip, action, ActionStatus::Cancelled, None),
                     r = async {
                         tokio::time::sleep_until(slot).await;
-                        one(ip, &cfg, factory.as_ref(), &sink, &ctx, &mut trace).await
+                        one(ip, &cfg, &resolver, &sink, &ctx, &mut trace).await
                     } => r,
                 };
                 audit(&ctx, &cfg, &fin, &trace, "outcome");
@@ -188,17 +192,17 @@ pub async fn run_action_guarded(
 async fn one(
     ip: IpAddr,
     cfg: &JobConfig,
-    factory: &dyn DriverFactory,
+    resolver: &Resolver,
     sink: &Sink,
     ctx: &SafetyCtx,
     trace: &mut Trace,
 ) -> ActionRowEvent {
     let action = cfg.action;
-    let driver = match tokio::time::timeout(cfg.timeout, factory.connect(ip)).await {
-        Ok(Ok(Some(d))) => d,
-        Ok(Ok(None)) => return ev(ip, action, ActionStatus::NotFound, None),
-        Ok(Err(e)) => return ev(ip, action, ActionStatus::Failed, Some(e.to_string())),
-        Err(_) => return ev(ip, action, ActionStatus::NotFound, Some("connect timeout".into())),
+    let (driver, obs) = match resolver.resolve(ip, cfg.timeout).await {
+        Resolved::Ready { driver, obs } => (driver, obs),
+        Resolved::Changed(msg) => return ev(ip, action, ActionStatus::Refused, Some(msg)),
+        Resolved::NotFound(msg) => return ev(ip, action, ActionStatus::NotFound, msg),
+        Resolved::Failed(e) => return ev(ip, action, ActionStatus::Failed, Some(e)),
     };
     trace.profile = Some(driver.profile());
     if !driver.caps().supports(action) {
@@ -207,9 +211,13 @@ async fn one(
     if cfg.dry_run {
         return ev(ip, action, ActionStatus::DryRun, None);
     }
-    // Baseline uptime so a reboot can be proven by a lower value afterwards.
+    // Baseline uptime so a reboot can be proven by a lower value afterwards
+    // (reuses the identity read when it carried uptime).
     let before = if cfg.verify.is_some() && action == MinerAction::Reboot {
-        tokio::time::timeout(cfg.timeout, driver.status()).await.ok().and_then(|r| r.ok())
+        match obs.and_then(|o| o.status).filter(|s| s.uptime_s.is_some()) {
+            Some(s) => Some(s),
+            None => tokio::time::timeout(cfg.timeout, driver.status()).await.ok().and_then(|r| r.ok()),
+        }
     } else {
         None
     };
@@ -228,13 +236,13 @@ async fn one(
         Err(_) if reboot => ev(ip, action, ActionStatus::Rebooting, Some("assumed rebooting: timeout".into())),
         Err(_) => ev(ip, action, ActionStatus::Failed, Some("timeout".into())),
     };
-    drop(driver);
     let Some(vcfg) = &cfg.verify else { return sent };
     if !matches!(sent.status, ActionStatus::Ok | ActionStatus::Rebooting) {
         return sent;
     }
     sink(ev(ip, action, ActionStatus::Verifying, None));
-    verify(ip, action, before, vcfg, cfg.timeout, factory).await
+    // Same driver for every poll: no reconnect / re-identification.
+    verify(ip, action, before, vcfg, cfg.timeout, driver.as_ref()).await
 }
 
 /// Outcome of comparing a fresh status against what the action should produce.
@@ -271,17 +279,13 @@ async fn verify(
     before: Option<MinerStatus>,
     v: &VerifyConfig,
     probe_timeout: Duration,
-    factory: &dyn DriverFactory,
+    driver: &dyn MinerDriver,
 ) -> ActionRowEvent {
     let deadline = tokio::time::Instant::now() + v.timeout;
     let mut last_err: Option<String> = None;
     loop {
         tokio::time::sleep(v.interval).await;
-        let probe = async {
-            let d = factory.connect(ip).await?.ok_or_else(|| anyhow::anyhow!("offline"))?;
-            d.status().await
-        };
-        match tokio::time::timeout(probe_timeout, probe).await {
+        match tokio::time::timeout(probe_timeout, driver.status()).await {
             Ok(Ok(st)) => match check_status(action, before, st) {
                 Check::Done => return ev(ip, action, ActionStatus::Verified, None),
                 Check::Pending => last_err = None,

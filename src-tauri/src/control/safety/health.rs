@@ -4,7 +4,46 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::settings::{HealthSample, SettingsDriver};
+use super::settings::HealthSample;
+use crate::control::driver::MinerDriver;
+
+/// Why a change was judged a failure (alert grouping key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCause {
+    Overheat,
+    Unreachable,
+    HashrateDrop,
+    ReadBackMismatch,
+    WriteFailed,
+    RollbackFailed,
+}
+
+impl FailureCause {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overheat => "overheat",
+            Self::Unreachable => "unreachable",
+            Self::HashrateDrop => "hashrate drop",
+            Self::ReadBackMismatch => "read-back mismatch",
+            Self::WriteFailed => "write failed",
+            Self::RollbackFailed => "rollback failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unhealthy {
+    pub cause: FailureCause,
+    pub reason: String,
+    pub sample: Option<HealthSample>,
+}
+
+impl Unhealthy {
+    fn new(cause: FailureCause, reason: impl Into<String>, sample: Option<HealthSample>) -> Self {
+        Self { cause, reason: reason.into(), sample }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HealthPolicy {
@@ -64,8 +103,8 @@ pub fn judge_hashrate(p: &HealthPolicy, baseline: &HealthSample, s: &HealthSampl
     }
 }
 
-/// Polls for `window`. Ok(last sample) when healthy, Err(reason) otherwise.
-pub async fn watch(d: &dyn SettingsDriver, p: &HealthPolicy, baseline: HealthSample) -> Result<HealthSample, String> {
+/// Polls for `window`. Ok(last sample) when healthy, Err(why) otherwise.
+pub async fn watch(d: &dyn MinerDriver, p: &HealthPolicy, baseline: HealthSample) -> Result<HealthSample, Unhealthy> {
     let start = tokio::time::Instant::now();
     let mut streak = 0u32;
     let mut last_settled: Option<HealthSample> = None;
@@ -75,7 +114,7 @@ pub async fn watch(d: &dyn SettingsDriver, p: &HealthPolicy, baseline: HealthSam
         if s.reachable {
             streak = 0;
             if let Some(r) = judge_temp(p, &s) {
-                return Err(r);
+                return Err(Unhealthy::new(FailureCause::Overheat, r, Some(s)));
             }
             if start.elapsed() >= p.settle {
                 last_settled = Some(s);
@@ -83,18 +122,18 @@ pub async fn watch(d: &dyn SettingsDriver, p: &HealthPolicy, baseline: HealthSam
         } else {
             streak += 1;
             if streak > p.max_unreachable_polls {
-                return Err(format!("unreachable for {streak} consecutive polls"));
+                return Err(Unhealthy::new(FailureCause::Unreachable, format!("unreachable for {streak} consecutive polls"), Some(s)));
             }
         }
         if start.elapsed() >= p.window {
             let Some(last) = last_settled else {
-                return Err("no reachable sample after settle time".into());
+                return Err(Unhealthy::new(FailureCause::Unreachable, "no reachable sample after settle time", Some(s)));
             };
             if !s.reachable {
-                return Err("unreachable at end of watch window".into());
+                return Err(Unhealthy::new(FailureCause::Unreachable, "unreachable at end of watch window", Some(s)));
             }
             return match judge_hashrate(p, &baseline, &last) {
-                Some(r) => Err(r),
+                Some(r) => Err(Unhealthy::new(FailureCause::HashrateDrop, r, Some(last))),
                 None => Ok(last),
             };
         }

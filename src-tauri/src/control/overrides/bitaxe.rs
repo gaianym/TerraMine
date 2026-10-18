@@ -14,7 +14,10 @@ use reqwest::Client;
 use semver::Version;
 use serde_json::Value;
 
-use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus};
+use crate::control::cache::DriverKind;
+use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, MinerStatus, Observation};
+use crate::control::safety::axeos::{health_from_info, AxeOsSettings};
+use crate::control::safety::settings::{HealthSample, SettingsDriver};
 use crate::control::safety::DeviceProfile;
 
 /// Minimum AxeOS version that exposes pause/resume endpoints.
@@ -97,6 +100,11 @@ impl BitaxeDriver {
                 .unwrap_or(false)
     }
 
+    async fn info(&self) -> anyhow::Result<Value> {
+        let url = format!("{}/api/system/info", self.base);
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
+    }
+
     async fn post(&self, path: &str) -> anyhow::Result<bool> {
         let url = format!("{}{path}", self.base);
         let resp = self.client.post(url).send().await?;
@@ -131,11 +139,32 @@ impl MinerDriver for BitaxeDriver {
     }
 
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
+        Box::pin(async move { Ok(parse_axeos_status(&self.info().await?)) })
+    }
+
+    fn kind(&self) -> DriverKind {
+        DriverKind::AxeOs
+    }
+
+    /// Status and identity come from the same `/api/system/info` read.
+    fn observe(&self) -> BoxFuture<'_, anyhow::Result<Option<Observation>>> {
         Box::pin(async move {
-            let url = format!("{}/api/system/info", self.base);
-            let body: Value = self.client.get(url).send().await?.error_for_status()?.json().await?;
-            Ok(parse_axeos_status(&body))
+            let body = self.info().await?;
+            Ok(Some(Observation { status: Some(parse_axeos_status(&body)), identity: parse_axeos_identity(&body) }))
         })
+    }
+
+    fn health(&self) -> BoxFuture<'_, HealthSample> {
+        Box::pin(async move {
+            match self.info().await {
+                Ok(v) => health_from_info(&v),
+                Err(_) => HealthSample::unreachable(),
+            }
+        })
+    }
+
+    fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
+        vec![Box::new(AxeOsSettings::new(self.base.clone(), self.client.clone()))]
     }
 
     fn profile(&self) -> DeviceProfile {
@@ -153,6 +182,12 @@ pub fn parse_axeos_status(body: &Value) -> MinerStatus {
         uptime_s: body.get("uptimeSeconds").and_then(|v| v.as_u64()),
         paused: body.get("miningPaused").and_then(|v| v.as_bool()),
     }
+}
+
+/// MAC (`macAddr`) and firmware version from AxeOS system info.
+pub fn parse_axeos_identity(body: &Value) -> Identity {
+    let s = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Identity { mac: s("macAddr"), firmware: s("version").or_else(|| s("axeOSVersion")) }
 }
 
 pub fn looks_like_axeos(body: &Value) -> bool {
@@ -173,7 +208,7 @@ pub fn parse_axeos_version(body: &Value) -> Option<Version> {
     None
 }
 
-fn parse_loose_version(s: &str) -> Option<Version> {
+pub fn parse_loose_version(s: &str) -> Option<Version> {
     let trimmed = s.trim().trim_start_matches('v');
     // Take major.minor.patch prefix; ignore trailing build metadata junk.
     let mut parts = trimmed.split(|c: char| !c.is_ascii_digit() && c != '.');

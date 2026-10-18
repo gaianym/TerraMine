@@ -28,9 +28,12 @@ use tokio::net::TcpListener;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::driver::{DriverFactory, MinerDriver};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use super::cache::{CachedDevice, DriverKind};
+use super::driver::{DriverFactory, Identity, MinerDriver};
 use super::overrides::{BitaxeDriver, DigestCredentials, S9StockDriver};
-use super::safety::paths::Target;
+use super::safety::audit::now_ms;
 use super::safety::DeviceProfile;
 
 /// How a mock misbehaves once its frequency/voltage leave the known-good values.
@@ -73,6 +76,9 @@ struct State {
     /// Accept PATCH with 200 but do not apply it (read-back mismatch).
     ignore_writes: bool,
     requests: Vec<String>,
+    mac: String,
+    /// Simulated network/pool outage: reachable but hashing at 0.
+    outage: bool,
 }
 
 impl State {
@@ -131,6 +137,16 @@ impl MockMiner {
     pub fn set_fault(&self, f: Option<Fault>) {
         self.state.lock().unwrap().fault = f;
     }
+    pub fn set_outage(&self, v: bool) {
+        self.state.lock().unwrap().outage = v;
+    }
+    pub fn mac(&self) -> String {
+        self.state.lock().unwrap().mac.clone()
+    }
+    /// Simulate a different device answering at this address.
+    pub fn set_mac(&self, mac: &str) {
+        self.state.lock().unwrap().mac = mac.to_string();
+    }
     pub fn set_ignore_writes(&self, v: bool) {
         self.state.lock().unwrap().ignore_writes = v;
     }
@@ -166,10 +182,13 @@ impl MockMiner {
             fault: None,
             ignore_writes: false,
             requests: Vec::new(),
+            mac: String::new(),
+            outage: false,
         }));
         let stop = CancellationToken::new();
         let l = TcpListener::bind("127.0.0.1:0").await?;
         let http = l.local_addr()?;
+        state.lock().unwrap().mac = format!("02:00:00:00:{:02X}:{:02X}", http.port() >> 8, http.port() & 0xff);
         tokio::spawn(serve_http(l, state.clone(), creds.clone(), stop.clone()));
         let cgminer = if matches!(kind, MockKind::S9Stock { .. }) {
             let l = TcpListener::bind("127.0.0.1:0").await?;
@@ -200,7 +219,8 @@ async fn serve_cgminer(l: TcpListener, st: Arc<Mutex<State>>, stop: Cancellation
                 if !s.online() {
                     return; // drop the socket while "rebooting"
                 }
-                format!(r#"{{"STATUS":[{{"STATUS":"S"}}],"SUMMARY":[{{"Elapsed":{},"GHS 5s":"13500"}}],"id":1}}"#, s.uptime())
+                let ghs = if s.outage || s.paused { "0" } else { "13500" };
+                format!(r#"{{"STATUS":[{{"STATUS":"S"}}],"SUMMARY":[{{"Elapsed":{},"GHS 5s":"{ghs}"}}],"id":1}}"#, s.uptime())
             };
             let mut out = reply.into_bytes();
             out.push(0);
@@ -338,10 +358,11 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     let paused = if new { format!(r#","miningPaused":{}"#, s.paused) } else { String::new() };
                     let fault = s.degraded();
                     let dead = matches!(fault, Some(Fault::HashrateDrop | Fault::Unreachable));
-                    let hr = if s.paused || dead { 0.0 } else { 1180.5 };
+                    let hr = if s.paused || dead || s.outage { 0.0 } else { 1180.5 };
                     let temp = if fault == Some(Fault::Overheat) { 95.0 } else { 52.5 };
                     let body = format!(
-                        r#"{{"ASICModel":"BM1370","boardVersion":"601","version":"{ver}","axeOSVersion":"{ver}","uptimeSeconds":{},"hashRate":{hr},"temp":{temp},"frequency":{},"coreVoltage":{},"fanspeed":{},"autofanspeed":{}{paused}}}"#,
+                        r#"{{"ASICModel":"BM1370","boardVersion":"601","version":"{ver}","axeOSVersion":"{ver}","macAddr":"{}","uptimeSeconds":{},"hashRate":{hr},"temp":{temp},"frequency":{},"coreVoltage":{},"fanspeed":{},"autofanspeed":{}{paused}}}"#,
+                        s.mac,
                         s.uptime(),
                         s.frequency,
                         s.core_voltage,
@@ -403,6 +424,10 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     };
                     http("200 OK", "", &body)
                 }
+                "/cgi-bin/get_system_info.cgi" => {
+                    let body = format!(r#"{{"macaddr":"{}","system_filesystem_version":"Thu May 31 2018","minertype":"Antminer S9"}}"#, s.mac);
+                    http("200 OK", "", &body)
+                }
                 "/cgi-bin/reboot.cgi" => {
                     s.reboot();
                     http("200 OK", "", "{}")
@@ -423,43 +448,77 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
     }
 }
 
-/// Factory that maps fake IPs to mock miners on 127.0.0.1 ports.
+/// Factory that maps fake IPs to mock miners on 127.0.0.1 ports. Counts
+/// full identifications (`connects`) and cache rebuilds (`builds`).
 pub struct MockMinerFactory {
     pub timeout: Duration,
     pub miners: HashMap<IpAddr, (MockKind, String, Option<SocketAddr>, DigestCredentials)>,
+    macs: HashMap<IpAddr, String>,
+    connects: AtomicUsize,
+    builds: AtomicUsize,
 }
 
 impl MockMinerFactory {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout, miners: HashMap::new() }
+        Self { timeout, miners: HashMap::new(), macs: HashMap::new(), connects: AtomicUsize::new(0), builds: AtomicUsize::new(0) }
     }
     pub fn add(&mut self, ip: IpAddr, m: &MockMiner) {
         self.miners.insert(ip, (m.kind, m.base(), m.cgminer, m.creds.clone()));
+        self.macs.insert(ip, m.mac());
     }
-}
-
-impl MockMinerFactory {
-    /// Safety-layer target for a mock: identity mirrors what the real
-    /// drivers report for that firmware.
-    pub fn target(&self, ip: IpAddr) -> Option<Target> {
-        let (kind, base, cg, _) = self.miners.get(&ip)?;
-        let profile = match kind {
-            MockKind::AxeOs210 => DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS 2.10.1", Some("BM1370")),
-            MockKind::AxeOs215 => DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS 2.15.3", Some("BM1370")),
-            MockKind::S9Stock { .. } => DeviceProfile::classify("AntMiner", "Antminer S9", "Stock", None),
+    /// Full identifications performed.
+    pub fn connects(&self) -> usize {
+        self.connects.load(Ordering::SeqCst)
+    }
+    /// Drivers rebuilt from a cached record (no identification).
+    pub fn builds(&self) -> usize {
+        self.builds.load(Ordering::SeqCst)
+    }
+    /// What discovery would cache for this mock (no driver yet).
+    pub fn discovered(&self, ip: IpAddr) -> Option<CachedDevice> {
+        let (kind, ..) = self.miners.get(&ip)?;
+        let (profile, kind, fw) = match kind {
+            MockKind::AxeOs210 => (DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS 2.10.1", Some("BM1370")), DriverKind::AxeOs, "v2.10.1"),
+            MockKind::AxeOs215 => (DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS 2.15.3", Some("BM1370")), DriverKind::AxeOs, "v2.15.3"),
+            MockKind::S9Stock { .. } => (DeviceProfile::classify("AntMiner", "Antminer S9", "Stock", None), DriverKind::S9Stock, "Thu May 31 2018"),
         };
-        let mut t = Target::for_ip(ip, profile);
-        t.http_base = base.clone();
-        if let Some(a) = cg {
-            t.cgminer_addr = a.to_string();
-        }
-        Some(t)
+        Some(CachedDevice {
+            profile,
+            identity: Identity { mac: self.macs.get(&ip).cloned(), firmware: Some(fw.into()) },
+            kind,
+            seen_at_ms: now_ms(),
+            miner: None,
+            driver: None,
+        })
     }
 }
 
 impl DriverFactory for MockMinerFactory {
+    fn build<'a>(&'a self, ip: IpAddr, _c: &'a CachedDevice) -> BoxFuture<'a, anyhow::Result<Option<Box<dyn MinerDriver>>>> {
+        Box::pin(async move {
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            let Some((kind, base, cg, creds)) = self.miners.get(&ip).cloned() else { return Ok(None) };
+            let client = reqwest::Client::builder().timeout(self.timeout).no_proxy().build()?;
+            Ok(Some(match kind {
+                MockKind::AxeOs210 | MockKind::AxeOs215 => {
+                    let v = if kind == MockKind::AxeOs215 { semver::Version::new(2, 15, 3) } else { semver::Version::new(2, 10, 1) };
+                    Box::new(BitaxeDriver::from_parts(ip, base, client, Some(v), false).with_asic_model(Some("BM1370".into())))
+                        as Box<dyn MinerDriver>
+                }
+                MockKind::S9Stock { miner_mode } => {
+                    let d = S9StockDriver::from_parts(ip, base, client, creds, miner_mode);
+                    Box::new(match cg {
+                        Some(a) => d.with_cgminer_addr(a.to_string()),
+                        None => d,
+                    }) as Box<dyn MinerDriver>
+                }
+            }))
+        })
+    }
+
     fn connect(&self, ip: IpAddr) -> BoxFuture<'_, anyhow::Result<Option<Box<dyn MinerDriver>>>> {
         Box::pin(async move {
+            self.connects.fetch_add(1, Ordering::SeqCst);
             let Some((kind, base, cg, creds)) = self.miners.get(&ip).cloned() else { return Ok(None) };
             Ok(match kind {
                 MockKind::AxeOs210 | MockKind::AxeOs215 => BitaxeDriver::probe_at(ip, base, self.timeout)

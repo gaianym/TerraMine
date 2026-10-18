@@ -1,32 +1,37 @@
 //! The guarded write sequence for settings changes:
 //!
-//! preflight → limits → open path (fallback chain) → [dry run stops here]
-//! → audit "attempt" → snapshot → write → read-back → health watch
-//! → (on any failure after the write) rollback to the snapshot → audit "outcome".
+//! preflight → limits → pick backend (asic-rs if it supports the change,
+//! else the AxeOS override, else refuse with a reason) → [dry run stops
+//! here] → audit "attempt" → snapshot → write → read-back → health watch
+//! → (on any failure after the write) rollback to the snapshot → audit
+//! "outcome".
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 
 use super::audit::{now_ms, AuditRecord, AuditSink};
-use super::health::{self, HealthPolicy};
+use super::health::{self, FailureCause, HealthPolicy};
 use super::limits::LimitsTable;
-use super::paths::{FallbackChain, Target};
 use super::policy::{preflight, ActionKind, Confirmation};
-use super::settings::{Settings, SettingsDriver};
+use super::profile::DeviceProfile;
+use super::settings::{HealthSample, Settings, SettingsDriver};
 use super::snapshot::{Snapshot, SnapshotStore};
+use crate::control::driver::MinerDriver;
 
 #[derive(Debug, Clone)]
 pub struct SafetyOptions {
-    /// Per-request I/O timeout (probe, read, write).
+    /// Per-request I/O timeout (read, write).
     pub op_timeout: Duration,
     /// How long read-back may retry (device may restart to apply).
     pub readback_timeout: Duration,
     pub health: HealthPolicy,
     /// How long rollback keeps retrying an unreachable device.
     pub rollback_timeout: Duration,
-    /// Allow paths not yet confirmed on real hardware (mock tests only).
+    /// Allow backends not yet confirmed on real hardware (mock tests only).
     pub allow_unconfirmed_paths: bool,
 }
 
@@ -66,6 +71,8 @@ pub enum WriteStatus {
     Verified,
     RolledBack,
     RollbackFailed,
+    /// Not attempted (e.g. job halted after a bad first wave).
+    Skipped,
 }
 
 impl WriteStatus {
@@ -78,7 +85,12 @@ impl WriteStatus {
             Self::Verified => "verified",
             Self::RolledBack => "rolled_back",
             Self::RollbackFailed => "rollback_failed",
+            Self::Skipped => "skipped",
         }
+    }
+    /// Counts against the canary threshold.
+    pub fn is_failure(self) -> bool {
+        matches!(self, Self::RolledBack | Self::RollbackFailed | Self::Failed)
     }
 }
 
@@ -89,11 +101,62 @@ pub struct WriteOutcome {
     pub msg: Option<String>,
     pub snapshot_id: Option<String>,
     pub paths_tried: Vec<String>,
+    /// Grouping key for alerts (`RollbackFailed` when the restore failed).
+    pub cause: Option<FailureCause>,
+    /// What triggered the rollback when the rollback itself failed.
+    pub trigger: Option<FailureCause>,
+    /// Snapshot values (before the change).
+    pub before: Option<Settings>,
+    pub attempted: Option<Settings>,
+    /// Values read at the end (after verify or rollback).
+    pub after: Option<Settings>,
+    /// Health sample that failed the watch.
+    pub sample: Option<HealthSample>,
+    /// Set by the batch runner when untouched miners degraded concurrently.
+    pub likely_external: bool,
+    /// Skip reason, e.g. "halted".
+    pub skip_reason: Option<String>,
+    #[serde(skip)]
+    pub window: Option<(Instant, Instant)>,
+}
+
+impl WriteOutcome {
+    pub fn new(ip: impl Into<String>, status: WriteStatus, msg: Option<String>) -> Self {
+        Self {
+            ip: ip.into(),
+            status,
+            msg,
+            snapshot_id: None,
+            paths_tried: Vec::new(),
+            cause: None,
+            trigger: None,
+            before: None,
+            attempted: None,
+            after: None,
+            sample: None,
+            likely_external: false,
+            skip_reason: None,
+            window: None,
+        }
+    }
+}
+
+/// A resolved device: identity from the cache plus its driver.
+#[derive(Clone)]
+pub struct Target {
+    pub ip: IpAddr,
+    pub profile: DeviceProfile,
+    pub driver: Arc<dyn MinerDriver>,
+}
+
+impl Target {
+    pub fn new(ip: IpAddr, driver: Arc<dyn MinerDriver>) -> Self {
+        Self { ip, profile: driver.profile(), driver }
+    }
 }
 
 pub struct SafetyEngine {
     pub limits: Arc<LimitsTable>,
-    pub chain: FallbackChain,
     pub snapshots: Arc<SnapshotStore>,
     pub audit: Arc<dyn AuditSink>,
     pub opts: SafetyOptions,
@@ -103,45 +166,70 @@ struct Ctx<'a> {
     run_id: &'a str,
     t: &'a Target,
     req: &'a SafeWriteRequest,
-    paths: Vec<String>,
-    snapshot_id: Option<String>,
+    out: WriteOutcome,
+    started: Option<Instant>,
 }
 
 impl SafetyEngine {
     pub fn new(audit: Arc<dyn AuditSink>, snapshots: Arc<SnapshotStore>, opts: SafetyOptions) -> Self {
-        Self { limits: Arc::new(LimitsTable::builtin()), chain: FallbackChain::builtin(), snapshots, audit, opts }
+        Self { limits: Arc::new(LimitsTable::builtin()), snapshots, audit, opts }
     }
 
-    fn record(&self, c: &Ctx<'_>, phase: &str, outcome: &str, msg: Option<String>) -> std::io::Result<()> {
+    pub(crate) fn record_outcome(&self, run_id: &str, profile: Option<&DeviceProfile>, req: &SafeWriteRequest, o: &WriteOutcome, phase: &str) -> std::io::Result<()> {
         self.audit.record(&AuditRecord {
             ts_ms: now_ms(),
-            run_id: c.run_id.to_string(),
-            ip: c.t.ip.to_string(),
+            run_id: run_id.to_string(),
+            ip: o.ip.clone(),
             action: ActionKind::ApplySettings.name().into(),
             phase: phase.into(),
-            dry_run: c.req.dry_run,
+            dry_run: req.dry_run,
             irreversible: false,
-            device_class: Some(c.t.profile.class),
-            model: Some(c.t.profile.model.clone()),
-            firmware: Some(c.t.profile.firmware.clone()),
-            requested: serde_json::to_value(&c.req.change).ok(),
-            snapshot_id: c.snapshot_id.clone(),
-            pre_state: None,
-            paths_tried: c.paths.clone(),
-            outcome: outcome.into(),
-            msg,
+            device_class: profile.map(|p| p.class),
+            model: profile.map(|p| p.model.clone()),
+            firmware: profile.map(|p| p.firmware.clone()),
+            requested: serde_json::to_value(&req.change).ok(),
+            snapshot_id: o.snapshot_id.clone(),
+            pre_state: o.before.as_ref().and_then(|b| serde_json::to_value(b).ok()),
+            paths_tried: o.paths_tried.clone(),
+            outcome: if phase == "attempt" { "pending".into() } else { o.status.as_str().into() },
+            msg: o.msg.clone(),
         })
     }
 
-    fn finish(&self, c: Ctx<'_>, status: WriteStatus, msg: Option<String>) -> WriteOutcome {
-        if let Err(e) = self.record(&c, "outcome", status.as_str(), msg.clone()) {
+    fn finish(&self, mut c: Ctx<'_>, status: WriteStatus, msg: Option<String>) -> WriteOutcome {
+        c.out.status = status;
+        c.out.msg = msg;
+        c.out.window = c.started.map(|s| (s, Instant::now()));
+        if let Err(e) = self.record_outcome(c.run_id, Some(&c.t.profile), c.req, &c.out, "outcome") {
             eprintln!("audit: failed to record outcome for {}: {e}", c.t.ip);
         }
-        WriteOutcome { ip: c.t.ip.to_string(), status, msg, snapshot_id: c.snapshot_id, paths_tried: c.paths }
+        c.out
+    }
+
+    /// asic-rs backend if it can do the change, else the AxeOS override,
+    /// else none — each skip is reported with its reason.
+    fn select(&self, t: &Target, change: &Settings) -> (Option<Box<dyn SettingsDriver>>, Vec<String>) {
+        let mut tried = Vec::new();
+        let backends = t.driver.settings_backends();
+        if backends.is_empty() {
+            tried.push(format!("{}: no settings write path for this device", t.driver.kind().label()));
+        }
+        for b in backends {
+            if let Err(reason) = b.accepts(&t.profile, change) {
+                tried.push(format!("{}: skipped ({reason})", b.id()));
+            } else if !b.hardware_confirmed() && !self.opts.allow_unconfirmed_paths {
+                tried.push(format!("{}: skipped (not yet confirmed on real hardware)", b.id()));
+            } else {
+                tried.push(format!("{}: selected", b.id()));
+                return (Some(b), tried);
+            }
+        }
+        (None, tried)
     }
 
     pub async fn apply_settings(&self, run_id: &str, t: &Target, req: &SafeWriteRequest) -> WriteOutcome {
-        let mut c = Ctx { run_id, t, req, paths: Vec::new(), snapshot_id: None };
+        let mut c = Ctx { run_id, t, req, out: WriteOutcome::new(t.ip.to_string(), WriteStatus::Refused, None), started: None };
+        c.out.attempted = Some(req.change.clone());
         let to = self.opts.op_timeout;
         if let Err(r) = preflight(ActionKind::ApplySettings, 1, req.dry_run, &req.confirm) {
             return self.finish(c, WriteStatus::Refused, Some(r.to_string()));
@@ -153,10 +241,10 @@ impl SafetyEngine {
             Ok(e) => e.clone(),
             Err(v) => return self.finish(c, WriteStatus::Refused, Some(v.join("; "))),
         };
-        let (opened, attempts) = self.chain.open(t, &req.change, self.opts.allow_unconfirmed_paths, to).await;
-        c.paths = attempts.iter().map(|a| a.to_string()).collect();
-        let Some((_, drv)) = opened else {
-            let msg = format!("no write path accepted {}; tried: {}", t.ip, c.paths.join("; "));
+        let (backend, tried) = self.select(t, &req.change);
+        c.out.paths_tried = tried;
+        let Some(drv) = backend else {
+            let msg = format!("no write path accepted {}; tried: {}", t.ip, c.out.paths_tried.join("; "));
             return self.finish(c, WriteStatus::NoPath, Some(msg));
         };
         let drv = drv.as_ref();
@@ -170,7 +258,7 @@ impl SafetyEngine {
         }
 
         // The attempt must be on record before the device is touched.
-        if let Err(e) = self.record(&c, "attempt", "pending", None) {
+        if let Err(e) = self.record_outcome(run_id, Some(&t.profile), req, &c.out, "attempt") {
             return self.finish(c, WriteStatus::Refused, Some(format!("audit log unavailable, refusing write: {e}")));
         }
         let current = match timed(to, drv.read()).await {
@@ -187,18 +275,21 @@ impl SafetyEngine {
             Ok(s) => s,
             Err(e) => return self.finish(c, WriteStatus::Failed, Some(format!("snapshot store unavailable: {e}"))),
         };
-        c.snapshot_id = Some(snap.id.clone());
-        let baseline = drv.health().await;
+        c.out.snapshot_id = Some(snap.id.clone());
+        c.out.before = Some(snap.settings.clone());
+        let baseline = t.driver.health().await;
         let policy = self.opts.health.clone().with_temp_ceiling(entry.max_temp_c);
+        c.started = Some(Instant::now());
 
         if let Err(e) = timed(to, drv.write(&req.change)).await {
-            return self.rollback(c, drv, &snap, format!("write failed: {e}")).await;
+            return self.rollback(c, drv, &snap, FailureCause::WriteFailed, format!("write failed: {e}"), None).await;
         }
         if let Err(r) = self.read_back(drv, &req.change).await {
-            return self.rollback(c, drv, &snap, format!("read-back failed: {r}")).await;
+            return self.rollback(c, drv, &snap, FailureCause::ReadBackMismatch, format!("read-back failed: {r}"), None).await;
         }
-        match health::watch(drv, &policy, baseline).await {
+        match health::watch(t.driver.as_ref(), &policy, baseline).await {
             Ok(s) => {
+                c.out.after = timed(to, drv.read()).await.ok().map(|a| a.restrict_to(&req.change));
                 let msg = format!(
                     "applied {}; healthy (hashrate {:?} GH/s, temp {:?}°C)",
                     snap.settings.describe_change(&req.change),
@@ -207,12 +298,15 @@ impl SafetyEngine {
                 );
                 self.finish(c, WriteStatus::Verified, Some(msg))
             }
-            Err(r) => self.rollback(c, drv, &snap, format!("unhealthy after change: {r}")).await,
+            Err(u) => {
+                let reason = format!("unhealthy after change: {}", u.reason);
+                self.rollback(c, drv, &snap, u.cause, reason, u.sample).await
+            }
         }
     }
 
     async fn read_back(&self, drv: &dyn SettingsDriver, want: &Settings) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + self.opts.readback_timeout;
+        let deadline = Instant::now() + self.opts.readback_timeout;
         loop {
             let last = match timed(self.opts.op_timeout, drv.read()).await {
                 Ok(got) => {
@@ -224,33 +318,49 @@ impl SafetyEngine {
                 }
                 Err(e) => e.to_string(),
             };
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 return Err(last);
             }
             tokio::time::sleep(self.opts.health.interval).await;
         }
     }
 
-    async fn rollback(&self, c: Ctx<'_>, drv: &dyn SettingsDriver, snap: &Snapshot, reason: String) -> WriteOutcome {
-        let deadline = tokio::time::Instant::now() + self.opts.rollback_timeout;
+    async fn rollback(
+        &self,
+        mut c: Ctx<'_>,
+        drv: &dyn SettingsDriver,
+        snap: &Snapshot,
+        cause: FailureCause,
+        reason: String,
+        sample: Option<HealthSample>,
+    ) -> WriteOutcome {
+        c.out.sample = sample;
+        let deadline = Instant::now() + self.opts.rollback_timeout;
         let to = self.opts.op_timeout;
         loop {
             let last = match timed(to, drv.write(&snap.settings)).await {
                 Ok(()) => match timed(to, drv.read()).await {
                     Ok(got) if got.mismatches(&snap.settings).is_empty() => {
-                        let h = drv.health().await;
+                        c.out.after = Some(got.restrict_to(&snap.settings));
+                        c.out.cause = Some(cause);
+                        let h = c.t.driver.health().await;
                         let msg = format!(
                             "{reason}; rolled back to snapshot {} (reachable {}, hashrate {:?} GH/s, temp {:?}°C)",
                             snap.id, h.reachable, h.hashrate_ghs, h.temp_c
                         );
                         return self.finish(c, WriteStatus::RolledBack, Some(msg));
                     }
-                    Ok(got) => format!("read-back mismatch: {}", got.mismatches(&snap.settings).join(", ")),
+                    Ok(got) => {
+                        c.out.after = Some(got.restrict_to(&snap.settings));
+                        format!("read-back mismatch: {}", got.mismatches(&snap.settings).join(", "))
+                    }
                     Err(e) => e.to_string(),
                 },
                 Err(e) => e.to_string(),
             };
-            if tokio::time::Instant::now() >= deadline {
+            if Instant::now() >= deadline {
+                c.out.cause = Some(FailureCause::RollbackFailed);
+                c.out.trigger = Some(cause);
                 let msg = format!("{reason}; ROLLBACK FAILED to snapshot {} ({:?}): {last}", snap.id, snap.settings);
                 return self.finish(c, WriteStatus::RollbackFailed, Some(msg));
             }

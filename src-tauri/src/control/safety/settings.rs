@@ -86,10 +86,14 @@ impl HealthSample {
     }
 }
 
-/// A device opened by a write path.
+/// A settings write backend for one device (asic-rs or the AxeOS override).
 pub trait SettingsDriver: Send + Sync {
+    fn id(&self) -> &'static str;
+    /// False until verified against real hardware; such backends are only
+    /// used when the caller explicitly allows it (mock tests).
+    fn hardware_confirmed(&self) -> bool;
+    /// Static check, no I/O. Err = reason this backend cannot do the change.
+    fn accepts(&self, p: &super::profile::DeviceProfile, change: &Settings) -> Result<(), String>;
     fn read(&self) -> BoxFuture<'_, anyhow::Result<Settings>>;
     fn write(&self, s: &Settings) -> BoxFuture<'_, anyhow::Result<()>>;
-    /// Never errors: an unreachable device is a sample, not a failure.
-    fn health(&self) -> BoxFuture<'_, HealthSample>;
 }

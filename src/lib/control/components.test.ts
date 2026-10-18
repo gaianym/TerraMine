@@ -8,6 +8,8 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) })
 const { default: ActionDialog } = await import("./ActionDialog.svelte");
 const { default: ControlToolbar } = await import("./ControlToolbar.svelte");
 const { control } = await import("./controlState.svelte");
+const { default: SafetyAlertBanner } = await import("./SafetyAlertBanner.svelte");
+const { sampleAlert } = await import("./alertFixtures");
 
 function dryRunInput(html: string): string {
   const m = html.match(/<input[^>]*data-testid="tm-dry-run"[^>]*>/);
@@ -49,5 +51,28 @@ describe("ControlToolbar run summary", () => {
     expect(body).toContain("Dry run: 5/5 would be sent");
     expect(body).toMatch(/data-kind="dry"/);
     expect(body).not.toContain("Last run: 0/5 ok");
+  });
+});
+
+describe("SafetyAlertBanner", () => {
+  it("renders the grouped headline, retry and dismiss", () => {
+    const { body } = render(SafetyAlertBanner, { props: { initial: [sampleAlert()] } });
+    expect(body).toContain("3 of 4 rolled back");
+    expect(body).toMatch(/Retry 3 miners \(dry run\)/);
+    expect(body).toContain("Dismiss");
+    expect(body).toMatch(/data-tone="warn"/);
+  });
+
+  it("shows the likely-external note", () => {
+    const note = "likely external (network/pool): 2 of 2 failures coincided with degradation on untouched miners (192.0.2.9)";
+    const { body } = render(SafetyAlertBanner, {
+      props: { initial: [sampleAlert({ likely_external: true, external_note: note })] },
+    });
+    expect(body).toContain(note);
+  });
+
+  it("renders nothing without alerts", () => {
+    const { body } = render(SafetyAlertBanner, { props: {} });
+    expect(body).not.toContain("tm-safety-alert");
   });
 });

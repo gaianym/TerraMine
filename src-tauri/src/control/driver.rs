@@ -8,6 +8,7 @@
 //!   error or timeout on reboot is reported as "probably rebooting".
 
 use std::net::IpAddr;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
@@ -17,7 +18,9 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
+use super::cache::{CachedDevice, DriverKind};
 use super::overrides::{BitaxeDriver, DigestCredentials, S9StockDriver};
+use super::safety::settings::{HealthSample, SettingsDriver};
 use super::safety::DeviceProfile;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -59,6 +62,70 @@ pub trait MinerDriver: Send + Sync {
     fn profile(&self) -> DeviceProfile {
         DeviceProfile::unknown()
     }
+    /// Which driver family built this (cached so actions can rebuild it
+    /// without identifying the device again).
+    fn kind(&self) -> DriverKind {
+        DriverKind::AsicRs
+    }
+    /// One cheap read: current status plus MAC/firmware, used to check the
+    /// cached identity is still right. `Ok(None)` = no identity read
+    /// available for this driver (nothing is sent).
+    fn observe(&self) -> BoxFuture<'_, anyhow::Result<Option<Observation>>> {
+        Box::pin(async { Ok(None) })
+    }
+    /// Health sample for the post-change watch. Never errors.
+    fn health(&self) -> BoxFuture<'_, HealthSample> {
+        Box::pin(async move {
+            match self.status().await {
+                Ok(_) => HealthSample { reachable: true, hashrate_ghs: None, temp_c: None },
+                Err(_) => HealthSample::unreachable(),
+            }
+        })
+    }
+    /// Settings write backends for this device, in preference order.
+    /// Empty = this device has no settings write path.
+    fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
+        Vec::new()
+    }
+}
+
+/// MAC + firmware as reported by the device right now.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    pub mac: Option<String>,
+    pub firmware: Option<String>,
+}
+
+impl Identity {
+    /// `Some(reason)` when both sides report a field and the values differ.
+    pub fn mismatch(&self, now: &Identity) -> Option<String> {
+        // Formatting differences (case, MAC separators, a leading "v" on
+        // versions, spacing) are not a different device.
+        let mac = |s: &str| s.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>().to_ascii_lowercase();
+        let norm = |s: &str| {
+            let s: String = s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase();
+            s.strip_prefix('v').filter(|r| r.starts_with(|c: char| c.is_ascii_digit())).map(str::to_string).unwrap_or(s)
+        };
+        let mut why = Vec::new();
+        if let (Some(a), Some(b)) = (&self.mac, &now.mac) {
+            if mac(a) != mac(b) {
+                why.push(format!("MAC {a} → {b}"));
+            }
+        }
+        if let (Some(a), Some(b)) = (&self.firmware, &now.firmware) {
+            if norm(a) != norm(b) {
+                why.push(format!("firmware {a} → {b}"));
+            }
+        }
+        (!why.is_empty()).then(|| why.join(", "))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Observation {
+    /// Status from the same read when available (reboot baseline).
+    pub status: Option<MinerStatus>,
+    pub identity: Identity,
 }
 
 /// Snapshot used to verify an action took effect.
@@ -72,18 +139,30 @@ pub struct MinerStatus {
 
 /// Resolves an IP to a driver (None = no miner found).
 pub trait DriverFactory: Send + Sync {
+    /// Full identification (the expensive path).
     fn connect(&self, ip: IpAddr) -> BoxFuture<'_, anyhow::Result<Option<Box<dyn MinerDriver>>>>;
+    /// Build a driver from a cached discovery record without identifying.
+    /// Default falls back to [`Self::connect`].
+    fn build<'a>(&'a self, ip: IpAddr, cached: &'a CachedDevice) -> BoxFuture<'a, anyhow::Result<Option<Box<dyn MinerDriver>>>> {
+        let _ = cached;
+        self.connect(ip)
+    }
 }
 
 // ---------------- asic-rs backed driver ----------------
 
+pub type SharedMiner = Arc<dyn asic_rs_core::traits::miner::Miner>;
+
 pub struct AsicRsDriver {
     ip: IpAddr,
-    miner: Box<dyn asic_rs_core::traits::miner::Miner>,
+    miner: SharedMiner,
 }
 
 impl AsicRsDriver {
     pub fn new(ip: IpAddr, miner: Box<dyn asic_rs_core::traits::miner::Miner>) -> Self {
+        Self { ip, miner: Arc::from(miner) }
+    }
+    pub fn from_shared(ip: IpAddr, miner: SharedMiner) -> Self {
         Self { ip, miner }
     }
 }
@@ -117,6 +196,22 @@ impl MinerDriver for AsicRsDriver {
     fn profile(&self) -> DeviceProfile {
         let i = self.miner.get_device_info();
         DeviceProfile::classify(&i.make, &i.model, &i.firmware, None)
+    }
+    fn observe(&self) -> BoxFuture<'_, anyhow::Result<Option<Observation>>> {
+        Box::pin(async move {
+            let mac = self.miner.get_mac().await.map(|m| m.to_string());
+            let firmware = self.miner.get_firmware_version().await;
+            if mac.is_none() && firmware.is_none() {
+                anyhow::bail!("no identity reported");
+            }
+            Ok(Some(Observation { status: None, identity: Identity { mac, firmware } }))
+        })
+    }
+    fn health(&self) -> BoxFuture<'_, HealthSample> {
+        Box::pin(async move { super::safety::asic::health_from_miner_data(&self.miner.get_data().await) })
+    }
+    fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
+        vec![Box::new(super::safety::asic::AsicRsSettings::new(self.miner.clone()))]
     }
 }
 
@@ -183,6 +278,31 @@ impl OverlayFactory {
 }
 
 impl DriverFactory for OverlayFactory {
+    /// Rebuild from the discovery cache: no identification requests. The
+    /// stock-S9 override needs one config read for its miner-mode flag;
+    /// the resulting driver is memoized by the cache.
+    fn build<'a>(&'a self, ip: IpAddr, c: &'a CachedDevice) -> BoxFuture<'a, anyhow::Result<Option<Box<dyn MinerDriver>>>> {
+        Box::pin(async move {
+            Ok(match c.kind {
+                DriverKind::AxeOs => {
+                    let client = reqwest::Client::builder().timeout(self.timeout).no_proxy().build()?;
+                    let version = c.firmware().and_then(super::overrides::bitaxe::parse_loose_version);
+                    Some(Box::new(
+                        BitaxeDriver::from_parts(ip, format!("http://{ip}"), client, version, false)
+                            .with_asic_model(c.profile.chip.clone()),
+                    ) as Box<dyn MinerDriver>)
+                }
+                DriverKind::S9Stock => S9StockDriver::probe(ip, self.s9_creds.clone(), self.timeout)
+                    .await?
+                    .map(|d| Box::new(d) as Box<dyn MinerDriver>),
+                DriverKind::AsicRs => match &c.miner {
+                    Some(m) => Some(Box::new(AsicRsDriver::from_shared(ip, m.clone())) as Box<dyn MinerDriver>),
+                    None => return self.connect(ip).await,
+                },
+            })
+        })
+    }
+
     fn connect(&self, ip: IpAddr) -> BoxFuture<'_, anyhow::Result<Option<Box<dyn MinerDriver>>>> {
         Box::pin(async move {
             if let Some(d) = BitaxeDriver::probe(ip, self.timeout).await? {

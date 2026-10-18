@@ -21,6 +21,7 @@
   import { control } from "$lib/control/controlState.svelte";
   import ControlToolbar from "$lib/control/ControlToolbar.svelte";
   import ActionDialog from "$lib/control/ActionDialog.svelte";
+  import SafetyAlertBanner from "$lib/control/SafetyAlertBanner.svelte";
   import {
     ACTION_LABEL,
     unsupportedReason,
@@ -2990,6 +2991,7 @@
     </div>
   </div>
 
+  <SafetyAlertBanner />
   <div class="flex min-h-0 w-full flex-1 flex-col overflow-hidden rounded-xl border border-zinc-800">
     <div class="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2 text-sm text-zinc-400">
       <span>Results</span>

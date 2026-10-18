@@ -1,18 +1,13 @@
-//! Device identity used to pick write paths and limits.
-//!
-//! A [`DeviceProfile`] is built from whatever the driver or scan learned
-//! (make / model / firmware / ASIC chip). [`DeviceClass`] is the coarse
-//! family that decides which write paths are allowed to touch the device:
-//! an AxeOS HTTP path must never talk to a cgminer device and vice versa.
+//! Device identity for the safety layer: a thin mapping from what
+//! discovery / asic-rs already reported (make, model, firmware, chip) to
+//! the coarse [`DeviceClass`] used for limits and audit. No probing here.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceClass {
-    /// Bitaxe / NerdAxe family running AxeOS (ESP-Miner) — HTTP JSON API.
     AxeOs,
-    /// Bitmain stock firmware (CGI + cgminer API).
     AntminerStock,
     BraiinsOs,
     LuxOs,
@@ -21,16 +16,6 @@ pub enum DeviceClass {
     Avalon,
     Epic,
     Unknown,
-}
-
-impl DeviceClass {
-    /// Families that speak the cgminer/bmminer JSON-RPC API on :4028.
-    pub fn is_cgminer_family(self) -> bool {
-        matches!(
-            self,
-            Self::AntminerStock | Self::BraiinsOs | Self::LuxOs | Self::Vnish | Self::Whatsminer | Self::Avalon
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +28,38 @@ pub struct DeviceProfile {
     pub chip: Option<String>,
 }
 
+/// (field, needle, class) — first match wins; firmware rules come first so
+/// a BraiinsOS Antminer is not "stock".
+const RULES: &[(Field, &str, DeviceClass)] = &[
+    (Field::Firmware, "axeos", DeviceClass::AxeOs),
+    (Field::Make, "bitaxe", DeviceClass::AxeOs),
+    (Field::Make, "nerdaxe", DeviceClass::AxeOs),
+    (Field::Firmware, "braiins", DeviceClass::BraiinsOs),
+    (Field::Firmware, "luxos", DeviceClass::LuxOs),
+    (Field::Firmware, "vnish", DeviceClass::Vnish),
+    (Field::Firmware, "epic", DeviceClass::Epic),
+    (Field::Make, "whatsminer", DeviceClass::Whatsminer),
+    (Field::Make, "avalon", DeviceClass::Avalon),
+    (Field::Make, "antminer", DeviceClass::AntminerStock),
+];
+
+#[derive(Clone, Copy)]
+enum Field {
+    Make,
+    Firmware,
+}
+
+pub fn classify_class(make: &str, firmware: &str) -> DeviceClass {
+    let (make, fw) = (make.to_ascii_lowercase(), firmware.to_ascii_lowercase());
+    RULES
+        .iter()
+        .find(|(f, needle, _)| match f {
+            Field::Make => make.contains(needle),
+            Field::Firmware => fw.contains(needle),
+        })
+        .map_or(DeviceClass::Unknown, |r| r.2)
+}
+
 impl DeviceProfile {
     pub fn unknown() -> Self {
         Self::classify("", "", "", None)
@@ -50,44 +67,11 @@ impl DeviceProfile {
 
     pub fn classify(make: &str, model: &str, firmware: &str, chip: Option<&str>) -> Self {
         Self {
-            class: classify_class(make, model, firmware),
-            make: make.to_string(),
-            model: model.to_string(),
-            firmware: firmware.to_string(),
-            chip: chip.map(str::to_string),
+            class: classify_class(make, firmware),
+            make: make.into(),
+            model: model.into(),
+            firmware: firmware.into(),
+            chip: chip.map(Into::into),
         }
     }
-}
-
-/// Firmware wins over make: a BraiinsOS Antminer is not "stock".
-pub fn classify_class(make: &str, model: &str, firmware: &str) -> DeviceClass {
-    let make = make.to_ascii_lowercase();
-    let model = model.to_ascii_lowercase();
-    let fw = firmware.to_ascii_lowercase();
-    if fw.contains("axeos") || fw.contains("esp-miner") || make.contains("bitaxe") || make.contains("nerdaxe") {
-        return DeviceClass::AxeOs;
-    }
-    if fw.contains("braiins") || fw.contains("bos") {
-        return DeviceClass::BraiinsOs;
-    }
-    if fw.contains("luxos") {
-        return DeviceClass::LuxOs;
-    }
-    if fw.contains("vnish") {
-        return DeviceClass::Vnish;
-    }
-    if fw.contains("epic") {
-        return DeviceClass::Epic;
-    }
-    if make.contains("whatsminer") || make.contains("microbt") {
-        return DeviceClass::Whatsminer;
-    }
-    if make.contains("avalon") || make.contains("canaan") {
-        return DeviceClass::Avalon;
-    }
-    let bitmain = make.contains("antminer") || make.contains("bitmain") || model.starts_with("antminer");
-    if bitmain && (fw.is_empty() || fw.contains("stock") || fw.contains("bitmain")) {
-        return DeviceClass::AntminerStock;
-    }
-    DeviceClass::Unknown
 }

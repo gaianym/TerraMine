@@ -5191,6 +5191,7 @@ dependencies = [
  "keyring",
  "log",
  "md-5",
+ "measurements",
  "rand 0.9.4",
  "reqwest",
  "semver",
