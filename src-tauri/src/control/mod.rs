@@ -327,7 +327,7 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
     let t = safety::Target::new(ip, d);
     let field = |change: safety::settings::Settings| {
         let (b, tried) = engine.select(&t, &change, true);
-        FieldSupport { confirmed: b.as_ref().is_some_and(|b| b.hardware_confirmed()), path: b.map(|b| b.id().to_string()), tried }
+        FieldSupport { confirmed: b.as_ref().is_some_and(|b| b.confirmed_for(&change)), path: b.map(|b| b.id().to_string()), tried }
     };
     let limits = engine.limits.lookup(&t.profile);
     SettingsSupportRow {

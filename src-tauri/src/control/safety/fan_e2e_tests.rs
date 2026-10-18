@@ -163,7 +163,8 @@ async fn fan_dry_run_fleetwide_shows_path_or_not_supported() {
     let b = &o[&IpAddr::from(AXE)];
     assert_eq!(b.status, WriteStatus::DryRun, "{b:?}");
     assert!(b.paths_tried[0].contains("supports_fan_config() = false"), "{b:?}");
-    assert!(b.paths_tried[1].starts_with("axeos-http: selected for dry run only"), "{b:?}");
+    // Fan on AxeOS 2.15.x is hardware-confirmed.
+    assert_eq!(b.paths_tried[1], "axeos-http: selected", "{b:?}");
     assert!(b.msg.as_deref().unwrap().contains("via axeos-http"), "{b:?}");
     let s = &o[&IpAddr::from(S9)];
     assert_eq!(s.status, WriteStatus::NoPath, "{s:?}");

@@ -160,6 +160,12 @@ pub trait SettingsDriver: Send + Sync {
     /// False until verified against real hardware; such backends are only
     /// used when the caller explicitly allows it (mock tests).
     fn hardware_confirmed(&self) -> bool;
+    /// Confirmed on real hardware for this particular change (e.g. AxeOS
+    /// 2.15.x frequency and fan, but not core voltage). Default: the
+    /// backend-wide [`Self::hardware_confirmed`].
+    fn confirmed_for(&self, _change: &Settings) -> bool {
+        self.hardware_confirmed()
+    }
     /// Static check, no I/O. Err = reason this backend cannot do the change.
     fn accepts(&self, p: &super::profile::DeviceProfile, change: &Settings) -> Result<(), String>;
     fn read(&self) -> BoxFuture<'_, anyhow::Result<Settings>>;

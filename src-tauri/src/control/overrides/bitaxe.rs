@@ -223,7 +223,7 @@ impl MinerDriver for BitaxeDriver {
     }
 
     fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
-        vec![Box::new(AxeOsSettings::new(self.base.clone(), self.client.clone()))]
+        vec![Box::new(AxeOsSettings::new(self.base.clone(), self.client.clone()).with_version(self.version.clone()))]
     }
 
     fn profile(&self) -> DeviceProfile {
