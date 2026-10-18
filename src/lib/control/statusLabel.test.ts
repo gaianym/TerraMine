@@ -56,3 +56,12 @@ describe("RowSelectionModule registration requirement", () => {
     ).toEqual([]);
   });
 });
+
+describe("fault light labels", () => {
+  it("labels light outcomes", () => {
+    expect(formatActionStatusLabel({ action: "light_on", status: "verified" })).toBe("light on");
+    expect(formatActionStatusLabel({ action: "light_off", status: "verified" })).toBe("light off");
+    expect(formatActionStatusLabel({ action: "light_on", status: "ok" })).toBe("light on (sent)");
+    expect(formatActionStatusLabel({ action: "light_on", status: "unsupported" })).toBe("unsupported");
+  });
+});

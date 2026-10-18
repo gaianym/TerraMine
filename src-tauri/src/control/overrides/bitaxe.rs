@@ -7,6 +7,14 @@
 //! through asic-rs when it has a backend for the firmware (fleet devices
 //! are on 2.15.3); this override covers them only as a fallback. Devices
 //! below 2.14 advertise reboot only.
+//!
+//! Fault light: asic-rs reports `supports_set_fault_light = false` for
+//! every Bitaxe backend, and AxeOS has no LED endpoint. The documented
+//! stand-in is `POST /api/system/identify` (ESP-Miner >= 2.12, see its
+//! openapi.yaml): the screen says "Hi!" for 30 s. It is a toggle with no
+//! readable state, so TerraMine only offers it as "light on" (never as
+//! "off": a second call would toggle, and it expires by itself), cannot
+//! read it back, and keeps it dry-run only until confirmed on hardware.
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -24,6 +32,8 @@ use crate::control::safety::DeviceProfile;
 
 /// Minimum AxeOS version that exposes pause/resume endpoints.
 pub const PAUSE_RESUME_MIN: Version = Version::new(2, 14, 0);
+/// First ESP-Miner release with `POST /api/system/identify`.
+pub const IDENTIFY_MIN: Version = Version::new(2, 12, 0);
 
 #[derive(Debug, Clone)]
 pub struct BitaxeDriver {
@@ -122,6 +132,10 @@ impl BitaxeDriver {
     pub fn native_backend_available(&self) -> bool {
         self.version.as_ref().is_some_and(|v| *v >= ASIC_RS_NATIVE_MIN)
     }
+
+    fn identify_supported(&self) -> bool {
+        identify_supported(self.version.as_ref())
+    }
 }
 
 /// First AxeOS version asic-rs 0.8.6 drives natively (pause/resume).
@@ -147,8 +161,30 @@ impl MinerDriver for BitaxeDriver {
                     self.post("/api/system/resume").await
                 }
                 MinerAction::Start | MinerAction::Stop => Ok(false),
+                MinerAction::LightOn if self.identify_supported() => self.post("/api/system/identify").await,
+                MinerAction::LightOn | MinerAction::LightOff => Ok(false),
             }
         })
+    }
+
+    fn paths_tried(&self, action: MinerAction) -> Vec<String> {
+        let msg = match action {
+            MinerAction::LightOn if self.identify_supported() => {
+                "axeos-http: POST /api/system/identify (30 s on-screen \"Hi!\", no read-back; not yet confirmed on hardware)".to_string()
+            }
+            MinerAction::LightOn => format!(
+                "axeos-http: no identify endpoint before AxeOS {IDENTIFY_MIN} (device reports {})",
+                self.version.as_ref().map_or("no version".to_string(), |v| v.to_string())
+            ),
+            MinerAction::LightOff => {
+                "axeos-http: identify expires after 30 s and has no off command (a second call toggles)".to_string()
+            }
+            MinerAction::Start | MinerAction::Stop if !self.pause_resume_supported() => {
+                format!("axeos-http: pause/resume needs AxeOS >= {PAUSE_RESUME_MIN}")
+            }
+            _ => format!("axeos-http: {} available", action.name()),
+        };
+        vec![msg]
     }
 
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
@@ -243,7 +279,16 @@ pub fn parse_loose_version(s: &str) -> Option<Version> {
 pub fn axeos_caps(version: Option<&Version>, pause_probe_ok: bool) -> Capabilities {
     let pause = pause_probe_ok || version.map(|v| *v >= PAUSE_RESUME_MIN).unwrap_or(false);
     // Reboot: live POST /api/system/restart returns 200 even on 2.10.
-    Capabilities::flags(pause, pause, true, Route::Axeos)
+    let c = Capabilities::flags(pause, pause, true, Route::Axeos);
+    if identify_supported(version) {
+        c.with_unconfirmed(MinerAction::LightOn, Route::Axeos)
+    } else {
+        c
+    }
+}
+
+pub fn identify_supported(version: Option<&Version>) -> bool {
+    version.is_some_and(|v| *v >= IDENTIFY_MIN)
 }
 
 /// Convenience: build caps for a version string.

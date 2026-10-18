@@ -1,6 +1,6 @@
 <script lang="ts">
   import { control } from "./controlState.svelte";
-  import { ACTION_LABEL, unsupportedReason, type MinerAction } from "./types";
+  import { ACTION_LABEL, ALL_ACTIONS, unsupportedReason, type MinerAction } from "./types";
   import { summarizeRun } from "./runSummary";
 
   let {
@@ -8,7 +8,7 @@
     onrequest,
   }: { selectedIps: string[]; onrequest: (ips: string[], action: MinerAction) => void } = $props();
 
-  const actions: MinerAction[] = ["start", "stop", "reboot"];
+  const actions = ALL_ACTIONS;
 
   function reasonFor(action: MinerAction): string | null {
     if (!selectedIps.length) return "Select one or more miners";
