@@ -188,7 +188,7 @@ async fn e2e_axeos_path_never_hits_non_axeos_mock() {
     let before = r.s9.requests().len();
     let o = r.engine.apply_settings("run", &t, &apply(freq(600))).await;
     assert_eq!(o.status, WriteStatus::NoPath, "{o:?}");
-    assert_eq!(o.paths_tried, ["s9-stock: no settings write path for this device"]);
+    assert_eq!(o.paths_tried, [format!("s9-cgi: skipped ({})", crate::control::overrides::s9::S9_NO_SETTINGS)]);
     let mut wrong = t.clone();
     wrong.profile = DeviceProfile::classify("Bitaxe", "Bitaxe", "AxeOS", Some("BM1370"));
     let o = r.engine.apply_settings("run", &wrong, &apply(freq(600))).await;
@@ -231,7 +231,7 @@ async fn e2e_total_failure_reports_paths_tried() {
     let o = r.engine.apply_settings("run", &t, &apply(freq(600))).await;
     assert_eq!(o.status, WriteStatus::NoPath);
     let msg = o.msg.clone().unwrap();
-    assert!(msg.contains("tried:") && msg.contains("s9-stock: no settings write path"), "{msg}");
+    assert!(msg.contains("tried:") && msg.contains("s9-cgi: skipped (stock S9 firmware"), "{msg}");
     assert_eq!(r.audit.records().last().unwrap().paths_tried, o.paths_tried);
 }
 

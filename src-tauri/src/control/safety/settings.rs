@@ -16,6 +16,12 @@ pub struct Settings {
     /// Auto-fan target chip temperature (°C), AxeOS `temptarget`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temp_target_c: Option<u32>,
+    /// Thermal thresholds (°C): fans at 100% / thermal shutdown. asic-rs
+    /// `TemperatureConfig` `hot` / `danger`; read only in asic-rs 0.8.6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_hot_c: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_danger_c: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_fan: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,6 +37,24 @@ impl Settings {
         *self == Self::default()
     }
 
+    /// Any fan field (manual %, auto, target temperature) is set.
+    pub fn touches_fan(&self) -> bool {
+        self.fan_pct.is_some() || self.auto_fan.is_some() || self.temp_target_c.is_some()
+    }
+
+    /// `self` plus every fan field when any is set: a fan change snapshots
+    /// the whole fan state (mode + manual % + target), so a rollback
+    /// restores the mode too.
+    pub fn with_fan_group(&self) -> Settings {
+        let mut m = self.clone();
+        if self.touches_fan() {
+            m.fan_pct = m.fan_pct.or(Some(0));
+            m.auto_fan = m.auto_fan.or(Some(false));
+            m.temp_target_c = m.temp_target_c.or(Some(0));
+        }
+        m
+    }
+
     /// Keep only the fields that are set in `mask` (what a snapshot needs
     /// to restore for a given change).
     pub fn restrict_to(&self, mask: &Settings) -> Settings {
@@ -39,6 +63,8 @@ impl Settings {
             core_voltage_mv: mask.core_voltage_mv.and(self.core_voltage_mv),
             fan_pct: mask.fan_pct.and(self.fan_pct),
             temp_target_c: mask.temp_target_c.and(self.temp_target_c),
+            temp_hot_c: mask.temp_hot_c.and(self.temp_hot_c),
+            temp_danger_c: mask.temp_danger_c.and(self.temp_danger_c),
             auto_fan: mask.auto_fan.and(self.auto_fan),
             power_limit_w: mask.power_limit_w.and(self.power_limit_w),
             tuning_pct: mask.tuning_pct.and(self.tuning_pct),
@@ -59,6 +85,8 @@ impl Settings {
         cmp(&mut out, "core_voltage_mv", self.core_voltage_mv, want.core_voltage_mv);
         cmp(&mut out, "fan_pct", self.fan_pct, want.fan_pct);
         cmp(&mut out, "temp_target_c", self.temp_target_c, want.temp_target_c);
+        cmp(&mut out, "temp_hot_c", self.temp_hot_c, want.temp_hot_c);
+        cmp(&mut out, "temp_danger_c", self.temp_danger_c, want.temp_danger_c);
         cmp(&mut out, "auto_fan", self.auto_fan, want.auto_fan);
         cmp(&mut out, "power_limit_w", self.power_limit_w, want.power_limit_w);
         cmp(&mut out, "tuning_pct", self.tuning_pct, want.tuning_pct);
@@ -78,6 +106,8 @@ impl Settings {
         f("core_voltage_mv", s(self.core_voltage_mv), s(to.core_voltage_mv));
         f("fan_pct", s(self.fan_pct), s(to.fan_pct));
         f("temp_target_c", s(self.temp_target_c), s(to.temp_target_c));
+        f("temp_hot_c", s(self.temp_hot_c), s(to.temp_hot_c));
+        f("temp_danger_c", s(self.temp_danger_c), s(to.temp_danger_c));
         f("auto_fan", self.auto_fan.map(|b| b.to_string()), to.auto_fan.map(|b| b.to_string()));
         f("power_limit_w", s(self.power_limit_w), s(to.power_limit_w));
         f("tuning_pct", s(self.tuning_pct), s(to.tuning_pct));
@@ -96,6 +126,31 @@ pub struct HealthSample {
 impl HealthSample {
     pub fn unreachable() -> Self {
         Self { reachable: false, hashrate_ghs: None, temp_c: None }
+    }
+}
+
+/// A path that exists but deliberately writes nothing; it only explains why
+/// (shown in "paths tried").
+pub struct NoSettingsPath {
+    pub id: &'static str,
+    pub reason: &'static str,
+}
+
+impl SettingsDriver for NoSettingsPath {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn hardware_confirmed(&self) -> bool {
+        false
+    }
+    fn accepts(&self, _p: &super::profile::DeviceProfile, _change: &Settings) -> Result<(), String> {
+        Err(self.reason.to_string())
+    }
+    fn read(&self) -> BoxFuture<'_, anyhow::Result<Settings>> {
+        Box::pin(async { anyhow::bail!("no settings path") })
+    }
+    fn write(&self, _s: &Settings) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { anyhow::bail!("no settings path") })
     }
 }
 

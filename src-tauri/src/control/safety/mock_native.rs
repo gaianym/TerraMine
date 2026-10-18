@@ -7,14 +7,17 @@
 //! read / write code as the app) via the [`NativeTuning`] seam. Every call
 //! is logged so tests can prove what was (not) sent.
 //!
-//! A mock can be made unhealthy below a power level (hashrate drops to 0)
-//! or told to ignore writes (read-back mismatch).
+//! A mock can be made unhealthy below a power level (hashrate drops to 0),
+//! overheat below a manual fan speed, or told to ignore writes (read-back
+//! mismatch). Fan state follows each backend's `set_fan_config`: stock
+//! Antminer auto drops the target (it only writes `bitmain-fan-ctrl`).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use asic_rs_core::config::fan::FanConfig;
+use asic_rs_core::config::temperature::TemperatureConfig;
 use futures::future::BoxFuture;
 
 use super::asic::{AsicRsSettings, NativeSettingsFlags, NativeTuning};
@@ -65,7 +68,23 @@ impl NativeFirmware {
 
     pub fn flags(self) -> NativeSettingsFlags {
         let power_limit = !matches!(self, Self::AntminerStock | Self::EpicV1 | Self::BitaxeV214);
-        NativeSettingsFlags { power_limit, tuning_percent: self == Self::Vnish13, fan: false }
+        let fan = matches!(self, Self::AntminerStock | Self::EpicV1 | Self::ProtoV1);
+        NativeSettingsFlags {
+            power_limit,
+            tuning_percent: self == Self::Vnish13,
+            fan,
+            auto_target: fan && self != Self::AntminerStock,
+            temperature_config: self == Self::Vnish13,
+        }
+    }
+
+    /// Fan config at power-on, as the backend would report it.
+    fn initial_fan(self) -> FanConfig {
+        match self {
+            Self::AntminerStock => FanConfig::Auto { target_temp: 0.0, idle_speed: Some(100) },
+            Self::EpicV1 => FanConfig::Auto { target_temp: 70.0, idle_speed: Some(25) },
+            _ => FanConfig::Auto { target_temp: 65.0, idle_speed: None },
+        }
     }
 
     /// (make, model, firmware) as asic-rs reports them.
@@ -94,6 +113,9 @@ pub struct NativeState {
     /// Hashrate drops to 0 when the power limit is below this.
     pub unhealthy_below_w: Option<u32>,
     pub ignore_writes: bool,
+    pub fan: FanConfig,
+    /// Board temperature reaches 95 °C with a manual fan below this.
+    pub overheat_below_fan: Option<u64>,
 }
 
 /// One mocked asic-rs miner.
@@ -112,6 +134,8 @@ impl MockNative {
                 calls: Vec::new(),
                 unhealthy_below_w: None,
                 ignore_writes: false,
+                fan: fw.initial_fan(),
+                overheat_below_fan: None,
             })),
         })
     }
@@ -131,11 +155,21 @@ impl MockNative {
     pub fn set_ignore_writes(&self, v: bool) {
         self.state.lock().unwrap().ignore_writes = v;
     }
+    pub fn fan(&self) -> FanConfig {
+        self.state.lock().unwrap().fan.clone()
+    }
+    pub fn set_overheat_below_fan(&self, pct: Option<u64>) {
+        self.state.lock().unwrap().overheat_below_fan = pct;
+    }
     fn health(&self) -> HealthSample {
         let s = self.state.lock().unwrap();
         let dead = s.unhealthy_below_w.is_some_and(|w| s.power_w < w);
         let hr = if dead { 0.0 } else { 100_000.0 * f64::from(s.tuning_pct) / 100.0 };
-        HealthSample { reachable: true, hashrate_ghs: Some(hr), temp_c: Some(65.0) }
+        let hot = match (&s.fan, s.overheat_below_fan) {
+            (FanConfig::Manual { fan_speed }, Some(min)) => *fan_speed < min,
+            _ => false,
+        };
+        HealthSample { reachable: true, hashrate_ghs: Some(hr), temp_c: Some(if hot { 95.0 } else { 65.0 }) }
     }
 }
 
@@ -176,10 +210,40 @@ impl NativeTuning for Seam {
         })
     }
     fn fan(&self) -> BoxFuture<'_, Option<FanConfig>> {
-        Box::pin(async { None })
+        Box::pin(async move { self.flags().fan.then(|| self.0.fan()) })
     }
-    fn set_fan(&self, _f: FanConfig) -> BoxFuture<'_, anyhow::Result<bool>> {
-        Box::pin(async { anyhow::bail!("fan config not modelled in this mock") })
+    fn set_fan(&self, f: FanConfig) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move {
+            anyhow::ensure!(self.flags().fan, "Setting fan config is not supported on this platform");
+            let mut s = self.0.state.lock().unwrap();
+            let f = match f {
+                FanConfig::Manual { fan_speed } => FanConfig::Manual { fan_speed: fan_speed.min(100) },
+                // Stock Antminer: only bitmain-fan-ctrl = false; reads back Auto{0, pwm}.
+                FanConfig::Auto { .. } if self.0.fw == NativeFirmware::AntminerStock => {
+                    let pwm = match &s.fan {
+                        FanConfig::Manual { fan_speed } => *fan_speed,
+                        FanConfig::Auto { idle_speed, .. } => idle_speed.unwrap_or(100),
+                    };
+                    FanConfig::Auto { target_temp: 0.0, idle_speed: Some(pwm) }
+                }
+                FanConfig::Auto { target_temp, idle_speed } => FanConfig::Auto { target_temp: target_temp.round(), idle_speed },
+            };
+            s.calls.push(match &f {
+                FanConfig::Manual { fan_speed } => format!("set_fan_config manual {fan_speed}"),
+                FanConfig::Auto { target_temp, idle_speed } => format!("set_fan_config auto {target_temp} idle {idle_speed:?}"),
+            });
+            if !s.ignore_writes {
+                s.fan = f;
+            }
+            Ok(true)
+        })
+    }
+    fn temperature_config(&self) -> BoxFuture<'_, Option<TemperatureConfig>> {
+        Box::pin(async move {
+            self.flags()
+                .temperature_config
+                .then_some(TemperatureConfig { hot: Some(80.0), danger: Some(90.0), minimum: None })
+        })
     }
 }
 

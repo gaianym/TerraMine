@@ -526,7 +526,7 @@ fn asic_rs_accepts_only_what_it_supports() {
     let power = Settings { power_limit_w: Some(3000), ..Default::default() };
     let pct = Settings { tuning_pct: Some(80), ..Default::default() };
     let fan = Settings { fan_pct: Some(70), ..Default::default() };
-    let all = F { power_limit: true, tuning_percent: true, fan: true };
+    let all = F { power_limit: true, tuning_percent: true, fan: true, auto_target: true, temperature_config: false };
     assert!(asic_accepts(&power, F { power_limit: true, ..F::default() }).is_ok());
     assert!(asic_accepts(&power, F { tuning_percent: true, fan: true, ..F::default() })
         .unwrap_err()
@@ -538,7 +538,9 @@ fn asic_rs_accepts_only_what_it_supports() {
     assert!(asic_accepts(&fan, all).is_ok());
     assert!(asic_accepts(&fan, F { fan: false, ..all }).unwrap_err().contains("fan config not supported"));
     assert!(asic_accepts(&freq(500), all).unwrap_err().contains("no manual frequency"));
-    assert!(asic_accepts(&Settings { auto_fan: Some(true), ..Default::default() }, all).is_err());
+    assert!(asic_accepts(&Settings { auto_fan: Some(true), ..Default::default() }, all)
+        .unwrap_err()
+        .contains("auto fan needs a target temperature"));
 }
 
 /// Permanent (bug fixed in PR C): stock Antminer reports
@@ -551,7 +553,7 @@ fn power_limit_needs_set_power_limit_not_tuning_config() {
     use super::asic::NativeSettingsFlags as F;
     let power = Settings { power_limit_w: Some(3000), ..Default::default() };
     // Antminer stock v2020 / v2023 in asic-rs 0.8.6: tuning_config yes, power limit no, fan yes.
-    let antminer = F { power_limit: false, tuning_percent: false, fan: true };
+    let antminer = F { fan: true, ..F::default() };
     assert!(asic_accepts(&power, antminer).is_err());
 }
 

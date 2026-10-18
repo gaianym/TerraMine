@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onDestroy, onMount } from "svelte";
-  import { EMPTY_TUNE, buildTuneChange, buildTuneRequest, restartsAxeOs, type TuneInput } from "./tune";
+  import { EMPTY_TUNE, LOW_FAN_PCT, buildTuneChange, buildTuneRequest, isLowFan, restartsAxeOs, type TuneInput } from "./tune";
 
   type Row = { ip: string; status: string; msg: string | null };
 
@@ -11,6 +11,7 @@
   // Safety rule: new write classes open with Dry run checked.
   let dryRun = $state(true);
   let allowRaise = $state(false);
+  let forceLowFan = $state(false);
   let canarySize = $state(1);
   let input = $state<TuneInput>({ ...EMPTY_TUNE });
   let rows = $state<Record<string, Row>>({});
@@ -32,13 +33,14 @@
 
   const built = $derived(buildTuneChange(input));
   const restarts = $derived(restartsAxeOs(built.change));
+  const lowFan = $derived(isLowFan(built.change));
   const canSend = $derived(!built.errors.length && !runId);
 
   async function send() {
     error = null;
     rows = {};
     try {
-      runId = await invoke<string>("run_settings_job", { req: buildTuneRequest(ips, built.change, { dryRun, allowRaise, canarySize }) });
+      runId = await invoke<string>("run_settings_job", { req: buildTuneRequest(ips, built.change, { dryRun, allowRaise, canarySize, forceLowFan }) });
     } catch (e) {
       error = String(e);
     }
@@ -56,7 +58,8 @@
     <p class="mb-3 text-xs text-zinc-400">
       Frequency, core voltage, fan and target temperature through the safety pipeline: per-model limits, snapshot,
       read-back, health watch and automatic rollback, canary first wave. Leave a field empty to keep it. Run a dry run
-      first to see each miner's plan.
+      first to see each miner's plan. Fan and target temperature apply fleetwide where the firmware supports them
+      (Bitaxe over AxeOS, others via asic-rs fan config); unsupported miners report every path tried.
     </p>
     <div class="mb-3 grid grid-cols-3 gap-2 text-xs">
       <label class="flex flex-col gap-1">Frequency (MHz)
@@ -88,6 +91,9 @@
     <div class="mb-3 flex flex-wrap gap-4 text-xs">
       <label class="flex items-center gap-2"><input type="checkbox" data-testid="tm-tune-dry-run" bind:checked={dryRun} /> Dry run (send nothing)</label>
       <label class="flex items-center gap-2"><input type="checkbox" data-testid="tm-tune-allow-raise" bind:checked={allowRaise} /> Allow frequency raise</label>
+      {#if lowFan}
+        <label class="flex items-center gap-2 text-amber-300"><input type="checkbox" data-testid="tm-tune-force-low-fan" bind:checked={forceLowFan} /> Allow fan below {LOW_FAN_PCT}%</label>
+      {/if}
       <label class="flex items-center gap-2">Canary first wave
         <input class="w-14 rounded border border-zinc-700 bg-zinc-950 px-2 py-1" type="number" min="1" bind:value={canarySize} />
       </label>

@@ -297,6 +297,13 @@ pub struct SettingsSupportRow {
     pub tuning_pct: Option<safety::limits::Range>,
     pub power: FieldSupport,
     pub tuning: FieldSupport,
+    pub fan_pct: Option<safety::limits::Range>,
+    pub temp_target_c: Option<safety::limits::Range>,
+    /// Manual fan %.
+    pub fan: FieldSupport,
+    /// Auto fan with a target temperature (or plain auto where the firmware
+    /// has no target, e.g. stock Antminer).
+    pub fan_auto: FieldSupport,
 }
 
 pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: Option<Arc<dyn driver::MinerDriver>>) -> SettingsSupportRow {
@@ -311,6 +318,10 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
             tuning_pct: None,
             power: none(),
             tuning: none(),
+            fan_pct: None,
+            temp_target_c: None,
+            fan: none(),
+            fan_auto: none(),
         };
     };
     let t = safety::Target::new(ip, d);
@@ -328,6 +339,18 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
         tuning_pct: limits.and_then(|e| e.tuning_pct),
         power: field(safety::settings::Settings { power_limit_w: Some(1), ..Default::default() }),
         tuning: field(safety::settings::Settings { tuning_pct: Some(100), ..Default::default() }),
+        fan_pct: limits.and_then(|e| e.fan_pct),
+        temp_target_c: limits.and_then(|e| e.temp_target_c),
+        fan: field(safety::settings::Settings { auto_fan: Some(false), fan_pct: Some(100), ..Default::default() }),
+        fan_auto: {
+            let with_target = field(safety::settings::Settings { auto_fan: Some(true), temp_target_c: Some(60), ..Default::default() });
+            if with_target.path.is_some() {
+                with_target
+            } else {
+                let plain = field(safety::settings::Settings { auto_fan: Some(true), ..Default::default() });
+                if plain.path.is_some() { plain } else { with_target }
+            }
+        },
     }
 }
 

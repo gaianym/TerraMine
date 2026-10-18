@@ -203,7 +203,11 @@ async fn auto_fan_with_target_temperature() {
     assert_eq!(o.status, WriteStatus::Verified, "{o:?}");
     assert_eq!(r.axe.fan(), (true, 60, 58));
     assert_eq!(r.axe.reboots(), 0);
-    assert_eq!(o.before, Some(Settings { auto_fan: Some(true), temp_target_c: Some(60), ..Default::default() }));
+    // The whole fan state is snapshotted (mode, manual %, target).
+    assert_eq!(
+        o.before,
+        Some(Settings { auto_fan: Some(true), fan_pct: Some(60), temp_target_c: Some(60), ..Default::default() })
+    );
 }
 
 /// Placeholder limits: BM1370 400-625 MHz, 1000-1250 mV, fan 20-100 %,
