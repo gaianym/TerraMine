@@ -6,6 +6,7 @@ export type Settings = {
   frequency_mhz?: number | null;
   core_voltage_mv?: number | null;
   fan_pct?: number | null;
+  temp_target_c?: number | null;
   auto_fan?: boolean | null;
   power_limit_w?: number | null;
   tuning_pct?: number | null;
@@ -55,6 +56,7 @@ const FIELDS: Array<[keyof Settings, string]> = [
   ["frequency_mhz", "MHz"],
   ["core_voltage_mv", "mV"],
   ["fan_pct", "% fan"],
+  ["temp_target_c", "°C target"],
   ["power_limit_w", "W"],
   ["tuning_pct", "% tuning"],
 ];

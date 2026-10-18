@@ -9,11 +9,17 @@
 //! A reboot takes the miner "offline" (HTTP 503 / closed cgminer socket)
 //! for `reboot_downtime`, then resets uptime to zero.
 //!
-//! AxeOS mocks also hold settings (frequency, core voltage, fan) behind
-//! `PATCH /api/system` and report `temp`. A [`Fault`] simulates a miner
-//! that turns unhealthy whenever its frequency/voltage differ from the
-//! known-good values, which is what the rollback tests exercise. Unlike
-//! real AxeOS, the mock applies settings immediately (no restart).
+//! AxeOS mocks also hold settings (frequency, core voltage, fan, target
+//! temperature) behind `PATCH /api/system` and report `temp` / `power`.
+//! Frequency and core voltage are restart-to-apply: PATCH only stores
+//! them (`frequency` / `coreVoltage` report the stored value at once) and
+//! the running values (`actualFrequency`, health, faults) change only
+//! after `POST /api/system/restart`. Fan settings apply immediately. On
+//! 2.15 the manual fan speed is `manualFanSpeed` and `fanspeed` is the
+//! measured fan % (as in AxeOS ≥ 2.11); 2.10 uses `fanspeed` for both.
+//! A [`Fault`] simulates a miner that turns unhealthy whenever its running
+//! frequency/voltage differ from the known-good values, which is what the
+//! rollback tests exercise.
 //! Every request is logged so tests can prove which endpoints were hit.
 //!
 //! Fault light: the S9 mock serves the stock `blink.cgi` /
@@ -58,6 +64,8 @@ pub enum Fault {
 
 pub const MOCK_FREQ_MHZ: u32 = 525;
 pub const MOCK_CORE_MV: u32 = 1150;
+/// Power draw at the default frequency / voltage.
+pub const MOCK_POWER_W: f64 = 17.6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MockKind {
@@ -112,10 +120,22 @@ struct State {
     paused: bool,
     reboots: u32,
     downtime: Duration,
+    /// Running values (applied at boot).
     frequency: u32,
     core_voltage: u32,
+    /// Stored (NVS) values, applied by the next restart.
+    nvs_frequency: u32,
+    nvs_core_voltage: u32,
+    /// Manual fan speed setting.
     fanspeed: u32,
     autofan: bool,
+    temptarget: u32,
+    /// Running config that already crashed once (Fault::Unreachable).
+    crashed_on: Option<(u32, u32)>,
+    /// Answer `POST /api/system/restart` with 200 but do not restart.
+    ignore_restart: bool,
+    /// Running frequency never exceeds this (firmware throttling).
+    freq_cap: Option<u32>,
     /// Known-good (frequency, core voltage); differing values trigger `fault`.
     healthy: (u32, u32),
     fault: Option<Fault>,
@@ -145,6 +165,14 @@ impl State {
                 self.boot_at = t;
                 self.uptime_offset = 0;
                 self.paused = false; // stock sleep does not survive reboot
+                self.frequency = self.freq_cap.map_or(self.nvs_frequency, |c| self.nvs_frequency.min(c));
+                self.core_voltage = self.nvs_core_voltage;
+                let running = (self.frequency, self.core_voltage);
+                if self.degraded() == Some(Fault::Unreachable) && self.crashed_on != Some(running) {
+                    // Crashes once more right after booting the bad config.
+                    self.crashed_on = Some(running);
+                    self.offline_until = Some(Instant::now() + self.downtime);
+                }
             }
         }
     }
@@ -200,7 +228,30 @@ impl MockMiner {
     pub fn set_ignore_writes(&self, v: bool) {
         self.state.lock().unwrap().ignore_writes = v;
     }
-    /// (frequency MHz, core voltage mV).
+    /// Set stored and running frequency (e.g. a unit held low after throttling).
+    pub fn set_frequency(&self, f: u32) {
+        let mut s = self.state.lock().unwrap();
+        s.frequency = f;
+        s.nvs_frequency = f;
+        s.healthy.0 = f;
+    }
+    pub fn set_ignore_restart(&self, v: bool) {
+        self.state.lock().unwrap().ignore_restart = v;
+    }
+    pub fn set_freq_cap(&self, cap: Option<u32>) {
+        self.state.lock().unwrap().freq_cap = cap;
+    }
+    /// Stored (frequency MHz, core voltage mV), applied by the next restart.
+    pub fn stored(&self) -> (u32, u32) {
+        let s = self.state.lock().unwrap();
+        (s.nvs_frequency, s.nvs_core_voltage)
+    }
+    /// (auto fan, manual fan %, target °C).
+    pub fn fan(&self) -> (bool, u32, u32) {
+        let s = self.state.lock().unwrap();
+        (s.autofan, s.fanspeed, s.temptarget)
+    }
+    /// Running (frequency MHz, core voltage mV).
     pub fn settings(&self) -> (u32, u32) {
         let s = self.state.lock().unwrap();
         (s.frequency, s.core_voltage)
@@ -234,8 +285,14 @@ impl MockMiner {
             downtime,
             frequency: MOCK_FREQ_MHZ,
             core_voltage: MOCK_CORE_MV,
+            nvs_frequency: MOCK_FREQ_MHZ,
+            nvs_core_voltage: MOCK_CORE_MV,
             fanspeed: 60,
             autofan: true,
+            temptarget: 60,
+            crashed_on: None,
+            ignore_restart: false,
+            freq_cap: None,
             healthy: (MOCK_FREQ_MHZ, MOCK_CORE_MV),
             fault: None,
             ignore_writes: false,
@@ -420,14 +477,22 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     let dead = matches!(fault, Some(Fault::HashrateDrop | Fault::Unreachable));
                     let hr = if s.paused || dead || s.outage { 0.0 } else { 1180.5 };
                     let temp = if fault == Some(Fault::Overheat) { 95.0 } else { 52.5 };
+                    let volts = f64::from(s.core_voltage) / f64::from(MOCK_CORE_MV);
+                    let power = if hr > 0.0 { MOCK_POWER_W * f64::from(s.frequency) / f64::from(MOCK_FREQ_MHZ) * volts * volts } else { 3.0 };
+                    let fan = if new {
+                        let measured = if s.autofan { 47 } else { s.fanspeed };
+                        format!(r#""fanspeed":{measured},"manualFanSpeed":{},"actualFrequency":{}"#, s.fanspeed, s.frequency)
+                    } else {
+                        format!(r#""fanspeed":{}"#, s.fanspeed)
+                    };
                     let body = format!(
-                        r#"{{"ASICModel":"BM1370","boardVersion":"601","version":"{ver}","axeOSVersion":"{ver}","macAddr":"{}","uptimeSeconds":{},"hashRate":{hr},"temp":{temp},"frequency":{},"coreVoltage":{},"fanspeed":{},"autofanspeed":{}{paused}}}"#,
+                        r#"{{"ASICModel":"BM1370","boardVersion":"601","version":"{ver}","axeOSVersion":"{ver}","macAddr":"{}","uptimeSeconds":{},"hashRate":{hr},"temp":{temp},"power":{power:.2},"frequency":{},"coreVoltage":{},{fan},"autofanspeed":{},"temptarget":{}{paused}}}"#,
                         s.mac,
                         s.uptime(),
-                        s.frequency,
-                        s.core_voltage,
-                        s.fanspeed,
-                        u8::from(s.autofan)
+                        s.nvs_frequency,
+                        s.nvs_core_voltage,
+                        u8::from(s.autofan),
+                        s.temptarget
                     );
                     http("200 OK", "", &body)
                 }
@@ -437,26 +502,30 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     };
                     if !s.ignore_writes {
                         let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as u32);
+                        // Stored only; applied by the next restart.
                         if let Some(f) = num("frequency") {
-                            s.frequency = f;
+                            s.nvs_frequency = f;
                         }
                         if let Some(c) = num("coreVoltage") {
-                            s.core_voltage = c;
+                            s.nvs_core_voltage = c;
                         }
-                        if let Some(f) = num("fanspeed") {
+                        // Unknown keys are ignored, as on AxeOS.
+                        if let Some(f) = num(if new { "manualFanSpeed" } else { "fanspeed" }) {
                             s.fanspeed = f;
                         }
                         if let Some(a) = num("autofanspeed") {
                             s.autofan = a != 0;
                         }
-                        if s.degraded() == Some(Fault::Unreachable) {
-                            s.offline_until = Some(Instant::now() + s.downtime);
+                        if let Some(t) = num("temptarget") {
+                            s.temptarget = t;
                         }
                     }
                     http("200 OK", "", "{}")
                 }
                 ("POST", "/api/system/restart") => {
-                    s.reboot();
+                    if !s.ignore_restart {
+                        s.reboot();
+                    }
                     http("200 OK", "", r#"{"message":"System will restart shortly."}"#)
                 }
                 ("POST", "/api/system/pause") if new => {

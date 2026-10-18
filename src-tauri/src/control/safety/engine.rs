@@ -5,6 +5,13 @@
 //! [dry run stops here] → audit "attempt" → snapshot → write → read-back → health watch
 //! → (on any failure after the write) rollback to the snapshot → audit
 //! "outcome".
+//!
+//! Backends may map a request (`translate`, e.g. the AxeOS power
+//! stand-in; the result is limit-checked too) and may need a restart to
+//! apply it (`restart_to_apply`): the restart is part of the write, the
+//! engine waits for it (uptime reset, temperature watched) before
+//! read-back, and a rollback writes the snapshot and restarts again.
+//! Raising a frequency needs `Confirmation::allow_frequency_raise`.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -14,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use super::audit::{now_ms, AuditRecord, AuditSink};
-use super::health::{self, FailureCause, HealthPolicy};
+use super::health::{self, FailureCause, HealthPolicy, Unhealthy};
 use super::limits::LimitsTable;
 use super::policy::{preflight, ActionKind, Confirmation};
 use super::profile::DeviceProfile;
@@ -255,6 +262,20 @@ impl SafetyEngine {
             Ok(e) => e.clone(),
             Err(v) => return self.finish(c, WriteStatus::Refused, Some(v.join("; "))),
         };
+        // Backend mapping (AxeOS power → frequency stand-in), limit-checked too.
+        let (change, note) = match tokio::time::timeout(to, drv.translate(&req.change)).await {
+            Ok(Ok(x)) => x,
+            Ok(Err(e)) => return self.finish(c, WriteStatus::Refused, Some(e)),
+            Err(_) => return self.finish(c, WriteStatus::Refused, Some("timeout while mapping the request".into())),
+        };
+        if change != req.change {
+            if let Err(v) = self.limits.check(&t.profile, &change) {
+                let msg = format!("{}; {}", note.unwrap_or_default(), v.join("; "));
+                return self.finish(c, WriteStatus::Refused, Some(msg));
+            }
+        }
+        c.out.attempted = Some(change.clone());
+        let note = note.map(|n| format!("{n}; ")).unwrap_or_default();
 
         if req.dry_run {
             let via = format!("via {}", drv.id());
@@ -263,9 +284,13 @@ impl SafetyEngine {
             } else {
                 "; path not yet confirmed on real hardware, a live write is refused".into()
             };
+            let restart = if drv.restart_to_apply(&change).is_some() { " with a restart to apply" } else { "" };
             let msg = match timed(to, drv.read()).await {
-                Ok(cur) => format!("would set {} {via}{unconfirmed}", cur.describe_change(&req.change)),
-                Err(e) => format!("would set {:?} {via} (current unreadable: {e}){unconfirmed}", req.change),
+                Ok(cur) => {
+                    let hold = raise_hold(&cur, &change, &req.confirm).map(|h| format!("; {h}")).unwrap_or_default();
+                    format!("{note}would set {}{restart} {via}{hold}{unconfirmed}", cur.describe_change(&change))
+                }
+                Err(e) => format!("{note}would set {change:?}{restart} {via} (current unreadable: {e}){unconfirmed}"),
             };
             return self.finish(c, WriteStatus::DryRun, Some(msg));
         }
@@ -278,8 +303,11 @@ impl SafetyEngine {
             Ok(s) => s,
             Err(e) => return self.finish(c, WriteStatus::Failed, Some(format!("cannot read settings for snapshot: {e}"))),
         };
-        let restore = current.restrict_to(&req.change);
-        let missing = missing_fields(&req.change, &restore);
+        if let Some(h) = raise_hold(&current, &change, &req.confirm) {
+            return self.finish(c, WriteStatus::Refused, Some(h));
+        }
+        let restore = current.restrict_to(&change);
+        let missing = missing_fields(&change, &restore);
         if !missing.is_empty() {
             let msg = format!("cannot snapshot every field being changed ({}); refusing write", missing.join(", "));
             return self.finish(c, WriteStatus::Refused, Some(msg));
@@ -294,18 +322,21 @@ impl SafetyEngine {
         let policy = self.opts.health.clone().with_temp_ceiling(entry.max_temp_c);
         c.started = Some(Instant::now());
 
-        if let Err(e) = timed(to, drv.write(&req.change)).await {
+        if let Err(e) = timed(to, drv.write(&change)).await {
             return self.rollback(c, drv, &snap, FailureCause::WriteFailed, format!("write failed: {e}"), None).await;
         }
-        if let Err(r) = self.read_back(drv, &req.change).await {
+        if let Err(u) = self.restart_and_wait(t, drv, &change, &policy).await {
+            return self.rollback(c, drv, &snap, u.cause, u.reason, u.sample).await;
+        }
+        if let Err(r) = self.read_back(drv, &change).await {
             return self.rollback(c, drv, &snap, FailureCause::ReadBackMismatch, format!("read-back failed: {r}"), None).await;
         }
         match health::watch(t.driver.as_ref(), &policy, baseline).await {
             Ok(s) => {
-                c.out.after = timed(to, drv.read()).await.ok().map(|a| a.restrict_to(&req.change));
+                c.out.after = timed(to, drv.read()).await.ok().map(|a| a.restrict_to(&change));
                 let msg = format!(
-                    "applied {}; healthy (hashrate {:?} GH/s, temp {:?}°C)",
-                    snap.settings.describe_change(&req.change),
+                    "{note}applied {}; healthy (hashrate {:?} GH/s, temp {:?}°C)",
+                    snap.settings.describe_change(&change),
                     s.hashrate_ghs,
                     s.temp_c
                 );
@@ -318,6 +349,56 @@ impl SafetyEngine {
         }
     }
 
+    async fn applied(&self, drv: &dyn SettingsDriver, want: &Settings) -> bool {
+        matches!(tokio::time::timeout(self.opts.op_timeout, drv.check_applied(want)).await, Ok(Ok(())))
+    }
+
+    /// The restart a backend needs to apply `change` (none for most), then
+    /// wait for proof it happened: uptime reset (or seen offline, then
+    /// back). Temperature is watched throughout; bounded by
+    /// `readback_timeout`. A failed restart request is not fatal by itself
+    /// (the device may drop the connection while restarting); only the
+    /// missing evidence is.
+    async fn restart_and_wait(&self, t: &Target, drv: &dyn SettingsDriver, change: &Settings, policy: &HealthPolicy) -> Result<(), Unhealthy> {
+        let to = self.opts.op_timeout;
+        let Some(restart) = drv.restart_to_apply(change) else { return Ok(()) };
+        let up0 = timed(to, drv.uptime_s()).await.ok().flatten();
+        let sent = timed(to, restart).await;
+        let deadline = Instant::now() + self.opts.readback_timeout;
+        let mut saw_down = false;
+        loop {
+            tokio::time::sleep(policy.interval).await;
+            let h = t.driver.health().await;
+            if h.reachable {
+                if let Some(r) = health::judge_temp(policy, &h) {
+                    return Err(Unhealthy { cause: FailureCause::Overheat, reason: format!("during restart: {r}"), sample: Some(h) });
+                }
+                let up = timed(to, drv.uptime_s()).await.ok().flatten();
+                let restarted = match (up0, up) {
+                    // Seen offline and back with no more uptime than before
+                    // also counts (uptime has whole-second resolution).
+                    (Some(a), Some(b)) => b < a || (saw_down && b <= a),
+                    _ => saw_down,
+                };
+                if restarted {
+                    return Ok(());
+                }
+            } else {
+                saw_down = true;
+            }
+            if Instant::now() >= deadline {
+                let (cause, reason) = if !h.reachable {
+                    (FailureCause::Unreachable, "did not come back after the restart to apply".to_string())
+                } else if let Err(e) = &sent {
+                    (FailureCause::WriteFailed, format!("restart to apply not observed (restart request failed: {e})"))
+                } else {
+                    (FailureCause::WriteFailed, "restart to apply not observed (uptime did not reset)".to_string())
+                };
+                return Err(Unhealthy { cause, reason, sample: Some(h) });
+            }
+        }
+    }
+
     async fn read_back(&self, drv: &dyn SettingsDriver, want: &Settings) -> Result<(), String> {
         let deadline = Instant::now() + self.opts.readback_timeout;
         loop {
@@ -325,9 +406,14 @@ impl SafetyEngine {
                 Ok(got) => {
                     let mm = got.mismatches(want);
                     if mm.is_empty() {
-                        return Ok(());
+                        match tokio::time::timeout(self.opts.op_timeout, drv.check_applied(want)).await {
+                            Ok(Ok(())) => return Ok(()),
+                            Ok(Err(e)) => e,
+                            Err(_) => "timeout checking the applied value".into(),
+                        }
+                    } else {
+                        format!("mismatch: {}", mm.join(", "))
                     }
-                    format!("mismatch: {}", mm.join(", "))
                 }
                 Err(e) => e.to_string(),
             };
@@ -351,9 +437,15 @@ impl SafetyEngine {
         let deadline = Instant::now() + self.opts.rollback_timeout;
         let to = self.opts.op_timeout;
         loop {
-            let last = match timed(to, drv.write(&snap.settings)).await {
-                Ok(()) => match timed(to, drv.read()).await {
-                    Ok(got) if got.mismatches(&snap.settings).is_empty() => {
+            // The restored state decides, not the restart evidence: if the
+            // snapshot values are stored and running, the rollback worked.
+            let written = match timed(to, drv.write(&snap.settings)).await {
+                Ok(()) => Ok(self.restart_and_wait(c.t, drv, &snap.settings, &self.opts.health).await.err().map(|u| u.reason)),
+                Err(e) => Err(e.to_string()),
+            };
+            let last = match written {
+                Ok(restart_err) => match timed(to, drv.read()).await {
+                    Ok(got) if got.mismatches(&snap.settings).is_empty() && self.applied(drv, &snap.settings).await => {
                         c.out.after = Some(got.restrict_to(&snap.settings));
                         c.out.cause = Some(cause);
                         let h = c.t.driver.health().await;
@@ -365,11 +457,16 @@ impl SafetyEngine {
                     }
                     Ok(got) => {
                         c.out.after = Some(got.restrict_to(&snap.settings));
-                        format!("read-back mismatch: {}", got.mismatches(&snap.settings).join(", "))
+                        let mm = got.mismatches(&snap.settings);
+                        let what = if mm.is_empty() { "snapshot stored but not running".to_string() } else { mm.join(", ") };
+                        match restart_err {
+                            Some(r) => format!("read-back mismatch: {what} ({r})"),
+                            None => format!("read-back mismatch: {what}"),
+                        }
                     }
                     Err(e) => e.to_string(),
                 },
-                Err(e) => e.to_string(),
+                Err(e) => e,
             };
             if Instant::now() >= deadline {
                 c.out.cause = Some(FailureCause::RollbackFailed);
@@ -393,10 +490,26 @@ fn missing_fields(change: &Settings, snap: &Settings) -> Vec<String> {
     f("frequency_mhz", change.frequency_mhz.is_some(), snap.frequency_mhz.is_some());
     f("core_voltage_mv", change.core_voltage_mv.is_some(), snap.core_voltage_mv.is_some());
     f("fan_pct", change.fan_pct.is_some(), snap.fan_pct.is_some());
+    f("temp_target_c", change.temp_target_c.is_some(), snap.temp_target_c.is_some());
     f("auto_fan", change.auto_fan.is_some(), snap.auto_fan.is_some());
     f("power_limit_w", change.power_limit_w.is_some(), snap.power_limit_w.is_some());
     f("tuning_pct", change.tuning_pct.is_some(), snap.tuning_pct.is_some());
     out
+}
+
+/// A frequency increase over the current value is held unless the
+/// operator explicitly allowed it. Unknown current frequency counts as a
+/// possible raise.
+pub fn raise_hold(current: &Settings, change: &Settings, c: &Confirmation) -> Option<String> {
+    let want = change.frequency_mhz?;
+    if c.allow_frequency_raise {
+        return None;
+    }
+    match current.frequency_mhz {
+        Some(cur) if want <= cur => None,
+        Some(cur) => Some(format!("frequency raise {cur} → {want} MHz is held: needs an explicit OK (allow_frequency_raise)")),
+        None => Some(format!("frequency {want} MHz held: current frequency unknown, needs an explicit OK (allow_frequency_raise)")),
+    }
 }
 
 async fn timed<T>(d: Duration, f: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {

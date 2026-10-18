@@ -141,11 +141,13 @@ async fn power_dry_run_by_default_shows_path_or_not_supported_per_class() {
         assert_eq!(x.status, WriteStatus::NoPath, "{fw:?}: {x:?}");
         assert!(x.paths_tried[0].contains("supports_set_power_limit() = false"), "{x:?}");
     }
-    // Bitaxe: asic-rs has no power control and the AxeOS override has no power field.
+    // Bitaxe: asic-rs has no power control; the AxeOS override maps power to
+    // a frequency stand-in (PR H), and 2500 W is far outside the Bitaxe range.
     let x = &o[&IpAddr::from(AXE)];
-    assert_eq!(x.status, WriteStatus::NoPath, "{x:?}");
+    assert_eq!(x.status, WriteStatus::Refused, "{x:?}");
+    assert!(x.msg.as_deref().unwrap().contains("power_w 2500 outside 0..=40"), "{x:?}");
     assert!(x.paths_tried[0].starts_with("asic-rs: skipped (asic-rs: power limit not supported"), "{x:?}");
-    assert!(x.paths_tried[1].starts_with("axeos-http: skipped (power_limit_w is not writable over AxeOS"), "{x:?}");
+    assert!(x.paths_tried[1].starts_with("axeos-http: selected for dry run only"), "{x:?}");
     assert!(alert.is_none());
     for m in r.miners.values() {
         assert!(m.writes().is_empty(), "{:?}: dry run wrote", m.fw);
@@ -301,8 +303,10 @@ async fn settings_support_rows_show_limits_and_paths() {
     assert!(a.power.tried[0].contains("supports_set_power_limit() = false"));
     let b = row(IpAddr::from(AXE)).await;
     assert_eq!(b.class, Some(super::DeviceClass::AxeOs));
-    assert_eq!((b.power.path.clone(), b.tuning.path.clone()), (None, None));
-    assert_eq!(b.power.tried.len(), 2, "asic-rs and the AxeOS override both say no: {:?}", b.power.tried);
+    // Power maps to the AxeOS frequency stand-in; tuning percent has no AxeOS equivalent.
+    assert_eq!((b.power.path.as_deref(), b.tuning.path.clone()), (Some("axeos-http"), None));
+    assert_eq!(b.power_w, Some([0, 40]));
+    assert!(b.tuning.tried.iter().any(|t| t.contains("tuning_pct has no AxeOS equivalent")), "{:?}", b.tuning.tried);
     let missing = crate::control::settings_support_row(&r.engine, IpAddr::from([192, 0, 2, 254]), None);
     assert!(!missing.found);
     let json = serde_json::to_value(&v).unwrap();

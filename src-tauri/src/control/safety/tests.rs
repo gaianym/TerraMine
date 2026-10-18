@@ -115,7 +115,7 @@ fn new_write_classes_default_to_dry_run() {
 fn irreversible_needs_typed_name_and_flag_and_single_device() {
     for k in [ActionKind::FactoryReset, ActionKind::FirmwareUpdate, ActionKind::ChangePassword] {
         assert!(k.irreversible());
-        let typed = |s: &str, allow| Confirmation { typed: Some(s.into()), allow_irreversible: allow };
+        let typed = |s: &str, allow| Confirmation { typed: Some(s.into()), allow_irreversible: allow, ..Default::default() };
         assert_eq!(preflight(k, 1, false, &Confirmation::default()), Err(Refusal::IrreversibleNotAllowed));
         assert_eq!(preflight(k, 1, false, &typed(k.name(), false)), Err(Refusal::IrreversibleNotAllowed));
         assert!(matches!(preflight(k, 1, false, &typed("yes", true)), Err(Refusal::TypedConfirmationMismatch { .. })));
@@ -325,7 +325,12 @@ fn engine(audit: Arc<dyn AuditSink>) -> SafetyEngine {
 }
 
 fn apply(change: Settings) -> SafeWriteRequest {
-    SafeWriteRequest { change, dry_run: false, confirm: Confirmation::default() }
+    SafeWriteRequest { change, dry_run: false, confirm: raise_ok() }
+}
+
+/// These tests exercise other gates; the frequency-raise hold has its own.
+fn raise_ok() -> Confirmation {
+    Confirmation { allow_frequency_raise: true, ..Default::default() }
 }
 
 // ---------------- health ----------------
@@ -557,7 +562,9 @@ fn axeos_override_is_bitaxe_only_and_unconfirmed() {
     assert!(!b.hardware_confirmed(), "nothing is hardware-confirmed yet");
     assert!(b.accepts(&bitaxe(), &freq(500)).is_ok());
     assert!(b.accepts(&s9(), &freq(500)).is_err());
-    assert!(b.accepts(&bitaxe(), &Settings { power_limit_w: Some(10), ..Default::default() }).is_err());
+    // Power is mapped to a frequency stand-in, so it cannot be combined with one.
+    assert!(b.accepts(&bitaxe(), &Settings { power_limit_w: Some(10), ..Default::default() }).is_ok());
+    assert!(b.accepts(&bitaxe(), &Settings { power_limit_w: Some(10), frequency_mhz: Some(500), ..Default::default() }).is_err());
 }
 
 #[test]
@@ -570,11 +577,14 @@ fn asic_rs_configs_map_to_settings() {
 
 #[test]
 fn axeos_body_round_trip() {
-    let s = Settings { frequency_mhz: Some(575), core_voltage_mv: Some(1200), fan_pct: Some(70), auto_fan: Some(false), ..Default::default() };
-    let body = axeos_patch_body(&s);
-    assert_eq!(body, serde_json::json!({"frequency":575,"coreVoltage":1200,"fanspeed":70,"autofanspeed":0}));
+    let s = Settings { frequency_mhz: Some(575), core_voltage_mv: Some(1200), fan_pct: Some(70), temp_target_c: Some(58), auto_fan: Some(false), ..Default::default() };
+    let body = axeos_patch_body(&s, "fanspeed");
+    assert_eq!(body, serde_json::json!({"frequency":575,"coreVoltage":1200,"fanspeed":70,"temptarget":58,"autofanspeed":0}));
     assert_eq!(parse_axeos_settings(&body), s);
-    assert_eq!(axeos_patch_body(&freq(500)), serde_json::json!({"frequency":500}));
+    let body = axeos_patch_body(&s, "manualFanSpeed");
+    assert_eq!(body["manualFanSpeed"], 70);
+    assert_eq!(parse_axeos_settings(&body), s);
+    assert_eq!(axeos_patch_body(&freq(500), "fanspeed"), serde_json::json!({"frequency":500}));
 }
 
 /// A driver with no settings backends (e.g. stock S9).
@@ -646,7 +656,10 @@ async fn engine_dry_run_and_refusals_touch_nothing() {
     let dry = SafeWriteRequest { change: freq(575), dry_run: true, confirm: Confirmation::default() };
     let o = e.apply_settings("r", &t, &dry).await;
     assert_eq!(o.status, WriteStatus::DryRun);
-    assert_eq!(o.msg.as_deref(), Some("would set frequency_mhz 525 → 575 via fake-axeos"));
+    assert_eq!(
+        o.msg.as_deref(),
+        Some("would set frequency_mhz 525 → 575 via fake-axeos; frequency raise 525 → 575 MHz is held: needs an explicit OK (allow_frequency_raise)")
+    );
     for change in [freq(900), Settings::default(), Settings { core_voltage_mv: Some(2000), ..Default::default() }] {
         let o = e.apply_settings("r", &t, &apply(change)).await;
         assert_eq!(o.status, WriteStatus::Refused, "{o:?}");

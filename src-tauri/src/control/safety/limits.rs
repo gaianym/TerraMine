@@ -24,6 +24,9 @@ pub struct LimitEntry {
     pub power_w: Option<Range>,
     #[serde(default)]
     pub fan_pct: Option<Range>,
+    /// Auto-fan target temperature (°C).
+    #[serde(default)]
+    pub temp_target_c: Option<Range>,
     /// asic-rs tuning percent (100 = unthrottled).
     #[serde(default)]
     pub tuning_pct: Option<Range>,
@@ -51,6 +54,7 @@ impl LimitsTable {
                 ("core_voltage_mv", e.core_voltage_mv),
                 ("power_w", e.power_w),
                 ("fan_pct", e.fan_pct),
+                ("temp_target_c", e.temp_target_c),
                 ("tuning_pct", e.tuning_pct),
             ] {
                 if let Some([lo, hi]) = r {
@@ -97,6 +101,7 @@ impl LimitsTable {
         field("core_voltage_mv", change.core_voltage_mv, e.core_voltage_mv);
         field("power_w", change.power_limit_w, e.power_w);
         field("fan_pct", change.fan_pct, e.fan_pct);
+        field("temp_target_c", change.temp_target_c, e.temp_target_c);
         field("tuning_pct", change.tuning_pct, e.tuning_pct);
         if errs.is_empty() {
             Ok(e)

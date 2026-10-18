@@ -80,7 +80,7 @@
     <h2 id="tm-power-title" class="mb-2 text-base font-semibold">Power limit / tuning for {ips.length} miner{ips.length === 1 ? "" : "s"}</h2>
     <p class="mb-3 text-xs text-zinc-400">
       Sent through the safety pipeline: limits, snapshot, read-back, health watch and automatic rollback, with a canary
-      first wave. Bitaxe / AxeOS has no power control here (frequency / voltage is a separate change).
+      first wave. Bitaxe / AxeOS has no power limit: a power target becomes an estimated frequency (restart to apply), shown in the dry-run plan.
     </p>
     <div class="mb-3 grid grid-cols-2 gap-2 text-xs">
       <label class="flex flex-col gap-1">Power limit (W)

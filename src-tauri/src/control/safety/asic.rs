@@ -61,6 +61,9 @@ pub fn asic_accepts(change: &Settings, f: NativeSettingsFlags) -> Result<(), Str
     if change.fan_pct.is_some() && !f.fan {
         why.push("asic-rs: fan config not supported on this firmware".into());
     }
+    if change.temp_target_c.is_some() {
+        why.push("asic-rs: target temperature is not modelled for this path yet".into());
+    }
     if change.auto_fan.is_some() {
         why.push("asic-rs: auto-fan needs a target temperature (not modelled yet)".into());
     }
