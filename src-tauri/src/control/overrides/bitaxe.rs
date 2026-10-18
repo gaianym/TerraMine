@@ -16,7 +16,11 @@ use reqwest::Client;
 use semver::Version;
 use serde_json::Value;
 
-use crate::control::driver::{Capabilities, MinerAction, MinerDriver, MinerStatus, Route};
+use crate::control::cache::DriverKind;
+use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, MinerStatus, Observation, Route};
+use crate::control::safety::axeos::{health_from_info, AxeOsSettings};
+use crate::control::safety::settings::{HealthSample, SettingsDriver};
+use crate::control::safety::DeviceProfile;
 
 /// Minimum AxeOS version that exposes pause/resume endpoints.
 pub const PAUSE_RESUME_MIN: Version = Version::new(2, 14, 0);
@@ -31,6 +35,8 @@ pub struct BitaxeDriver {
     /// True when a probe of `/api/system/pause` returned success even if
     /// the version string was missing or below the floor.
     pause_probe_ok: bool,
+    /// `ASICModel` from system info (limits are keyed on the chip).
+    asic_model: Option<String>,
 }
 
 impl BitaxeDriver {
@@ -47,7 +53,13 @@ impl BitaxeDriver {
             client,
             version,
             pause_probe_ok,
+            asic_model: None,
         }
+    }
+
+    pub fn with_asic_model(mut self, chip: Option<String>) -> Self {
+        self.asic_model = chip;
+        self
     }
 
     /// Probe `GET {base}/api/system/info` and optionally pause support.
@@ -77,7 +89,8 @@ impl BitaxeDriver {
         // Soft probe: `miningPaused` in /info is only present once pause
         // support shipped; avoids POSTing pause against a live miner.
         let pause_probe_ok = body.get("miningPaused").is_some();
-        Ok(Some(Self::from_parts(ip, base, client, version, pause_probe_ok)))
+        let chip = body.get("ASICModel").and_then(|v| v.as_str()).map(str::to_string);
+        Ok(Some(Self::from_parts(ip, base, client, version, pause_probe_ok).with_asic_model(chip)))
     }
 
     fn pause_resume_supported(&self) -> bool {
@@ -87,6 +100,11 @@ impl BitaxeDriver {
                 .as_ref()
                 .map(|v| *v >= PAUSE_RESUME_MIN)
                 .unwrap_or(false)
+    }
+
+    async fn info(&self) -> anyhow::Result<Value> {
+        let url = format!("{}/api/system/info", self.base);
+        Ok(self.client.get(url).send().await?.error_for_status()?.json().await?)
     }
 
     async fn post(&self, path: &str) -> anyhow::Result<bool> {
@@ -134,11 +152,40 @@ impl MinerDriver for BitaxeDriver {
     }
 
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {
+        Box::pin(async move { Ok(parse_axeos_status(&self.info().await?)) })
+    }
+
+    fn kind(&self) -> DriverKind {
+        DriverKind::AxeOs
+    }
+
+    /// Status and identity come from the same `/api/system/info` read.
+    fn observe(&self) -> BoxFuture<'_, anyhow::Result<Option<Observation>>> {
         Box::pin(async move {
-            let url = format!("{}/api/system/info", self.base);
-            let body: Value = self.client.get(url).send().await?.error_for_status()?.json().await?;
-            Ok(parse_axeos_status(&body))
+            let body = self.info().await?;
+            Ok(Some(Observation { status: Some(parse_axeos_status(&body)), identity: parse_axeos_identity(&body) }))
         })
+    }
+
+    fn health(&self) -> BoxFuture<'_, HealthSample> {
+        Box::pin(async move {
+            match self.info().await {
+                Ok(v) => health_from_info(&v),
+                Err(_) => HealthSample::unreachable(),
+            }
+        })
+    }
+
+    fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
+        vec![Box::new(AxeOsSettings::new(self.base.clone(), self.client.clone()))]
+    }
+
+    fn profile(&self) -> DeviceProfile {
+        let fw = match &self.version {
+            Some(v) => format!("AxeOS {v}"),
+            None => "AxeOS".to_string(),
+        };
+        DeviceProfile::classify("Bitaxe", "Bitaxe", &fw, self.asic_model.as_deref())
     }
 }
 
@@ -150,7 +197,13 @@ pub fn parse_axeos_status(body: &Value) -> MinerStatus {
     }
 }
 
-fn looks_like_axeos(body: &Value) -> bool {
+/// MAC (`macAddr`) and firmware version from AxeOS system info.
+pub fn parse_axeos_identity(body: &Value) -> Identity {
+    let s = |k: &str| body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    Identity { mac: s("macAddr"), firmware: s("version").or_else(|| s("axeOSVersion")) }
+}
+
+pub fn looks_like_axeos(body: &Value) -> bool {
     body.get("ASICModel").is_some()
         || body.get("axeOSVersion").is_some()
         || (body.get("version").is_some() && body.get("boardVersion").is_some())
@@ -168,7 +221,7 @@ pub fn parse_axeos_version(body: &Value) -> Option<Version> {
     None
 }
 
-fn parse_loose_version(s: &str) -> Option<Version> {
+pub fn parse_loose_version(s: &str) -> Option<Version> {
     let trimmed = s.trim().trim_start_matches('v');
     // Take major.minor.patch prefix; ignore trailing build metadata junk.
     let mut parts = trimmed.split(|c: char| !c.is_ascii_digit() && c != '.');

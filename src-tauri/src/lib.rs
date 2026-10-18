@@ -17,6 +17,7 @@ pub fn run() {
             discovery::stop_all_discovery_runs,
             control::miner_capabilities,
             control::run_miner_action,
+            control::run_settings_job,
             control::cancel_action_run,
             control::list_miner_credentials,
             control::set_miner_credentials,

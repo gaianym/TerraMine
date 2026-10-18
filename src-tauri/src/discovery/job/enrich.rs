@@ -73,6 +73,12 @@ pub(super) async fn enrich_one(
 
     match res {
         Ok(data) => {
+            // Seed the device cache so actions reuse this identity instead
+            // of identifying the miner again.
+            let mac = data.mac.map(|m| m.to_string());
+            let fw = data.firmware_version.clone();
+            let shared: std::sync::Arc<dyn Miner + Send> = std::sync::Arc::from(miner);
+            crate::control::cache::DeviceCache::global().record_discovery(ip, shared, mac, fw);
             let (v, status, outcome) = match serde_json::to_value(&data) {
                 Ok(v) => (v, RowStatus::Enriched, EnrichOutcome::Enriched),
                 Err(e) => {
