@@ -24,7 +24,10 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 
 use super::cache::{CachedDevice, DriverKind};
-use super::overrides::{BitaxeDriver, DigestCredentials, S9StockDriver};
+use super::overrides::cgminer_rpc::stock_s9_driver;
+use super::overrides::{BitaxeDriver, DigestCredentials, S9RpcDriver, S9StockDriver};
+use super::safety::profile::classify_class;
+use super::safety::DeviceClass;
 use super::safety::settings::{HealthSample, SettingsDriver};
 use super::safety::DeviceProfile;
 
@@ -114,6 +117,8 @@ pub enum Route {
     Axeos,
     /// Stock Antminer S9 CGI override.
     S9Cgi,
+    /// cgminer / bmminer JSON-RPC on :4028 (stock Antminer only).
+    CgminerRpc,
     /// Test double.
     Mock,
 }
@@ -124,6 +129,7 @@ impl Route {
             Self::AsicRs => "asic-rs",
             Self::Axeos => "axeos",
             Self::S9Cgi => "s9-cgi",
+            Self::CgminerRpc => "cgminer-rpc",
             Self::Mock => "mock",
         }
     }
@@ -576,9 +582,17 @@ impl DriverFactory for OverlayFactory {
                         _ => Some(bitaxe_with_native(ip, d, self.timeout).await),
                     }
                 }
-                DriverKind::S9Stock => S9StockDriver::probe(ip, self.s9_creds.clone(), self.timeout)
-                    .await?
-                    .map(|d| Box::new(d) as Box<dyn MinerDriver>),
+                // CGI when its login works, else the bmminer RPC fallback
+                // (asic-rs first for whatever it supports).
+                DriverKind::S9Stock => {
+                    let d = stock_s9_driver(ip, format!("http://{ip}"), self.s9_creds.clone(), format!("{ip}:4028"), self.timeout).await?;
+                    match (d, &c.miner) {
+                        (Some(d), Some(m)) if d.caps().route(MinerAction::Reboot) != Some(Route::S9Cgi) => {
+                            Some(Box::new(CompositeDriver::new(ip, Box::new(AsicRsDriver::from_shared(ip, m.clone())), d)) as Box<dyn MinerDriver>)
+                        }
+                        (d, _) => d,
+                    }
+                }
                 DriverKind::AsicRs => match &c.miner {
                     Some(m) => Some(Box::new(AsicRsDriver::from_shared(ip, m.clone())) as Box<dyn MinerDriver>),
                     None => return self.connect(ip).await,
@@ -614,6 +628,16 @@ impl DriverFactory for OverlayFactory {
                         S9StockDriver::probe(ip, self.s9_creds.clone(), self.timeout).await?
                     {
                         return Ok(Some(Box::new(d) as Box<dyn MinerDriver>));
+                    }
+                    // CGI login rejected: bmminer RPC fallback, but only for
+                    // stock firmware (never Braiins / VNish / LuxOS on an S9).
+                    let fw = info.firmware.to_string();
+                    if classify_class(&info.make.to_string(), &fw) == DeviceClass::AntminerStock {
+                        let cgi = super::overrides::cgminer_rpc::CGI_UNUSABLE.to_string();
+                        if let Some(rpc) = S9RpcDriver::probe(ip, format!("{ip}:4028"), self.timeout, cgi).await? {
+                            let native = Box::new(AsicRsDriver::new(ip, m));
+                            return Ok(Some(Box::new(CompositeDriver::new(ip, native, Box::new(rpc))) as Box<dyn MinerDriver>));
+                        }
                     }
                 }
                 return Ok(Some(Box::new(AsicRsDriver::new(ip, m)) as Box<dyn MinerDriver>));

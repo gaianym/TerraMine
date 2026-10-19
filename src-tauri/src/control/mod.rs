@@ -13,6 +13,8 @@ mod http_mock;
 #[cfg(test)]
 mod override_tests;
 #[cfg(test)]
+mod antminer_fallback_e2e_tests;
+#[cfg(test)]
 mod e2e_tests;
 #[cfg(any(test, feature = "mock-miner"))]
 pub mod mock_miner;

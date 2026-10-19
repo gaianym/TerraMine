@@ -211,7 +211,7 @@ async fn e2e_mislabeled_axeos_gets_no_write() {
     assert!(o.paths_tried[0].starts_with("axeos-http: skipped (device class AntminerStock is not AxeOS)"), "{o:?}");
     let reqs = r.axe.requests();
     assert_eq!(reqs.len(), before, "nothing sent to the AxeOS mock: {reqs:?}");
-    assert!(!reqs.iter().any(|q| q == "cgminer" || q == "unparsed"));
+    assert!(!reqs.iter().any(|q| q.starts_with("cgminer") || q == "unparsed"));
 }
 
 /// Permanent: a refusal lists every backend considered, each with a reason.

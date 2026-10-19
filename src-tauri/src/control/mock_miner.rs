@@ -153,6 +153,10 @@ struct State {
     light: bool,
     /// AxeOS identify ("Hi!") active until.
     identify_until: Option<Instant>,
+    /// bmminer RPC: privileged commands denied (api-allow without W:).
+    rpc_denied: bool,
+    /// bmminer RPC `restart` count (mining process restarts).
+    mining_restarts: u32,
     /// AxeOS stratum settings (stored): [primary, fallback] as
     /// (host, port, user, password). Running copy applies at boot.
     stratum: [(String, u16, String, String); 2],
@@ -294,13 +298,21 @@ impl MockMiner {
         let s = self.state.lock().unwrap();
         (s.frequency, s.core_voltage)
     }
-    /// Every request seen, e.g. "GET /api/system/info", "cgminer", "unparsed".
+    /// Every request seen, e.g. "GET /api/system/info", "cgminer summary", "unparsed".
     pub fn requests(&self) -> Vec<String> {
         self.state.lock().unwrap().requests.clone()
     }
     /// Fault light as the mock sees it.
     pub fn light(&self) -> bool {
         self.state.lock().unwrap().light
+    }
+    /// bmminer RPC: deny privileged commands (`restart`).
+    pub fn set_rpc_denied(&self, v: bool) {
+        self.state.lock().unwrap().rpc_denied = v;
+    }
+    /// bmminer `restart` commands applied.
+    pub fn mining_restarts(&self) -> u32 {
+        self.state.lock().unwrap().mining_restarts
     }
     /// AxeOS identify currently showing "Hi!".
     pub fn identifying(&self) -> bool {
@@ -339,6 +351,8 @@ impl MockMiner {
             outage: false,
             light: false,
             identify_until: None,
+            rpc_denied: false,
+            mining_restarts: 0,
             stratum: mock_stratum(),
             running_stratum: mock_stratum(),
             patches: Vec::new(),
@@ -360,6 +374,9 @@ impl MockMiner {
     }
 }
 
+/// bmminer-style JSON-RPC: `summary`, `stats` (with bmminer's `}{`
+/// quirk), `pools`, `version`, `privileged`, `restart`. Every request is
+/// logged as `cgminer <command>`; unknown commands get `STATUS: E`.
 async fn serve_cgminer(l: TcpListener, st: Arc<Mutex<State>>, stop: CancellationToken) {
     loop {
         let (mut sock, _) = tokio::select! {
@@ -369,16 +386,37 @@ async fn serve_cgminer(l: TcpListener, st: Arc<Mutex<State>>, stop: Cancellation
         let st = st.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let cmd = serde_json::from_slice::<serde_json::Value>(&buf[..n])
+                .ok()
+                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(str::to_string))
+                .unwrap_or_else(|| "summary".into());
             let reply = {
                 let mut s = st.lock().unwrap();
-                s.requests.push("cgminer".into());
+                s.requests.push(format!("cgminer {cmd}"));
                 s.settle();
                 if !s.online() {
                     return; // drop the socket while "rebooting"
                 }
-                let ghs = if s.outage || s.paused { "0" } else { "13500" };
-                format!(r#"{{"STATUS":[{{"STATUS":"S"}}],"SUMMARY":[{{"Elapsed":{},"GHS 5s":"{ghs}"}}],"id":1}}"#, s.uptime())
+                let ok = r#"[{"STATUS":"S","Msg":"ok"}]"#;
+                match cmd.as_str() {
+                    "summary" => {
+                        let ghs = if s.outage || s.paused { "0" } else { "13500" };
+                        format!(r#"{{"STATUS":{ok},"SUMMARY":[{{"Elapsed":{},"GHS 5s":"{ghs}"}}],"id":1}}"#, s.uptime())
+                    }
+                    "stats" => format!(r#"{{"STATUS":{ok},"STATS":[{{"BMMiner":"2.0.0"}}{{"temp6":58,"temp7":60,"temp8":0,"temp2_6":"72","temp2_7":75,"temp2_8":0}}],"id":1}}"#),
+                    "pools" => format!(r#"{{"STATUS":{ok},"POOLS":[{{"POOL":0,"URL":"stratum+tcp://pool.example.com:3333","Status":"Alive","Priority":0}}],"id":1}}"#),
+                    "version" => format!(r#"{{"STATUS":{ok},"VERSION":[{{"BMMiner":"2.0.0","API":"3.1","Type":"Antminer S9"}}],"id":1}}"#),
+                    "privileged" | "restart" if s.rpc_denied => r#"{"STATUS":[{"STATUS":"E","Code":45,"Msg":"Access denied to 'privileged' command"}],"id":1}"#.to_string(),
+                    "privileged" => r#"{"STATUS":[{"STATUS":"S","Code":46,"Msg":"Privileged access OK"}],"id":1}"#.to_string(),
+                    "restart" => {
+                        s.mining_restarts += 1;
+                        s.boot_at = Instant::now();
+                        s.uptime_offset = 0;
+                        r#"{"STATUS":"RESTART"}"#.to_string()
+                    }
+                    _ => r#"{"STATUS":[{"STATUS":"E","Code":14,"Msg":"Invalid command"}],"id":1}"#.to_string(),
+                }
             };
             let mut out = reply.into_bytes();
             out.push(0);
@@ -800,6 +838,13 @@ impl MockMinerFactory {
         self.miners.insert(ip, (m.kind, m.base(), m.cgminer, m.creds.clone()));
         self.macs.insert(ip, m.mac());
     }
+    /// Use these digest credentials for the miner at `ip` (e.g. wrong
+    /// ones, to exercise the RPC fallback).
+    pub fn set_creds(&mut self, ip: IpAddr, creds: DigestCredentials) {
+        if let Some(m) = self.miners.get_mut(&ip) {
+            m.3 = creds;
+        }
+    }
     /// Full identifications performed.
     pub fn connects(&self) -> usize {
         self.connects.load(Ordering::SeqCst)
@@ -876,15 +921,11 @@ impl DriverFactory for MockMinerFactory {
                     Some(d) => Some(Box::new(d) as Box<dyn MinerDriver>),
                     None => None,
                 },
-                MockKind::S9Stock { .. } => S9StockDriver::probe_at(ip, base, creds, self.timeout)
-                    .await?
-                    .map(|d| {
-                        let d = match cg {
-                            Some(a) => d.with_cgminer_addr(a.to_string()),
-                            None => d,
-                        };
-                        Box::new(d) as Box<dyn MinerDriver>
-                    }),
+                // Same rule as the app: CGI when its login works, else bmminer RPC.
+                MockKind::S9Stock { .. } => {
+                    let cg = cg.map_or_else(|| format!("{ip}:4028"), |a| a.to_string());
+                    crate::control::overrides::cgminer_rpc::stock_s9_driver(ip, base, creds, cg, self.timeout).await?
+                }
                 MockKind::AsicRs(fw) => {
                     let client = reqwest::Client::builder().timeout(self.timeout).no_proxy().build()?;
                     Some(Box::new(MockAsicRs { ip, fw, base, client }) as Box<dyn MinerDriver>)
