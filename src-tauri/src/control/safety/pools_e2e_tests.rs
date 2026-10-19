@@ -195,7 +195,7 @@ async fn pool_request_checks() {
 /// Timezone: asic-rs where supported, must be listed by the miner.
 #[tokio::test(start_paused = true)]
 async fn timezone_paths_and_checks() {
-    let r = rig(true, true).await;
+    let r = rig(true, false).await;
     let b = NativeFirmware::Braiins2507;
     let o = run_c(&r, vec![ip_of(b)], tz("America/Chicago"), false, false).await;
     let x = &o[&ip_of(b)];
@@ -208,6 +208,16 @@ async fn timezone_paths_and_checks() {
     let o = run_c(&r, vec![ip_of(b)], tz("Mars/Base"), true, false).await;
     assert!(o[&ip_of(b)].paths_tried[0].contains("is not an IANA timezone"), "{:?}", o[&ip_of(b)]);
 
+}
+
+/// Timezone where there is no route: Whatsminer (asic-rs says no) and the
+/// Bitaxe (AxeOS has no timezone). Real time (multi_thread), not a paused
+/// clock: the Bitaxe is the real-socket AxeOS mock, and a paused clock
+/// auto-advances past the resolve timeout while its I/O is in flight
+/// (macOS CI flake). `paused_clock_tests_use_no_socket_mocks` guards this.
+#[tokio::test(flavor = "multi_thread")]
+async fn timezone_not_supported_with_paths_tried() {
+    let r = rig(true, true).await;
     let o = run_c(&r, vec![ip_of(NativeFirmware::WhatsminerV3), IpAddr::from(AXE)], tz("UTC"), true, false).await;
     let w = &o[&ip_of(NativeFirmware::WhatsminerV3)];
     assert_eq!(w.status, WriteStatus::NoPath);
