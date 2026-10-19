@@ -14,7 +14,10 @@
 //! - Fan / frequency / temperature: no safe partial write. The 2018 build's
 //!   `set_miner_conf.cgi` takes form fields and rewrites the whole miner
 //!   config (pools included); asic-rs only documents the JSON
-//!   read-modify-write of later (2020+) stock firmware.
+//!   read-modify-write of later (2020+) stock firmware. bmminer RPC has no
+//!   set command for them either (see [`super::cgminer_rpc`]).
+//! - Health: hashrate from bmminer `summary`, hottest chip temperature
+//!   from `stats` (both read-only RPC through the allowlisted client).
 
 use std::net::IpAddr;
 use std::time::Duration;
@@ -29,9 +32,11 @@ use crate::control::driver::{Capabilities, Identity, MinerAction, MinerDriver, M
 use crate::control::safety::settings::{HealthSample, NoSettingsPath, SettingsDriver};
 
 /// Why the stock S9 has no settings write path (shown in "paths tried").
-pub const S9_NO_SETTINGS: &str = "stock S9 firmware: set_miner_conf.cgi replaces the whole miner config (pools included) from form fields; no documented partial fan / frequency / temperature route";
+pub const S9_NO_SETTINGS: &str = "stock S9 firmware: set_miner_conf.cgi replaces the whole miner config (pools included) from form fields; no documented partial fan / frequency / temperature route; bmminer RPC has no set command for them either";
 use crate::control::safety::DeviceProfile;
 use crate::control::overrides::auth::DigestCredentials;
+use crate::control::overrides::cgminer_rpc::{CgminerRpc, RPC_NO_LIGHT, RPC_NO_PAUSE};
+use crate::control::safety::DeviceClass;
 
 #[derive(Debug, Clone)]
 pub struct S9StockDriver {
@@ -67,22 +72,14 @@ impl S9StockDriver {
         self
     }
 
-    async fn cgminer_summary(&self) -> anyhow::Result<Vec<u8>> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut sock = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&self.cgminer_addr),
-        )
-        .await??;
-        sock.write_all(br#"{"command":"summary"}"#).await?;
-        let mut buf = Vec::new();
-        tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut buf)).await??;
-        Ok(buf)
+    /// Allowlisted bmminer RPC client (class-gated to stock Antminer).
+    pub(crate) fn rpc(&self) -> CgminerRpc {
+        CgminerRpc::for_class(DeviceClass::AntminerStock, self.cgminer_addr.clone(), Duration::from_secs(5))
+            .expect("stock S9 is AntminerStock")
     }
 
     async fn cgminer_elapsed(&self) -> anyhow::Result<u64> {
-        let buf = self.cgminer_summary().await?;
-        parse_cgminer_elapsed(&buf).ok_or_else(|| anyhow::anyhow!("no Elapsed in cgminer summary"))
+        self.rpc().elapsed().await
     }
 
     pub async fn probe(
@@ -203,12 +200,7 @@ impl MinerDriver for S9StockDriver {
     }
 
     fn health(&self) -> BoxFuture<'_, HealthSample> {
-        Box::pin(async move {
-            match self.cgminer_summary().await {
-                Ok(raw) => HealthSample { reachable: true, hashrate_ghs: parse_cgminer_ghs(&raw), temp_c: None },
-                Err(_) => HealthSample::unreachable(),
-            }
-        })
+        Box::pin(async move { self.rpc().health().await })
     }
 
     fn caps(&self) -> Capabilities {
@@ -259,16 +251,19 @@ impl MinerDriver for S9StockDriver {
         })
     }
 
+    /// Every path for `action`; when the CGI has none, the bmminer RPC
+    /// is listed too, so "not supported" names both.
     fn paths_tried(&self, action: MinerAction) -> Vec<String> {
-        vec![match action {
-            MinerAction::LightOn | MinerAction::LightOff => {
-                "s9-cgi: POST /cgi-bin/blink.cgi (not yet confirmed on stock S9 firmware)".to_string()
-            }
+        match action {
+            MinerAction::LightOn | MinerAction::LightOff => vec![
+                "s9-cgi: POST /cgi-bin/blink.cgi (not yet confirmed on stock S9 firmware)".to_string(),
+                RPC_NO_LIGHT.to_string(),
+            ],
             MinerAction::Start | MinerAction::Stop if !self.has_miner_mode => {
-                "s9-cgi: no miner-mode on this firmware (no sleep API)".to_string()
+                vec!["s9-cgi: no miner-mode on this firmware (no sleep API)".to_string(), RPC_NO_PAUSE.to_string()]
             }
-            a => format!("s9-cgi: {} available", a.name()),
-        }]
+            a => vec![format!("s9-cgi: {} available", a.name())],
+        }
     }
 
     fn status(&self) -> BoxFuture<'_, anyhow::Result<MinerStatus>> {

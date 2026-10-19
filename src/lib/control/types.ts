@@ -24,7 +24,7 @@ export type ActionStatus =
   | "unverified";
 
 /** How an action reaches the miner: asic-rs natively, or an override. */
-export type Route = "asic-rs" | "axeos" | "s9-cgi" | "mock";
+export type Route = "asic-rs" | "axeos" | "s9-cgi" | "cgminer-rpc" | "mock";
 
 /** Support flags plus the per-action route (absent = unsupported). */
 export type Capabilities = {

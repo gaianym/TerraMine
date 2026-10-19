@@ -127,8 +127,12 @@ async fn e2e_s9_wrong_password_never_reboots() {
     f.miners.get_mut(&IpAddr::from(S9)).unwrap().3.password = "nope".into();
     let (s, _) = sink();
     let r = run_action(vec![IpAddr::from(S9)], cfg(MinerAction::Reboot), Arc::new(f), CancellationToken::new(), s).await;
-    assert!(matches!(r[0].status, ActionStatus::NotFound | ActionStatus::Failed), "{:?}", r[0]);
+    // Login rejected: the bmminer RPC fallback is found, but it is not
+    // hardware-confirmed, so a live reboot is refused and nothing is sent.
+    assert_eq!(r[0].status, ActionStatus::Refused, "{:?}", r[0]);
+    assert_eq!(r[0].route, Some(Route::CgminerRpc));
     assert_eq!(m.reboots(), 0);
+    assert_eq!(m.mining_restarts(), 0);
 }
 
 // ---------------- capability map (asic-rs 0.8.6) ----------------
