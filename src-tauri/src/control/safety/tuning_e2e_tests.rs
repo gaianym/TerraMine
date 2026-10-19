@@ -143,7 +143,13 @@ async fn unhealthy_mode_rolls_back_to_previous_target() {
 
 /// High (overclock) is refused by the limits on every class, before any
 /// write; Low on a non-A2 Sealminer is refused by the path.
-#[tokio::test(start_paused = true)]
+///
+/// Real time (multi_thread), not a paused clock: the Bitaxe here is the
+/// real-socket AxeOS mock, and a paused clock auto-advances past the 2 s
+/// resolve timeout while the socket I/O is still in flight (macOS CI
+/// flake: "miner not found"). `paused_clock_tests_use_no_socket_mocks`
+/// guards this.
+#[tokio::test(flavor = "multi_thread")]
 async fn high_mode_refused_everywhere() {
     let r = rig(true, true).await;
     let mut ips: Vec<IpAddr> = MODE_CAPABLE.map(ip_of).to_vec();
