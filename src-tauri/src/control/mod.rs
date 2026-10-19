@@ -304,9 +304,22 @@ pub struct SettingsSupportRow {
     /// Auto fan with a target temperature (or plain auto where the firmware
     /// has no target, e.g. stock Antminer).
     pub fan_auto: FieldSupport,
+    /// Tuning targets (plan PR D): mode, hashrate, preset, scaling.
+    pub tuning_modes: Vec<safety::settings::TuningMode>,
+    pub tuning_hashrate_ghs: Option<safety::limits::Range>,
+    pub scaling_step: Option<safety::limits::Range>,
+    pub scaling_min: Option<safety::limits::Range>,
+    /// Per allowed-or-not mode: the path for `tuning_mode: low` (the
+    /// representative check; High is refused by the limits everywhere).
+    pub mode: FieldSupport,
+    pub hashrate: FieldSupport,
+    pub preset: FieldSupport,
+    pub scaling: FieldSupport,
+    /// Presets the miner lists (read once, only where presets are supported).
+    pub presets: Vec<String>,
 }
 
-pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: Option<Arc<dyn driver::MinerDriver>>) -> SettingsSupportRow {
+pub async fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: Option<Arc<dyn driver::MinerDriver>>) -> SettingsSupportRow {
     let none = || FieldSupport { path: None, confirmed: false, tried: Vec::new() };
     let Some(d) = driver else {
         return SettingsSupportRow {
@@ -322,6 +335,15 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
             temp_target_c: None,
             fan: none(),
             fan_auto: none(),
+            tuning_modes: Vec::new(),
+            tuning_hashrate_ghs: None,
+            scaling_step: None,
+            scaling_min: None,
+            mode: none(),
+            hashrate: none(),
+            preset: none(),
+            scaling: none(),
+            presets: Vec::new(),
         };
     };
     let t = safety::Target::new(ip, d);
@@ -330,6 +352,20 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
         FieldSupport { confirmed: b.as_ref().is_some_and(|b| b.confirmed_for(&change)), path: b.map(|b| b.id().to_string()), tried }
     };
     let limits = engine.limits.lookup(&t.profile);
+    use safety::settings::{Settings as S, TuningMode};
+    let mode = field(S { tuning_mode: Some(TuningMode::Low), ..Default::default() });
+    let hashrate = field(S { tuning_hashrate_ghs: Some(1), ..Default::default() });
+    let preset = field(S { tuning_preset: Some(String::new()), ..Default::default() });
+    let scaling = field(S { scaling_step: Some(1), scaling_min: Some(1), ..Default::default() });
+    let mut presets = Vec::new();
+    if preset.path.is_some() {
+        for b in t.driver.settings_backends() {
+            if b.accepts(&t.profile, &S { tuning_preset: Some(String::new()), ..Default::default() }).is_ok() {
+                presets = tokio::time::timeout(Duration::from_secs(5), b.presets()).await.unwrap_or_default();
+                break;
+            }
+        }
+    }
     SettingsSupportRow {
         ip: ip.to_string(),
         found: true,
@@ -351,6 +387,15 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
                 if plain.path.is_some() { plain } else { with_target }
             }
         },
+        tuning_modes: limits.and_then(|e| e.tuning_modes.clone()).unwrap_or_default(),
+        tuning_hashrate_ghs: limits.and_then(|e| e.tuning_hashrate_ghs),
+        scaling_step: limits.and_then(|e| e.scaling_step),
+        scaling_min: limits.and_then(|e| e.scaling_min),
+        mode,
+        hashrate,
+        preset,
+        scaling,
+        presets,
     }
 }
 
@@ -370,7 +415,7 @@ pub async fn settings_support(ips: Vec<String>) -> Result<Vec<SettingsSupportRow
             cache::Resolved::Ready { driver, .. } => Some(driver),
             _ => None,
         };
-        out.push(settings_support_row(&engine, ip, d));
+        out.push(settings_support_row(&engine, ip, d).await);
     }
     Ok(out)
 }

@@ -395,7 +395,7 @@ impl MinerDriver for AsicRsDriver {
         Box::pin(async move { super::safety::asic::health_from_miner_data(&self.miner.get_data().await) })
     }
     fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
-        vec![Box::new(super::safety::asic::AsicRsSettings::new(self.miner.clone()))]
+        vec![Box::new(super::safety::asic::AsicRsSettings::new(self.miner.clone()).with_profile(&self.profile()))]
     }
 }
 
