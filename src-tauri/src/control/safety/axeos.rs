@@ -15,6 +15,14 @@
 //! - Power: AxeOS has no power limit. A `power_limit_w` request is mapped
 //!   to a frequency stand-in estimated from the reported power draw.
 //!
+//! - Pools (plan PR F): AxeOS has exactly two slots, primary and
+//!   fallback: `stratumURL` (host) / `stratumPort` / `stratumUser` /
+//!   `stratumPassword` and the `fallbackStratum*` keys, written by the same
+//!   `PATCH /api/system` and applied by a restart. Read back from
+//!   `/api/system/info` (passwords are not reported, so a password is only
+//!   sent when the request has one, and a rollback cannot restore an old
+//!   password). After the restart `isUsingFallbackStratum` must be false,
+//!   or the change is rolled back. stratum+tcp only. No timezone setting.
 //! - Tuning targets (plan PR D) reuse the same frequency stand-in:
 //!   a hashrate target scales frequency by target / reported `hashRate`;
 //!   mode Normal is the chip's ESP-Miner default frequency and Low 10%
@@ -31,6 +39,7 @@ use reqwest::Client;
 use semver::Version;
 use serde_json::{json, Value};
 
+use super::pools::{PoolGroupSpec, PoolSpec, Secret};
 use super::profile::{DeviceClass, DeviceProfile};
 use super::settings::{HealthSample, Settings, SettingsDriver, TuningMode};
 
@@ -48,7 +57,9 @@ pub fn confirmed_line(v: Option<&Version>) -> bool {
 
 /// The change only touches fields confirmed on hardware (frequency, fan).
 pub fn confirmed_fields(change: &Settings) -> bool {
-    change.core_voltage_mv.is_none()
+    !change.touches_pools()
+        && change.timezone.is_none()
+        && change.core_voltage_mv.is_none()
         && change.power_limit_w.is_none()
         && change.tuning_pct.is_none()
         && change.temp_hot_c.is_none()
@@ -133,6 +144,9 @@ impl AxeOsSettings {
 
     /// A restart is needed to apply `change` on this firmware.
     pub fn restart_needed(&self, change: &Settings) -> bool {
+        if change.pools.is_some() {
+            return true;
+        }
         if confirmed_line(self.version.as_ref()) {
             change.core_voltage_mv.is_some()
         } else {
@@ -159,8 +173,58 @@ pub fn fan_key(info: &Value) -> &'static str {
     }
 }
 
+/// AxeOS primary + fallback pool as one group (empty slots left out).
+pub fn parse_axeos_pools(v: &Value) -> Option<Vec<PoolGroupSpec>> {
+    let slot = |pre: &str| {
+        let host = v.get(format!("{pre}URL"))?.as_str()?.trim().to_string();
+        if host.is_empty() {
+            return None;
+        }
+        let port = v.get(format!("{pre}Port")).and_then(Value::as_u64).unwrap_or(0);
+        let user = v.get(format!("{pre}User")).and_then(Value::as_str).unwrap_or("").to_string();
+        let url = if host.contains("://") { host } else { format!("stratum+tcp://{host}:{port}") };
+        Some(PoolSpec { url, user, password: Secret::Unknown })
+    };
+    v.get("stratumURL")?;
+    let pools: Vec<PoolSpec> = ["stratum", "fallbackStratum"].iter().filter_map(|p| slot(p)).collect();
+    Some(vec![PoolGroupSpec { name: "default".into(), quota: 1, pools }])
+}
+
+/// PATCH keys for the AxeOS pool slots.
+fn pool_patch(m: &mut serde_json::Map<String, Value>, groups: &[PoolGroupSpec]) {
+    let pools: Vec<&PoolSpec> = groups.iter().flat_map(|g| g.pools.iter()).collect();
+    for (pre, p) in ["stratum", "fallbackStratum"].iter().zip(pools) {
+        let u = asic_rs_core::data::pool::PoolURL::from(p.url.trim().to_string());
+        m.insert(format!("{pre}URL"), json!(u.host));
+        m.insert(format!("{pre}Port"), json!(u.port));
+        m.insert(format!("{pre}User"), json!(p.user.trim()));
+        if let Some(pw) = p.password.value() {
+            m.insert(format!("{pre}Password"), json!(pw));
+        }
+    }
+}
+
+/// AxeOS pool constraints on a resolved list.
+pub fn axeos_pools_ok(groups: &[PoolGroupSpec]) -> Result<(), String> {
+    let pools: Vec<&PoolSpec> = groups.iter().flat_map(|g| g.pools.iter()).collect();
+    if pools.len() != 2 {
+        return Err(format!(
+            "AxeOS always has a primary and a fallback pool; the result has {} (send two pools, or replace one)",
+            pools.len()
+        ));
+    }
+    for p in pools {
+        let u = asic_rs_core::data::pool::PoolURL::from(p.url.trim().to_string());
+        if u.scheme.to_string() != "stratum+tcp" {
+            return Err(format!("AxeOS pools here are stratum+tcp only ({} is {})", p.url, u.scheme));
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_axeos_settings(v: &Value) -> Settings {
     Settings {
+        pools: parse_axeos_pools(v),
         frequency_mhz: as_u32(v.get("frequency")),
         core_voltage_mv: as_u32(v.get("coreVoltage")),
         fan_pct: as_u32(v.get(fan_key(v))),
@@ -172,6 +236,9 @@ pub fn parse_axeos_settings(v: &Value) -> Settings {
 
 pub fn axeos_patch_body(s: &Settings, fan_key: &str) -> Value {
     let mut m = serde_json::Map::new();
+    if let Some(g) = &s.pools {
+        pool_patch(&mut m, g);
+    }
     if let Some(f) = s.frequency_mhz {
         m.insert("frequency".into(), json!(f));
     }
@@ -258,6 +325,9 @@ impl SettingsDriver for AxeOsSettings {
         if p.class != DeviceClass::AxeOs {
             return Err(format!("device class {:?} is not AxeOS", p.class));
         }
+        if change.timezone.is_some() {
+            return Err("AxeOS has no timezone setting".into());
+        }
         if change.temp_hot_c.is_some() || change.temp_danger_c.is_some() {
             return Err("AxeOS has no thermal threshold setting (overheat protection is fixed in firmware)".into());
         }
@@ -300,6 +370,13 @@ impl SettingsDriver for AxeOsSettings {
     }
     fn translate<'a>(&'a self, change: &'a Settings) -> BoxFuture<'a, Result<(Settings, Option<String>), String>> {
         Box::pin(async move {
+            if let Some(g) = &change.pools {
+                axeos_pools_ok(g)?;
+                if g.iter().flat_map(|g| g.pools.iter()).any(|p| p.password.value().is_some()) {
+                    let note = "pool password sent; AxeOS does not report passwords, so a rollback cannot restore the previous one".to_string();
+                    return Ok((change.clone(), Some(note)));
+                }
+            }
             if change.power_limit_w.is_none() && change.tuning_hashrate_ghs.is_none() && change.tuning_mode.is_none() {
                 return Ok((change.clone(), None));
             }
@@ -329,10 +406,13 @@ impl SettingsDriver for AxeOsSettings {
     }
     fn check_applied<'a>(&'a self, want: &'a Settings) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            if want.frequency_mhz.is_none() {
+            if want.frequency_mhz.is_none() && want.pools.is_none() {
                 return Ok(());
             }
             let info = self.info().await.map_err(|e| e.to_string())?;
+            if want.pools.is_some() && info.get("isUsingFallbackStratum").and_then(Value::as_bool) == Some(true) {
+                return Err("miner is on its fallback pool: the new primary pool is not reachable".into());
+            }
             frequency_applied(&info, want)
         })
     }

@@ -95,6 +95,10 @@ pub struct Confirmation {
     /// Explicit OK for a manual fan speed below [`LOW_FAN_PCT`].
     #[serde(default)]
     pub force_low_fan: bool,
+    /// Explicit OK for a live pool change (a wrong URL or worker sends the
+    /// hashrate elsewhere while the miner still looks healthy).
+    #[serde(default)]
+    pub allow_pool_change: bool,
 }
 
 /// Manual fan speeds below this need `force_low_fan` (overheat risk).

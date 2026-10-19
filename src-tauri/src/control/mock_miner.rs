@@ -153,6 +153,20 @@ struct State {
     light: bool,
     /// AxeOS identify ("Hi!") active until.
     identify_until: Option<Instant>,
+    /// AxeOS stratum settings (stored): [primary, fallback] as
+    /// (host, port, user, password). Running copy applies at boot.
+    stratum: [(String, u16, String, String); 2],
+    running_stratum: [(String, u16, String, String); 2],
+    /// Raw PATCH bodies received (to prove what was sent).
+    patches: Vec<String>,
+}
+
+/// Stratum every AxeOS mock starts on.
+pub fn mock_stratum() -> [(String, u16, String, String); 2] {
+    [
+        ("pool.example.com".into(), 3333, "acct.worker1".into(), "x".into()),
+        ("backup.example.com".into(), 3333, "acct.worker1".into(), "x".into()),
+    ]
 }
 
 impl State {
@@ -171,6 +185,7 @@ impl State {
                 self.paused = false; // stock sleep does not survive reboot
                 self.frequency = self.freq_cap.map_or(self.nvs_frequency, |c| self.nvs_frequency.min(c));
                 self.core_voltage = self.nvs_core_voltage;
+                self.running_stratum = self.stratum.clone();
                 let running = (self.frequency, self.core_voltage);
                 if self.degraded() == Some(Fault::Unreachable) && self.crashed_on != Some(running) {
                     // Crashes once more right after booting the bad config.
@@ -242,6 +257,14 @@ impl MockMiner {
     }
     pub fn set_ignore_writes(&self, v: bool) {
         self.state.lock().unwrap().ignore_writes = v;
+    }
+    /// Stored AxeOS stratum [primary, fallback] as (host, port, user, password).
+    pub fn stratum(&self) -> [(String, u16, String, String); 2] {
+        self.state.lock().unwrap().stratum.clone()
+    }
+    /// Raw PATCH bodies received.
+    pub fn patches(&self) -> Vec<String> {
+        self.state.lock().unwrap().patches.clone()
     }
     /// Set stored and running frequency (e.g. a unit held low after throttling).
     pub fn set_frequency(&self, f: u32) {
@@ -316,6 +339,9 @@ impl MockMiner {
             outage: false,
             light: false,
             identify_until: None,
+            stratum: mock_stratum(),
+            running_stratum: mock_stratum(),
+            patches: Vec::new(),
         }));
         let stop = CancellationToken::new();
         let l = TcpListener::bind("127.0.0.1:0").await?;
@@ -500,8 +526,14 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     } else {
                         format!(r#""fanspeed":{}"#, s.fanspeed)
                     };
+                    let [p, f] = &s.stratum;
+                    let fallback_in_use = s.running_stratum[0].0.contains("dead");
+                    let stratum = format!(
+                        r#","stratumURL":"{}","stratumPort":{},"stratumUser":"{}","fallbackStratumURL":"{}","fallbackStratumPort":{},"fallbackStratumUser":"{}","isUsingFallbackStratum":{}"#,
+                        p.0, p.1, p.2, f.0, f.1, f.2, fallback_in_use
+                    );
                     let body = format!(
-                        r#"{{"ASICModel":"BM1370","boardVersion":"601","version":"{ver}","axeOSVersion":"{ver}","macAddr":"{}","uptimeSeconds":{},"hashRate":{hr},"temp":{temp},"power":{power:.2},"frequency":{},"coreVoltage":{},{fan},"autofanspeed":{},"temptarget":{}{paused}}}"#,
+                        r#"{{"ASICModel":"BM1370","boardVersion":"601","version":"{ver}","axeOSVersion":"{ver}","macAddr":"{}","uptimeSeconds":{},"hashRate":{hr},"temp":{temp},"power":{power:.2},"frequency":{},"coreVoltage":{},{fan},"autofanspeed":{},"temptarget":{}{paused}{stratum}}}"#,
                         s.mac,
                         s.uptime(),
                         s.nvs_frequency,
@@ -515,7 +547,23 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     let Ok(v) = serde_json::from_str::<serde_json::Value>(&req.body) else {
                         return http("400 Bad Request", "", "{}");
                     };
+                    s.patches.push(req.body.clone());
                     if !s.ignore_writes {
+                        let txt = |k: &str| v.get(k).and_then(|x| x.as_str()).map(String::from);
+                        for (i, pre) in ["stratum", "fallbackStratum"].iter().enumerate() {
+                            if let Some(u) = txt(&format!("{pre}URL")) {
+                                s.stratum[i].0 = u;
+                            }
+                            if let Some(p) = v.get(format!("{pre}Port")).and_then(|x| x.as_u64()) {
+                                s.stratum[i].1 = p as u16;
+                            }
+                            if let Some(u) = txt(&format!("{pre}User")) {
+                                s.stratum[i].2 = u;
+                            }
+                            if let Some(pw) = txt(&format!("{pre}Password")) {
+                                s.stratum[i].3 = pw;
+                            }
+                        }
                         let num = |k: &str| v.get(k).and_then(|x| x.as_u64()).map(|x| x as u32);
                         // 2.10: stored only, applied by the next restart.
                         // 2.15: applied live as well.

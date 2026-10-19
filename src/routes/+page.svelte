@@ -36,6 +36,7 @@
   import { statusChipSpec } from "$lib/control/statusChip";
   import { refreshUntilSettled, type RefreshTarget } from "$lib/control/postActionRefresh";
   import PowerTuningButton from "$lib/control/PowerTuningButton.svelte";
+  import PoolsButton from "$lib/control/PoolsButton.svelte";
   import TuningTargetButton from "$lib/control/TuningTargetButton.svelte";
   import { formatEfficiency, formatGridValue } from "$lib/format";
   import { formatHashRateDelta, formatMetricDelta } from "$lib/deltaFormat";
@@ -3006,6 +3007,7 @@
       <TuneButton {selectedIps} />
       <ControlToolbar {selectedIps} onrequest={requestAction} />
       <PowerTuningButton {selectedIps} />
+      <PoolsButton {selectedIps} />
       <TuningTargetButton {selectedIps} />
     </div>
     <div class="relative min-h-0 w-full flex-1">

@@ -95,7 +95,7 @@ pub(super) async fn rig(allow_unconfirmed: bool, with_bitaxe: bool) -> Rig {
     Rig { miners, resolver, audit, engine, axe }
 }
 
-fn batch(canary: Option<usize>) -> BatchOptions {
+pub(super) fn batch(canary: Option<usize>) -> BatchOptions {
     BatchOptions { concurrency: 4, stagger: Duration::from_millis(10), canary_size: canary, resolve_timeout: Duration::from_secs(2), ..Default::default() }
 }
 

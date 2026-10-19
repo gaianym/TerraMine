@@ -28,6 +28,13 @@ export type SettingsSupportRow = {
   temp_target_c?: [number, number] | null;
   fan?: FieldSupport;
   fan_auto?: FieldSupport;
+  /** Pools / timezone (plan PR F). */
+  pools?: FieldSupport;
+  pools_max?: number | null;
+  current_pools?: PoolGroup[] | null;
+  timezone?: FieldSupport;
+  timezone_allowed?: boolean;
+  current_timezone?: string | null;
   /** Tuning targets (plan PR D). */
   tuning_modes?: TuningMode[];
   tuning_hashrate_ghs?: Range | null;
@@ -39,6 +46,13 @@ export type SettingsSupportRow = {
   scaling?: FieldSupport;
   presets?: string[];
 };
+
+export type PoolSpec = { url: string; user: string; password?: string | null };
+export type PoolGroup = { name: string; quota: number; pools: PoolSpec[] };
+export type PoolOp =
+  | { op: "set"; groups: PoolGroup[] }
+  | { op: "add"; pool: PoolSpec }
+  | { op: "replace"; index: number; pool: PoolSpec };
 
 export type TuningMode = "low" | "normal" | "high";
 
@@ -53,6 +67,7 @@ export type SettingsJobRequest = {
   ips: string[];
   change: Settings;
   dry_run: boolean;
+  confirm?: { allow_pool_change?: boolean };
   concurrency: number;
   stagger_ms: number;
   canary_size?: number;

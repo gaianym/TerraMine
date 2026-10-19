@@ -17,6 +17,14 @@
 //! Temperature thresholds: `get_temperature_config` is read only
 //! (`supports_temperature_config()`: VNish 1.2 / 1.3); no 0.8.6 firmware
 //! implements `set_temperature_config`, so threshold writes are refused.
+//! Pools (plan PR F): `set_pools_config` / `get_pools_config`
+//! (`supports_pools_config()`), read back by URL and worker; after the
+//! write the runtime pool status (`get_pools`) must show one of the new
+//! pools alive. A password the firmware does not report is restored as
+//! `x` on rollback (the asic-rs default).
+//! Timezone: `set_timezone_config` / `get_timezone_config`
+//! (`supports_timezone_config()`: Braiins 25.03+, ePIC, VNish); the zone
+//! must be one the miner lists as available.
 //! Tuning targets (plan PR D): `set_tuning_config` / `get_tuning_config`
 //! (`supports_tuning_config()`). That flag is coarse, so the target kinds
 //! each 0.8.6 backend's `set_tuning_config` actually accepts are in
@@ -31,10 +39,13 @@
 //! (`supports_scaling_config()`, ePIC only): step and minimum.
 
 use asic_rs_core::config::fan::FanConfig;
+use asic_rs_core::config::pools::{PoolConfig, PoolGroupConfig};
 use asic_rs_core::config::scaling::ScalingConfig;
+use asic_rs_core::config::timezone::TimezoneConfig;
 use asic_rs_core::config::tuning::TuningConfig;
 use asic_rs_core::data::hashrate::HashRate;
 use asic_rs_core::data::miner::MiningMode;
+use asic_rs_core::data::pool::{PoolGroupData, PoolURL};
 use asic_rs_core::config::temperature::TemperatureConfig;
 use asic_rs_core::data::hashrate::HashRateUnit;
 use asic_rs_core::data::miner::{MinerData, TuningTarget};
@@ -43,6 +54,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use measurements::Power;
 
+use super::pools::{normalize_url, parse_timezone, PoolGroupSpec, PoolSpec, Secret};
 use super::profile::{DeviceClass, DeviceProfile};
 use super::settings::{HealthSample, Settings, SettingsDriver, TuningMode};
 use crate::control::driver::SharedMiner;
@@ -66,6 +78,10 @@ pub fn health_from_miner_data(d: &MinerData) -> HealthSample {
 /// asic-rs support flags for the settings it can write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NativeSettingsFlags {
+    /// `supports_pools_config()`.
+    pub pools: bool,
+    /// `supports_timezone_config()`.
+    pub timezone: bool,
     pub power_limit: bool,
     pub tuning_percent: bool,
     pub fan: bool,
@@ -218,6 +234,16 @@ pub fn asic_accepts(change: &Settings, f: NativeSettingsFlags) -> Result<(), Str
 /// [`asic_accepts`] plus the tuning target kinds of the device.
 pub fn asic_accepts_with(change: &Settings, f: NativeSettingsFlags, k: TargetKinds) -> Result<(), String> {
     let mut why = Vec::new();
+    if change.touches_pools() && !f.pools {
+        why.push("asic-rs: pools not supported on this firmware (supports_pools_config() = false)".to_string());
+    }
+    if let Some(tz) = &change.timezone {
+        if !f.timezone {
+            why.push("asic-rs: timezone not supported on this firmware (supports_timezone_config() = false)".into());
+        } else if let Err(e) = parse_timezone(tz) {
+            why.push(e);
+        }
+    }
     if change.frequency_mhz.is_some() || change.core_voltage_mv.is_some() {
         why.push("asic-rs has no manual frequency/voltage target".to_string());
     }
@@ -294,11 +320,81 @@ pub fn settings_from_configs(power_target: Option<&TuningTarget>, fan: Option<&F
     }
 }
 
+pub fn pools_from_config(groups: &[PoolGroupConfig]) -> Vec<PoolGroupSpec> {
+    groups
+        .iter()
+        .map(|g| PoolGroupSpec {
+            name: g.name.clone(),
+            quota: g.quota,
+            pools: g
+                .pools
+                .iter()
+                .map(|p| PoolSpec { url: p.url.to_string(), user: p.username.clone(), password: Secret::Value(p.password.clone()) })
+                .collect(),
+        })
+        .collect()
+}
+
+pub fn pools_to_config(groups: &[PoolGroupSpec]) -> Vec<PoolGroupConfig> {
+    groups
+        .iter()
+        .map(|g| PoolGroupConfig {
+            name: if g.name.is_empty() { "default".into() } else { g.name.clone() },
+            quota: g.quota.max(1),
+            pools: g
+                .pools
+                .iter()
+                .map(|p| PoolConfig {
+                    url: PoolURL::from(p.url.trim().to_string()),
+                    username: p.user.trim().to_string(),
+                    password: p.password.value().unwrap_or("x").to_string(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// After a pool write: one of the wanted pools must be reported alive (or
+/// active). Firmware that reports no status for them passes.
+pub fn pools_alive(status: &[PoolGroupData], want: &[PoolGroupSpec]) -> Result<(), String> {
+    let wanted: Vec<String> = super::pools::flatten(want).into_iter().map(|(u, _)| u).collect();
+    let seen: Vec<(String, Option<bool>, Option<bool>)> = status
+        .iter()
+        .flat_map(|g| g.pools.iter())
+        .filter_map(|p| Some((normalize_url(&p.url.as_ref()?.to_string()), p.alive, p.active)))
+        .filter(|(u, _, _)| wanted.contains(u))
+        .collect();
+    if seen.is_empty() || seen.iter().all(|(_, a, b)| a.is_none() && b.is_none()) {
+        return Ok(());
+    }
+    if seen.iter().any(|(_, a, b)| *a == Some(true) || *b == Some(true)) {
+        Ok(())
+    } else {
+        Err(format!("none of the new pools is alive yet ({})", wanted.join(", ")))
+    }
+}
+
 /// The asic-rs calls the settings backend makes. One implementation wraps
 /// a real asic-rs miner; mock tests provide per-firmware stand-ins (asic-rs
 /// hardcodes real ports, so it cannot reach a local mock).
 pub trait NativeTuning: Send + Sync {
     fn flags(&self) -> NativeSettingsFlags;
+    fn pools_config(&self) -> BoxFuture<'_, Option<Vec<PoolGroupConfig>>> {
+        Box::pin(async { None })
+    }
+    fn set_pools_config(&self, _c: Vec<PoolGroupConfig>) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async { anyhow::bail!("Setting pools is not supported on this platform") })
+    }
+    /// Runtime pool status (`get_pools`).
+    fn pool_status(&self) -> BoxFuture<'_, Vec<PoolGroupData>> {
+        Box::pin(async { Vec::new() })
+    }
+    fn timezone_config(&self) -> BoxFuture<'_, Option<TimezoneConfig>> {
+        Box::pin(async { None })
+    }
+    fn set_timezone_config(&self, _c: TimezoneConfig) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async { anyhow::bail!("Setting timezone config is not supported on this platform") })
+    }
     /// Power limit currently in force (W), when the firmware reports one.
     fn power_target(&self) -> BoxFuture<'_, Option<u32>>;
     fn set_power_limit(&self, watts: u32) -> BoxFuture<'_, anyhow::Result<bool>>;
@@ -335,6 +431,8 @@ pub struct AsicRsMiner(pub SharedMiner);
 impl NativeTuning for AsicRsMiner {
     fn flags(&self) -> NativeSettingsFlags {
         NativeSettingsFlags {
+            pools: self.0.supports_pools_config(),
+            timezone: self.0.supports_timezone_config(),
             power_limit: self.0.supports_set_power_limit(),
             tuning_percent: self.0.supports_set_tuning_percent(),
             fan: self.0.supports_fan_config(),
@@ -363,6 +461,21 @@ impl NativeTuning for AsicRsMiner {
     }
     fn temperature_config(&self) -> BoxFuture<'_, Option<TemperatureConfig>> {
         Box::pin(async move { self.0.get_temperature_config().await.ok() })
+    }
+    fn pools_config(&self) -> BoxFuture<'_, Option<Vec<PoolGroupConfig>>> {
+        Box::pin(async move { self.0.get_pools_config().await.ok() })
+    }
+    fn set_pools_config(&self, c: Vec<PoolGroupConfig>) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move { self.0.set_pools_config(c).await })
+    }
+    fn pool_status(&self) -> BoxFuture<'_, Vec<PoolGroupData>> {
+        Box::pin(async move { self.0.get_pools().await })
+    }
+    fn timezone_config(&self) -> BoxFuture<'_, Option<TimezoneConfig>> {
+        Box::pin(async move { self.0.get_timezone_config().await.ok() })
+    }
+    fn set_timezone_config(&self, c: TimezoneConfig) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move { self.0.set_timezone_config(c).await })
     }
     fn power_target(&self) -> BoxFuture<'_, Option<u32>> {
         Box::pin(async move { settings_from_configs(self.0.get_tuning_target().await.as_ref(), None).power_limit_w })
@@ -435,10 +548,19 @@ impl SettingsDriver for AsicRsSettings {
     fn presets(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async move { if self.native.flags().presets { self.native.presets().await } else { Vec::new() } })
     }
-    /// Fill the ePIC default algorithm for a hashrate target, and check a
-    /// preset against the miner's own list.
+    /// Fill the ePIC default algorithm for a hashrate target, check a
+    /// preset against the miner's own list, and a timezone against the
+    /// zones the miner lists (when it lists any).
     fn translate<'a>(&'a self, change: &'a Settings) -> BoxFuture<'a, Result<(Settings, Option<String>), String>> {
         Box::pin(async move {
+            if let Some(tz) = &change.timezone {
+                let want = parse_timezone(tz)?;
+                if let Some(c) = self.native.timezone_config().await {
+                    if !c.available.is_empty() && !c.available.contains(&want) {
+                        return Err(format!("timezone {tz} is not one this miner accepts"));
+                    }
+                }
+            }
             let mut out = change.clone();
             let mut note = None;
             if change.tuning_hashrate_ghs.is_some() && self.kinds.needs_algorithm && change.tuning_algorithm.is_none() {
@@ -455,6 +577,14 @@ impl SettingsDriver for AsicRsSettings {
             Ok((out, note))
         })
     }
+    fn check_applied<'a>(&'a self, want: &'a Settings) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            match &want.pools {
+                Some(g) => pools_alive(&self.native.pool_status().await, g),
+                None => Ok(()),
+            }
+        })
+    }
     fn read(&self) -> BoxFuture<'_, anyhow::Result<Settings>> {
         Box::pin(async move {
             let f = self.native.flags();
@@ -463,6 +593,12 @@ impl SettingsDriver for AsicRsSettings {
                 *self.idle_speed.lock().unwrap() = Some(*i);
             }
             let mut s = settings_from_configs(None, fan.as_ref());
+            if f.pools {
+                s.pools = self.native.pools_config().await.map(|g| pools_from_config(&g));
+            }
+            if f.timezone {
+                s.timezone = self.native.timezone_config().await.and_then(|t| t.timezone).map(|t| t.name().to_string());
+            }
             if f.power_limit {
                 s.power_limit_w = self.native.power_target().await;
             }
@@ -501,6 +637,14 @@ impl SettingsDriver for AsicRsSettings {
     fn write(&self, s: &Settings) -> BoxFuture<'_, anyhow::Result<()>> {
         let s = s.clone();
         Box::pin(async move {
+            if let Some(g) = &s.pools {
+                anyhow::ensure!(self.native.set_pools_config(pools_to_config(g)).await?, "miner refused pool config");
+            }
+            if let Some(tz) = &s.timezone {
+                let tz = parse_timezone(tz).map_err(|e| anyhow::anyhow!(e))?;
+                let c = TimezoneConfig { timezone: Some(tz), available: Vec::new() };
+                anyhow::ensure!(self.native.set_timezone_config(c).await?, "miner refused timezone");
+            }
             if s.touches_scaling() {
                 let (Some(step), Some(min)) = (s.scaling_step, s.scaling_min) else {
                     anyhow::bail!("scaling needs both step and minimum");

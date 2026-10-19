@@ -17,6 +17,9 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 
 use asic_rs_core::config::fan::FanConfig;
+use asic_rs_core::config::pools::{PoolConfig, PoolGroupConfig};
+use asic_rs_core::config::timezone::{TimezoneConfig, Tz};
+use asic_rs_core::data::pool::{PoolData, PoolGroupData, PoolURL};
 use asic_rs_core::config::scaling::ScalingConfig;
 use asic_rs_core::config::tuning::TuningConfig;
 use asic_rs_core::data::hashrate::HashRateUnit;
@@ -75,6 +78,8 @@ impl NativeFirmware {
         let power_limit = !matches!(self, Self::AntminerStock | Self::EpicV1 | Self::BitaxeV214);
         let fan = matches!(self, Self::AntminerStock | Self::EpicV1 | Self::ProtoV1);
         NativeSettingsFlags {
+            pools: !matches!(self, Self::AvalonA | Self::BitaxeV214),
+            timezone: matches!(self, Self::Braiins2507 | Self::Vnish13 | Self::EpicV1),
             power_limit,
             tuning_percent: self == Self::Vnish13,
             fan,
@@ -145,6 +150,20 @@ pub struct NativeState {
     pub scaling: (u32, u32),
     /// Hashrate drops to 0 in this mining mode (unhealthy-mode tests).
     pub unhealthy_mode: Option<MiningMode>,
+    /// Pool config (password as stored).
+    pub pools: Vec<PoolGroupConfig>,
+    pub timezone: Tz,
+}
+
+/// The pool every mock starts on.
+pub const MOCK_POOL: &str = "stratum+tcp://pool.example.com:3333";
+pub const MOCK_WORKER: &str = "acct.worker1";
+
+/// A pool URL whose host contains this never comes alive.
+pub const DEAD_POOL_HOST: &str = "dead";
+
+fn pool(url: &str, user: &str, pass: &str) -> PoolConfig {
+    PoolConfig { url: PoolURL::from(url.to_string()), username: user.into(), password: pass.into() }
 }
 
 /// One mocked asic-rs miner.
@@ -165,6 +184,8 @@ impl MockNative {
                 ignore_writes: false,
                 fan: fw.initial_fan(),
                 overheat_below_fan: None,
+                pools: vec![PoolGroupConfig { name: "default".into(), quota: 1, pools: vec![pool(MOCK_POOL, MOCK_WORKER, "x")] }],
+                timezone: Tz::UTC,
                 target: fw.initial_target(),
                 presets: if fw == NativeFirmware::Vnish13 { vec!["2500".into(), "3000".into(), "3250".into()] } else { Vec::new() },
                 scaling: (5, 50),
@@ -187,6 +208,18 @@ impl MockNative {
     }
     pub fn set_ignore_writes(&self, v: bool) {
         self.state.lock().unwrap().ignore_writes = v;
+    }
+    /// (url, worker) of every configured pool.
+    pub fn pool_list(&self) -> Vec<(String, String)> {
+        let s = self.state.lock().unwrap();
+        s.pools.iter().flat_map(|g| g.pools.iter()).map(|p| (p.url.to_string(), p.username.clone())).collect()
+    }
+    pub fn pool_passwords(&self) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        s.pools.iter().flat_map(|g| g.pools.iter()).map(|p| p.password.clone()).collect()
+    }
+    pub fn timezone(&self) -> Tz {
+        self.state.lock().unwrap().timezone
     }
     pub fn fan(&self) -> FanConfig {
         self.state.lock().unwrap().fan.clone()
@@ -236,6 +269,70 @@ struct Seam(Arc<MockNative>);
 impl NativeTuning for Seam {
     fn flags(&self) -> NativeSettingsFlags {
         self.0.fw.flags()
+    }
+    fn pools_config(&self) -> BoxFuture<'_, Option<Vec<PoolGroupConfig>>> {
+        Box::pin(async move { self.flags().pools.then(|| self.0.state.lock().unwrap().pools.clone()) })
+    }
+    fn set_pools_config(&self, c: Vec<PoolGroupConfig>) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move {
+            anyhow::ensure!(self.flags().pools, "Setting pools is not supported on this platform");
+            let mut s = self.0.state.lock().unwrap();
+            let list: Vec<String> = c.iter().flat_map(|g| g.pools.iter()).map(|p| format!("{} {}", p.url, p.username)).collect();
+            s.calls.push(format!("set_pools_config [{}]", list.join(", ")));
+            if !s.ignore_writes {
+                s.pools = c;
+            }
+            Ok(true)
+        })
+    }
+    /// Runtime status: every configured pool alive unless its host
+    /// contains [`DEAD_POOL_HOST`].
+    fn pool_status(&self) -> BoxFuture<'_, Vec<PoolGroupData>> {
+        Box::pin(async move {
+            let s = self.0.state.lock().unwrap();
+            s.pools
+                .iter()
+                .map(|g| PoolGroupData {
+                    name: g.name.clone(),
+                    quota: g.quota,
+                    pools: g
+                        .pools
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| PoolData {
+                            position: Some(i as u16),
+                            url: Some(p.url.clone()),
+                            accepted_shares: None,
+                            rejected_shares: None,
+                            last_share_time: None,
+                            active: Some(i == 0 && !p.url.host.contains(DEAD_POOL_HOST)),
+                            alive: Some(!p.url.host.contains(DEAD_POOL_HOST)),
+                            user: Some(p.username.clone()),
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
+    }
+    fn timezone_config(&self) -> BoxFuture<'_, Option<TimezoneConfig>> {
+        Box::pin(async move {
+            self.flags().timezone.then(|| TimezoneConfig {
+                timezone: Some(self.0.timezone()),
+                available: vec![Tz::UTC, Tz::America__Chicago, Tz::Europe__Vienna],
+            })
+        })
+    }
+    fn set_timezone_config(&self, c: TimezoneConfig) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move {
+            anyhow::ensure!(self.flags().timezone, "Setting timezone config is not supported on this platform");
+            let mut s = self.0.state.lock().unwrap();
+            let tz = c.timezone.ok_or_else(|| anyhow::anyhow!("no timezone"))?;
+            s.calls.push(format!("set_timezone_config {}", tz.name()));
+            if !s.ignore_writes {
+                s.timezone = tz;
+            }
+            Ok(true)
+        })
     }
     fn power_target(&self) -> BoxFuture<'_, Option<u32>> {
         Box::pin(async move { self.flags().power_limit.then(|| self.0.power()) })
