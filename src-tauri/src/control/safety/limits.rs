@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::profile::{DeviceClass, DeviceProfile};
-use super::settings::Settings;
+use super::settings::{Settings, TuningMode};
 
 const BUILTIN: &str = include_str!("limits.json");
 
@@ -30,6 +30,21 @@ pub struct LimitEntry {
     /// asic-rs tuning percent (100 = unthrottled).
     #[serde(default)]
     pub tuning_pct: Option<Range>,
+    /// Hashrate target (GH/s).
+    #[serde(default)]
+    pub tuning_hashrate_ghs: Option<Range>,
+    /// Mining modes allowed as a tuning target (absent = none).
+    #[serde(default)]
+    pub tuning_modes: Option<Vec<TuningMode>>,
+    /// Presets may be selected (each must be one the miner lists; a
+    /// numeric preset name is a wattage and must sit in `power_w`).
+    #[serde(default)]
+    pub presets: bool,
+    /// Scaling step and minimum (firmware units, ePIC: percent).
+    #[serde(default)]
+    pub scaling_step: Option<Range>,
+    #[serde(default)]
+    pub scaling_min: Option<Range>,
     pub max_temp_c: f64,
 }
 
@@ -56,6 +71,9 @@ impl LimitsTable {
                 ("fan_pct", e.fan_pct),
                 ("temp_target_c", e.temp_target_c),
                 ("tuning_pct", e.tuning_pct),
+                ("tuning_hashrate_ghs", e.tuning_hashrate_ghs),
+                ("scaling_step", e.scaling_step),
+                ("scaling_min", e.scaling_min),
             ] {
                 if let Some([lo, hi]) = r {
                     if lo > hi {
@@ -103,6 +121,25 @@ impl LimitsTable {
         field("fan_pct", change.fan_pct, e.fan_pct);
         field("temp_target_c", change.temp_target_c, e.temp_target_c);
         field("tuning_pct", change.tuning_pct, e.tuning_pct);
+        field("tuning_hashrate_ghs", change.tuning_hashrate_ghs, e.tuning_hashrate_ghs);
+        field("scaling_step", change.scaling_step, e.scaling_step);
+        field("scaling_min", change.scaling_min, e.scaling_min);
+        if let Some(m) = change.tuning_mode {
+            if !e.tuning_modes.as_ref().is_some_and(|l| l.contains(&m)) {
+                errs.push(format!("tuning_mode {} is not allowed on {}", m.as_str(), e.model));
+            }
+        }
+        if let Some(p) = &change.tuning_preset {
+            if !e.presets {
+                errs.push(format!("tuning_preset is not writable on {}", e.model));
+            } else if let Ok(w) = p.trim().parse::<u32>() {
+                match e.power_w {
+                    Some([lo, hi]) if w >= lo && w <= hi => {}
+                    Some([lo, hi]) => errs.push(format!("preset {p} ({w} W) outside power_w {lo}..={hi} for {}", e.model)),
+                    None => errs.push(format!("preset {p} is a wattage but {} has no power_w range", e.model)),
+                }
+            }
+        }
         // Fan mode needs the device's fan range; thresholds have no range (read only).
         if change.auto_fan.is_some() && e.fan_pct.is_none() {
             errs.push(format!("auto_fan is not writable on {}", e.model));

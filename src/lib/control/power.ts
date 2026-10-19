@@ -28,7 +28,19 @@ export type SettingsSupportRow = {
   temp_target_c?: [number, number] | null;
   fan?: FieldSupport;
   fan_auto?: FieldSupport;
+  /** Tuning targets (plan PR D). */
+  tuning_modes?: TuningMode[];
+  tuning_hashrate_ghs?: Range | null;
+  scaling_step?: Range | null;
+  scaling_min?: Range | null;
+  mode?: FieldSupport;
+  hashrate?: FieldSupport;
+  preset?: FieldSupport;
+  scaling?: FieldSupport;
+  presets?: string[];
 };
+
+export type TuningMode = "low" | "normal" | "high";
 
 export type WriteOutcome = {
   ip: string;

@@ -15,6 +15,12 @@
 //! - Power: AxeOS has no power limit. A `power_limit_w` request is mapped
 //!   to a frequency stand-in estimated from the reported power draw.
 //!
+//! - Tuning targets (plan PR D) reuse the same frequency stand-in:
+//!   a hashrate target scales frequency by target / reported `hashRate`;
+//!   mode Normal is the chip's ESP-Miner default frequency and Low 10%
+//!   under it. High (overclock), presets and scaling have no AxeOS
+//!   equivalent and are refused with the reason.
+//!
 //! Hardware-confirmed on AxeOS 2.15.x (Bitaxe Gamma, v2.15.3, Oct 17 2026,
 //! `tests/hw_axeos_settings.rs`) for frequency and the fan settings (manual
 //! %, auto fan, target temperature) only. Core voltage and the power
@@ -26,7 +32,7 @@ use semver::Version;
 use serde_json::{json, Value};
 
 use super::profile::{DeviceClass, DeviceProfile};
-use super::settings::{HealthSample, Settings, SettingsDriver};
+use super::settings::{HealthSample, Settings, SettingsDriver, TuningMode};
 
 /// Frequency stand-ins are rounded down to this step.
 pub const FREQ_STEP_MHZ: u32 = 5;
@@ -47,7 +53,65 @@ pub fn confirmed_fields(change: &Settings) -> bool {
         && change.tuning_pct.is_none()
         && change.temp_hot_c.is_none()
         && change.temp_danger_c.is_none()
+        && !change.touches_target_or_scaling()
         && (change.frequency_mhz.is_some() || change.touches_fan())
+}
+
+/// ESP-Miner default frequency (MHz) per ASIC: the "Normal" mode stand-in.
+pub const STOCK_FREQUENCY_MHZ: [(&str, u32); 4] = [("BM1370", 525), ("BM1368", 490), ("BM1366", 485), ("BM1397", 425)];
+
+/// "Low" mode stand-in: this fraction of the stock frequency.
+pub const LOW_MODE_FRACTION: f64 = 0.9;
+
+pub fn stock_frequency(chip: &str) -> Option<u32> {
+    STOCK_FREQUENCY_MHZ.iter().find(|(c, _)| c.eq_ignore_ascii_case(chip.trim())).map(|x| x.1)
+}
+
+fn floor_step(f: f64) -> u32 {
+    ((f / f64::from(FREQ_STEP_MHZ)).floor() as u32) * FREQ_STEP_MHZ
+}
+
+/// Map a hashrate target (GH/s) to a frequency: hashrate scales linearly
+/// with frequency. Same estimate shape as [`power_stand_in`].
+pub fn hashrate_stand_in(change: &Settings, info: &Value) -> Result<(Settings, String), String> {
+    let Some(h) = change.tuning_hashrate_ghs else {
+        return Ok((change.clone(), String::new()));
+    };
+    let cur_h = info.get("hashRate").and_then(Value::as_f64).filter(|h| *h > 1.0);
+    let cur_f = info.get("frequency").and_then(Value::as_f64).filter(|f| *f > 0.0);
+    let (Some(cur_h), Some(cur_f)) = (cur_h, cur_f) else {
+        return Err("AxeOS has no hashrate target, and hashrate / frequency are not reported (miner paused?), so no frequency stand-in can be estimated".into());
+    };
+    let f = floor_step(cur_f * f64::from(h) / cur_h);
+    let mut out = change.clone();
+    out.tuning_hashrate_ghs = None;
+    out.frequency_mhz = Some(f);
+    let note = format!(
+        "tuning_hashrate_ghs {h} GH/s: AxeOS has no hashrate target; stand-in frequency {cur_f:.0} → {f} MHz (estimated from {cur_h:.0} GH/s at {cur_f:.0} MHz, core voltage unchanged)"
+    );
+    Ok((out, note))
+}
+
+/// Map a mining mode to a frequency: Normal = the chip's ESP-Miner
+/// default, Low = [`LOW_MODE_FRACTION`] of it. High is refused.
+pub fn mode_stand_in(change: &Settings, info: &Value) -> Result<(Settings, String), String> {
+    let Some(m) = change.tuning_mode else {
+        return Ok((change.clone(), String::new()));
+    };
+    let chip = info.get("ASICModel").and_then(Value::as_str).unwrap_or("");
+    let Some(stock) = stock_frequency(chip) else {
+        return Err(format!("AxeOS has no mining modes, and no stock frequency is known for ASIC {chip:?}, so no frequency stand-in"));
+    };
+    let f = match m {
+        TuningMode::Normal => stock,
+        TuningMode::Low => floor_step(f64::from(stock) * LOW_MODE_FRACTION),
+        TuningMode::High => return Err("AxeOS has no High mode; an overclock needs an explicit frequency and allow_frequency_raise".into()),
+    };
+    let mut out = change.clone();
+    out.tuning_mode = None;
+    out.frequency_mhz = Some(f);
+    let note = format!("tuning_mode {}: AxeOS has no mining modes; stand-in frequency {f} MHz ({chip} stock {stock} MHz, core voltage unchanged)", m.as_str());
+    Ok((out, note))
 }
 
 pub struct AxeOsSettings {
@@ -145,8 +209,7 @@ pub fn power_stand_in(change: &Settings, info: &Value) -> Result<(Settings, Stri
     let (Some(cur_w), Some(cur_f)) = (cur_w, cur_f) else {
         return Err("AxeOS has no power limit, and power draw / frequency are not reported (miner paused?), so no frequency stand-in can be estimated".into());
     };
-    let est = cur_f * f64::from(w) / cur_w;
-    let f = ((est / f64::from(FREQ_STEP_MHZ)).floor() as u32) * FREQ_STEP_MHZ;
+    let f = floor_step(cur_f * f64::from(w) / cur_w);
     let mut out = change.clone();
     out.power_limit_w = None;
     out.frequency_mhz = Some(f);
@@ -204,6 +267,23 @@ impl SettingsDriver for AxeOsSettings {
         if change.power_limit_w.is_some() && change.frequency_mhz.is_some() {
             return Err("power_limit_w is mapped to a frequency on AxeOS; send either power_limit_w or frequency_mhz".into());
         }
+        if change.tuning_preset.is_some() {
+            return Err("AxeOS has no tuning presets".into());
+        }
+        if change.touches_scaling() {
+            return Err("AxeOS has no scaling (throttle step / minimum) setting".into());
+        }
+        if change.tuning_algorithm.is_some() {
+            return Err("AxeOS has no tuning algorithm setting".into());
+        }
+        if change.tuning_mode == Some(TuningMode::High) {
+            return Err("AxeOS has no High mode; an overclock needs an explicit frequency and allow_frequency_raise".into());
+        }
+        if (change.tuning_mode.is_some() || change.tuning_hashrate_ghs.is_some())
+            && (change.frequency_mhz.is_some() || change.target_kinds() > 1)
+        {
+            return Err("a tuning target is mapped to a frequency on AxeOS; send one of power, hashrate, mode or frequency".into());
+        }
         Ok(())
     }
     fn read(&self) -> BoxFuture<'_, anyhow::Result<Settings>> {
@@ -220,11 +300,18 @@ impl SettingsDriver for AxeOsSettings {
     }
     fn translate<'a>(&'a self, change: &'a Settings) -> BoxFuture<'a, Result<(Settings, Option<String>), String>> {
         Box::pin(async move {
-            if change.power_limit_w.is_none() {
+            if change.power_limit_w.is_none() && change.tuning_hashrate_ghs.is_none() && change.tuning_mode.is_none() {
                 return Ok((change.clone(), None));
             }
-            let info = self.info().await.map_err(|e| format!("cannot read power draw for the AxeOS power stand-in: {e}"))?;
-            power_stand_in(change, &info).map(|(s, n)| (s, Some(n)))
+            let info = self.info().await.map_err(|e| format!("cannot read system info for the AxeOS frequency stand-in: {e}"))?;
+            let (s, n) = if change.power_limit_w.is_some() {
+                power_stand_in(change, &info)?
+            } else if change.tuning_hashrate_ghs.is_some() {
+                hashrate_stand_in(change, &info)?
+            } else {
+                mode_stand_in(change, &info)?
+            };
+            Ok((s, Some(n)))
         })
     }
     fn restart_to_apply(&self, change: &Settings) -> Option<BoxFuture<'_, anyhow::Result<()>>> {
