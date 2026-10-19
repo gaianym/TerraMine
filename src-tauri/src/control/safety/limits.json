@@ -1,20 +1,32 @@
 {
   "version": 1,
-  "note": "PLACEHOLDER values, conservative, pending owner sign-off. Non-AxeOS power_w / tuning_pct / fan_pct / temp_target_c ranges are mock-tested only (no such hardware in the fleet). A write to a field that has no range for the device is refused (fail closed). Ranges are inclusive. AxeOS temp_target_c stays inside the firmware range (35-66). max_temp_c is the health-watch ceiling after a change.",
+  "note": "PLACEHOLDER values, conservative, pending owner sign-off. Non-AxeOS power_w / tuning_pct / fan_pct / temp_target_c ranges are mock-tested only (no such hardware in the fleet). A write to a field that has no range for the device is refused (fail closed). Ranges are inclusive. AxeOS temp_target_c stays inside the firmware range (35-66). max_temp_c is the health-watch ceiling after a change. Tuning targets (PR D): High mining mode is left out everywhere (overclock; needs owner sign-off); presets must be listed by the miner and a wattage preset must sit in power_w; scaling ranges are ePIC percent units.",
   "entries": [
-    { "class": "axe_os", "model": "BM1370", "frequency_mhz": [400, 625], "core_voltage_mv": [1000, 1250], "power_w": [0, 40], "fan_pct": [20, 100], "temp_target_c": [45, 65], "max_temp_c": 70 },
-    { "class": "axe_os", "model": "BM1368", "frequency_mhz": [400, 575], "core_voltage_mv": [1100, 1300], "power_w": [0, 30], "fan_pct": [20, 100], "temp_target_c": [45, 65], "max_temp_c": 70 },
-    { "class": "axe_os", "model": "BM1366", "frequency_mhz": [400, 575], "core_voltage_mv": [1100, 1300], "power_w": [0, 25], "fan_pct": [20, 100], "temp_target_c": [45, 65], "max_temp_c": 70 },
-    { "class": "axe_os", "model": "BM1397", "frequency_mhz": [400, 500], "core_voltage_mv": [1300, 1500], "power_w": [0, 20], "fan_pct": [20, 100], "temp_target_c": [45, 65], "max_temp_c": 70 },
+    { "class": "axe_os", "model": "BM1370", "frequency_mhz": [400, 625], "core_voltage_mv": [1000, 1250], "power_w": [0, 40], "fan_pct": [20, 100], "temp_target_c": [45, 65], "tuning_hashrate_ghs": [300, 1400], "tuning_modes": ["low", "normal"], "max_temp_c": 70 },
+    { "class": "axe_os", "model": "BM1368", "frequency_mhz": [400, 575], "core_voltage_mv": [1100, 1300], "power_w": [0, 30], "fan_pct": [20, 100], "temp_target_c": [45, 65], "tuning_hashrate_ghs": [200, 800], "tuning_modes": ["low", "normal"], "max_temp_c": 70 },
+    { "class": "axe_os", "model": "BM1366", "frequency_mhz": [400, 575], "core_voltage_mv": [1100, 1300], "power_w": [0, 25], "fan_pct": [20, 100], "temp_target_c": [45, 65], "tuning_hashrate_ghs": [150, 650], "tuning_modes": ["low", "normal"], "max_temp_c": 70 },
+    { "class": "axe_os", "model": "BM1397", "frequency_mhz": [400, 500], "core_voltage_mv": [1300, 1500], "power_w": [0, 20], "fan_pct": [20, 100], "temp_target_c": [45, 65], "tuning_hashrate_ghs": [100, 500], "tuning_modes": ["low", "normal"], "max_temp_c": 70 },
     { "class": "antminer_stock", "model": "Antminer S9", "frequency_mhz": [500, 700], "power_w": [0, 1500], "fan_pct": [30, 100], "max_temp_c": 85 },
-    { "class": "antminer_stock", "model": "Antminer S19", "fan_pct": [30, 100], "max_temp_c": 85 },
-    { "class": "epic", "model": "Antminer S19", "fan_pct": [30, 100], "temp_target_c": [55, 75], "max_temp_c": 85 },
+    { "class": "antminer_stock", "model": "Antminer S19", "fan_pct": [30, 100], "tuning_modes": ["low", "normal"], "max_temp_c": 85 },
+    { "class": "epic", "model": "Antminer S19", "power_w": [1000, 3250], "tuning_hashrate_ghs": [50000, 110000], "scaling_step": [1, 10], "scaling_min": [50, 100], "fan_pct": [30, 100], "temp_target_c": [55, 75], "max_temp_c": 85 },
     { "class": "braiins_os", "model": "Antminer S19", "power_w": [1000, 3250], "max_temp_c": 85 },
-    { "class": "vnish", "model": "Antminer S19", "power_w": [1000, 3250], "tuning_pct": [50, 100], "max_temp_c": 85 },
-    { "class": "whatsminer", "model": "M50", "power_w": [1500, 3500], "max_temp_c": 85 },
+    { "class": "vnish", "model": "Antminer S19", "power_w": [1000, 3250], "tuning_pct": [50, 100], "presets": true, "max_temp_c": 85 },
+    { "class": "whatsminer", "model": "M50", "power_w": [1500, 3500], "tuning_modes": ["low", "normal"], "max_temp_c": 85 },
     { "class": "avalon", "model": "A1566", "power_w": [1000, 3300], "max_temp_c": 85 },
     { "class": "proto", "model": "Rig", "power_w": [1000, 3500], "fan_pct": [30, 100], "temp_target_c": [40, 70], "max_temp_c": 85 },
-    { "class": "sealminer", "model": "A2", "power_w": [1500, 3700], "max_temp_c": 85 },
+    { "class": "sealminer", "model": "A2", "power_w": [1500, 3700], "tuning_modes": ["low", "normal"], "max_temp_c": 85 },
     { "class": "auradine", "model": "AT1500", "power_w": [1500, 3500], "max_temp_c": 85 }
+  ],
+  "pools": [
+    { "class": "axe_os", "pools_max": 2 },
+    { "class": "antminer_stock", "pools_max": 3 },
+    { "class": "braiins_os", "pools_max": 3, "timezone": true },
+    { "class": "lux_os", "pools_max": 3 },
+    { "class": "vnish", "pools_max": 3, "timezone": true },
+    { "class": "whatsminer", "pools_max": 3 },
+    { "class": "epic", "pools_max": 3, "timezone": true },
+    { "class": "proto", "pools_max": 3 },
+    { "class": "sealminer", "pools_max": 3 },
+    { "class": "auradine", "pools_max": 3 }
   ]
 }

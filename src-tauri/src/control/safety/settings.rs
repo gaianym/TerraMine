@@ -4,9 +4,39 @@
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
+use super::pools::{PoolGroupSpec, PoolOp};
+/// A named firmware mining mode (asic-rs `MiningMode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningMode {
+    Low,
+    Normal,
+    High,
+}
+
+impl TuningMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+}
+
 /// A partial set of settings. `None` = not part of this change / unknown.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// Pools (plan PR F), the full list. A request usually carries
+    /// [`Self::pool_op`] instead; each backend resolves it to this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pools: Option<Vec<PoolGroupSpec>>,
+    /// Pool operation (set / add / replace), resolved per miner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_op: Option<PoolOp>,
+    /// IANA timezone, e.g. "America/Chicago" (asic-rs `TimezoneConfig`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frequency_mhz: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30,6 +60,23 @@ pub struct Settings {
     /// `set_tuning_percent`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuning_pct: Option<u32>,
+    /// Tuning target: a named mining mode (asic-rs `TuningTarget::MiningMode`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning_mode: Option<TuningMode>,
+    /// Tuning target: hashrate in GH/s (asic-rs `TuningTarget::HashRate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning_hashrate_ghs: Option<u32>,
+    /// Tuning target: a named firmware preset (asic-rs `TuningTarget::Preset`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning_preset: Option<String>,
+    /// Tuning algorithm the target runs under (ePIC `ChipTune`, `PowerTune`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning_algorithm: Option<String>,
+    /// Scaling (asic-rs `ScalingConfig`): throttle step and minimum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling_step: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaling_min: Option<u32>,
 }
 
 impl Settings {
@@ -37,9 +84,67 @@ impl Settings {
         *self == Self::default()
     }
 
+    /// A pool field (list or operation) is set.
+    pub fn touches_pools(&self) -> bool {
+        self.pools.is_some() || self.pool_op.is_some()
+    }
+
     /// Any fan field (manual %, auto, target temperature) is set.
     pub fn touches_fan(&self) -> bool {
         self.fan_pct.is_some() || self.auto_fan.is_some() || self.temp_target_c.is_some()
+    }
+
+    /// A tuning target field (power, hashrate, mode, preset) is set.
+    pub fn touches_tuning_target(&self) -> bool {
+        self.power_limit_w.is_some()
+            || self.tuning_hashrate_ghs.is_some()
+            || self.tuning_mode.is_some()
+            || self.tuning_preset.is_some()
+    }
+
+    /// Fields of the D-plan tuning-target / scaling kinds (not power).
+    pub fn touches_target_or_scaling(&self) -> bool {
+        self.tuning_hashrate_ghs.is_some()
+            || self.tuning_mode.is_some()
+            || self.tuning_preset.is_some()
+            || self.tuning_algorithm.is_some()
+            || self.touches_scaling()
+    }
+
+    pub fn touches_scaling(&self) -> bool {
+        self.scaling_step.is_some() || self.scaling_min.is_some()
+    }
+
+    /// How many tuning target kinds are set (a firmware runs one target).
+    pub fn target_kinds(&self) -> usize {
+        [
+            self.power_limit_w.is_some(),
+            self.tuning_hashrate_ghs.is_some(),
+            self.tuning_mode.is_some(),
+            self.tuning_preset.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count()
+    }
+
+    /// `self` plus every tuning target field (and the algorithm) when any
+    /// is set, and both scaling fields when either is: the firmware runs
+    /// one target, so a rollback restores whichever was active before.
+    pub fn with_tuning_group(&self) -> Settings {
+        let mut m = self.clone();
+        if self.touches_tuning_target() {
+            m.power_limit_w = m.power_limit_w.or(Some(0));
+            m.tuning_hashrate_ghs = m.tuning_hashrate_ghs.or(Some(0));
+            m.tuning_mode = m.tuning_mode.or(Some(TuningMode::Normal));
+            m.tuning_preset = m.tuning_preset.or(Some(String::new()));
+            m.tuning_algorithm = m.tuning_algorithm.or(Some(String::new()));
+        }
+        if self.touches_scaling() {
+            m.scaling_step = m.scaling_step.or(Some(0));
+            m.scaling_min = m.scaling_min.or(Some(0));
+        }
+        m
     }
 
     /// `self` plus every fan field when any is set: a fan change snapshots
@@ -59,6 +164,10 @@ impl Settings {
     /// to restore for a given change).
     pub fn restrict_to(&self, mask: &Settings) -> Settings {
         Settings {
+            // A pool operation is restored as the full previous list.
+            pools: (mask.pools.is_some() || mask.pool_op.is_some()).then(|| self.pools.clone()).flatten(),
+            pool_op: None,
+            timezone: mask.timezone.as_ref().and(self.timezone.clone()),
             frequency_mhz: mask.frequency_mhz.and(self.frequency_mhz),
             core_voltage_mv: mask.core_voltage_mv.and(self.core_voltage_mv),
             fan_pct: mask.fan_pct.and(self.fan_pct),
@@ -68,6 +177,12 @@ impl Settings {
             auto_fan: mask.auto_fan.and(self.auto_fan),
             power_limit_w: mask.power_limit_w.and(self.power_limit_w),
             tuning_pct: mask.tuning_pct.and(self.tuning_pct),
+            tuning_mode: mask.tuning_mode.and(self.tuning_mode),
+            tuning_hashrate_ghs: mask.tuning_hashrate_ghs.and(self.tuning_hashrate_ghs),
+            tuning_preset: mask.tuning_preset.as_ref().and(self.tuning_preset.clone()),
+            tuning_algorithm: mask.tuning_algorithm.as_ref().and(self.tuning_algorithm.clone()),
+            scaling_step: mask.scaling_step.and(self.scaling_step),
+            scaling_min: mask.scaling_min.and(self.scaling_min),
         }
     }
 
@@ -81,6 +196,18 @@ impl Settings {
             }
         }
         let mut out = Vec::new();
+        if let Some(w) = &want.pools {
+            match &self.pools {
+                Some(g) if super::pools::same_pools(g, w) => {}
+                got => out.push(format!(
+                    "pools: got {}, want {}",
+                    got.as_deref().map_or("?".into(), super::pools::describe),
+                    super::pools::describe(w)
+                )),
+            }
+        }
+        let tz = |v: &Option<String>| v.as_ref().map(|t| t.trim().to_string());
+        cmp(&mut out, "timezone", tz(&self.timezone), tz(&want.timezone));
         cmp(&mut out, "frequency_mhz", self.frequency_mhz, want.frequency_mhz);
         cmp(&mut out, "core_voltage_mv", self.core_voltage_mv, want.core_voltage_mv);
         cmp(&mut out, "fan_pct", self.fan_pct, want.fan_pct);
@@ -90,6 +217,14 @@ impl Settings {
         cmp(&mut out, "auto_fan", self.auto_fan, want.auto_fan);
         cmp(&mut out, "power_limit_w", self.power_limit_w, want.power_limit_w);
         cmp(&mut out, "tuning_pct", self.tuning_pct, want.tuning_pct);
+        cmp(&mut out, "tuning_mode", self.tuning_mode, want.tuning_mode);
+        cmp(&mut out, "tuning_hashrate_ghs", self.tuning_hashrate_ghs, want.tuning_hashrate_ghs);
+        cmp(&mut out, "tuning_preset", self.tuning_preset.clone(), want.tuning_preset.clone());
+        // Firmware reports algorithm names in its own case.
+        let lc = |v: &Option<String>| v.as_ref().map(|a| a.to_ascii_lowercase());
+        cmp(&mut out, "tuning_algorithm", lc(&self.tuning_algorithm), lc(&want.tuning_algorithm));
+        cmp(&mut out, "scaling_step", self.scaling_step, want.scaling_step);
+        cmp(&mut out, "scaling_min", self.scaling_min, want.scaling_min);
         out
     }
 
@@ -102,6 +237,9 @@ impl Settings {
             }
         };
         let s = |v: Option<u32>| v.map(|x| x.to_string());
+        let pl = |v: &Option<Vec<PoolGroupSpec>>| v.as_deref().map(super::pools::describe);
+        f("pools", pl(&self.pools), pl(&to.pools));
+        f("timezone", self.timezone.clone(), to.timezone.clone());
         f("frequency_mhz", s(self.frequency_mhz), s(to.frequency_mhz));
         f("core_voltage_mv", s(self.core_voltage_mv), s(to.core_voltage_mv));
         f("fan_pct", s(self.fan_pct), s(to.fan_pct));
@@ -111,6 +249,13 @@ impl Settings {
         f("auto_fan", self.auto_fan.map(|b| b.to_string()), to.auto_fan.map(|b| b.to_string()));
         f("power_limit_w", s(self.power_limit_w), s(to.power_limit_w));
         f("tuning_pct", s(self.tuning_pct), s(to.tuning_pct));
+        let m = |v: Option<TuningMode>| v.map(|x| x.as_str().to_string());
+        f("tuning_mode", m(self.tuning_mode), m(to.tuning_mode));
+        f("tuning_hashrate_ghs", s(self.tuning_hashrate_ghs), s(to.tuning_hashrate_ghs));
+        f("tuning_preset", self.tuning_preset.clone(), to.tuning_preset.clone());
+        f("tuning_algorithm", self.tuning_algorithm.clone(), to.tuning_algorithm.clone());
+        f("scaling_step", s(self.scaling_step), s(to.scaling_step));
+        f("scaling_min", s(self.scaling_min), s(to.scaling_min));
         parts.join(", ")
     }
 }
@@ -183,6 +328,10 @@ pub trait SettingsDriver: Send + Sync {
     /// Seconds since boot, used to prove a restart happened.
     fn uptime_s(&self) -> BoxFuture<'_, anyhow::Result<Option<u64>>> {
         Box::pin(async { Ok(None) })
+    }
+    /// Named presets the firmware offers (empty = none / not supported).
+    fn presets(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async { Vec::new() })
     }
     /// Beyond the configured values read back by [`Self::read`]: is the
     /// change actually running (e.g. AxeOS `actualFrequency`)? Default: yes.

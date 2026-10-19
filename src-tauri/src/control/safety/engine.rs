@@ -262,14 +262,48 @@ impl SafetyEngine {
             Ok(e) => e.clone(),
             Err(v) => return self.finish(c, WriteStatus::Refused, Some(v.join("; "))),
         };
+        if let Err(v) = self.limits.check_pools(&t.profile, &req.change) {
+            return self.finish(c, WriteStatus::Refused, Some(v.join("; ")));
+        }
+        if req.change.touches_pools() && (req.change.pools.is_some() == req.change.pool_op.is_some() || {
+            let rest = Settings { pools: None, pool_op: None, ..req.change.clone() };
+            !rest.is_empty()
+        }) {
+            let msg = "send a pool change on its own: one pool operation (or one full list) and no other settings";
+            return self.finish(c, WriteStatus::Refused, Some(msg.into()));
+        }
+        if req.change.touches_pools() && !req.dry_run && !req.confirm.allow_pool_change {
+            let msg = "pool change needs an explicit OK (allow_pool_change): a wrong pool sends the hashrate elsewhere";
+            return self.finish(c, WriteStatus::Refused, Some(msg.into()));
+        }
+        // A pool operation (set / add / replace) resolves against this
+        // miner's current pools into the full new list.
+        let resolved;
+        let req_change = match &req.change.pool_op {
+            None => &req.change,
+            Some(op) => {
+                let cur = match timed(to, drv.read()).await {
+                    Ok(s) => s,
+                    Err(e) => return self.finish(c, WriteStatus::Failed, Some(format!("cannot read current pools: {e}"))),
+                };
+                let max = self.limits.pool_limit(&t.profile).map_or(0, |l| l.pools_max);
+                match super::pools::apply_op(cur.pools.as_deref().unwrap_or_default(), op, max) {
+                    Ok(p) => {
+                        resolved = Settings { pools: Some(p), pool_op: None, ..req.change.clone() };
+                        &resolved
+                    }
+                    Err(e) => return self.finish(c, WriteStatus::Refused, Some(e)),
+                }
+            }
+        };
         // Backend mapping (AxeOS power → frequency stand-in), limit-checked too.
-        let (change, note) = match tokio::time::timeout(to, drv.translate(&req.change)).await {
+        let (change, note) = match tokio::time::timeout(to, drv.translate(req_change)).await {
             Ok(Ok(x)) => x,
             Ok(Err(e)) => return self.finish(c, WriteStatus::Refused, Some(e)),
             Err(_) => return self.finish(c, WriteStatus::Refused, Some("timeout while mapping the request".into())),
         };
-        if change != req.change {
-            if let Err(v) = self.limits.check(&t.profile, &change) {
+        if change != *req_change {
+            if let Err(v) = self.limits.check(&t.profile, &change).map(|_| ()).and_then(|_| self.limits.check_pools(&t.profile, &change)) {
                 let msg = format!("{}; {}", note.unwrap_or_default(), v.join("; "));
                 return self.finish(c, WriteStatus::Refused, Some(msg));
             }
@@ -311,12 +345,18 @@ impl SafetyEngine {
             return self.finish(c, WriteStatus::Refused, Some(h));
         }
         // A fan change snapshots the whole fan state (mode, manual %, target).
-        let restore = current.restrict_to(&change.with_fan_group());
+        // A tuning target change snapshots whichever target is running.
+        let restore = current.restrict_to(&change.with_fan_group().with_tuning_group());
         let mut missing = missing_fields(&change, &restore);
         if restore.auto_fan == Some(true) || (restore.auto_fan == Some(false) && restore.fan_pct.is_some()) {
             // The mode plus its own value restores the fan; the other mode's
             // value may simply not be reported.
             missing.retain(|f| f != "fan_pct" && f != "temp_target_c");
+        }
+        if restore.touches_tuning_target() {
+            // The running target restores the tuning; the other kinds are
+            // simply not active.
+            missing.retain(|f| !TARGET_FIELDS.contains(&f.as_str()));
         }
         if !missing.is_empty() {
             let msg = format!("cannot snapshot every field being changed ({}); refusing write", missing.join(", "));
@@ -329,6 +369,13 @@ impl SafetyEngine {
         c.out.snapshot_id = Some(snap.id.clone());
         c.out.before = Some(snap.settings.clone());
         let baseline = t.driver.health().await;
+        // An intended reduction (lower power / frequency / hashrate target,
+        // Low mode) lowers the hashrate floor accordingly.
+        let (baseline, scaled) = scaled_baseline(baseline, &snap.settings, &change);
+        let note = match scaled {
+            Some(r) if r < 1.0 => format!("{note}hashrate floor scaled to {:.0}% of the pre-change baseline for the intended reduction; ", r * 100.0),
+            _ => note,
+        };
         let policy = self.opts.health.clone().with_temp_ceiling(entry.max_temp_c);
         c.started = Some(Instant::now());
 
@@ -497,6 +544,8 @@ fn missing_fields(change: &Settings, snap: &Settings) -> Vec<String> {
             out.push(n.to_string());
         }
     };
+    f("pools", change.pools.is_some(), snap.pools.is_some());
+    f("timezone", change.timezone.is_some(), snap.timezone.is_some());
     f("frequency_mhz", change.frequency_mhz.is_some(), snap.frequency_mhz.is_some());
     f("core_voltage_mv", change.core_voltage_mv.is_some(), snap.core_voltage_mv.is_some());
     f("fan_pct", change.fan_pct.is_some(), snap.fan_pct.is_some());
@@ -506,7 +555,68 @@ fn missing_fields(change: &Settings, snap: &Settings) -> Vec<String> {
     f("auto_fan", change.auto_fan.is_some(), snap.auto_fan.is_some());
     f("power_limit_w", change.power_limit_w.is_some(), snap.power_limit_w.is_some());
     f("tuning_pct", change.tuning_pct.is_some(), snap.tuning_pct.is_some());
+    f("tuning_mode", change.tuning_mode.is_some(), snap.tuning_mode.is_some());
+    f("tuning_hashrate_ghs", change.tuning_hashrate_ghs.is_some(), snap.tuning_hashrate_ghs.is_some());
+    f("tuning_preset", change.tuning_preset.is_some(), snap.tuning_preset.is_some());
+    f("tuning_algorithm", change.tuning_algorithm.is_some(), snap.tuning_algorithm.is_some());
+    f("scaling_step", change.scaling_step.is_some(), snap.scaling_step.is_some());
+    f("scaling_min", change.scaling_min.is_some(), snap.scaling_min.is_some());
     out
+}
+
+/// Tuning target fields: one of them restores the running target.
+const TARGET_FIELDS: [&str; 5] = ["power_limit_w", "tuning_hashrate_ghs", "tuning_mode", "tuning_preset", "tuning_algorithm"];
+
+/// Hashrate-floor factor for intended reductions: the lowest
+/// new/old ratio among power, frequency, tuning percent and a hashrate
+/// target (vs the measured baseline); Low mode or a change of preset /
+/// target kind with no number to compare uses [`UNKNOWN_REDUCTION_RATIO`].
+/// Increases never raise the floor above the baseline. `None` = no
+/// intended reduction.
+pub fn expected_ratio(before: &Settings, change: &Settings, baseline_ghs: Option<f64>) -> Option<f64> {
+    let mut r: Option<f64> = None;
+    let mut take = |x: f64| r = Some(r.map_or(x, |y: f64| y.min(x)));
+    let ratio = |new: Option<u32>, old: Option<u32>| match (new, old) {
+        (Some(n), Some(o)) if o > 0 && n < o => Some(f64::from(n) / f64::from(o)),
+        _ => None,
+    };
+    for x in [
+        ratio(change.power_limit_w, before.power_limit_w),
+        ratio(change.frequency_mhz, before.frequency_mhz),
+        ratio(change.tuning_pct, before.tuning_pct),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        take(x);
+    }
+    if let (Some(h), Some(b)) = (change.tuning_hashrate_ghs, baseline_ghs.filter(|b| *b > 0.0)) {
+        if f64::from(h) < b {
+            take(f64::from(h) / b);
+        }
+    }
+    let kind_changed = change.touches_tuning_target() && before.touches_tuning_target() && {
+        let kind = |s: &Settings| [s.power_limit_w.is_some(), s.tuning_hashrate_ghs.is_some(), s.tuning_mode.is_some(), s.tuning_preset.is_some()];
+        kind(change) != kind(before)
+    };
+    let low = change.tuning_mode == Some(super::settings::TuningMode::Low) && before.tuning_mode != Some(super::settings::TuningMode::Low);
+    let new_preset = change.tuning_preset.is_some() && change.tuning_preset != before.tuning_preset;
+    if low || new_preset || (kind_changed && change.tuning_hashrate_ghs.is_none() && change.power_limit_w.is_none()) {
+        take(UNKNOWN_REDUCTION_RATIO);
+    }
+    r
+}
+
+/// Floor factor when a change may lower hashrate by an unknown amount
+/// (Low mode, a different preset).
+pub const UNKNOWN_REDUCTION_RATIO: f64 = 0.5;
+
+fn scaled_baseline(mut b: HealthSample, before: &Settings, change: &Settings) -> (HealthSample, Option<f64>) {
+    let r = expected_ratio(before, change, b.hashrate_ghs);
+    if let (Some(r), Some(h)) = (r, b.hashrate_ghs) {
+        b.hashrate_ghs = Some(h * r);
+    }
+    (b, r)
 }
 
 /// A frequency increase over the current value is held unless the

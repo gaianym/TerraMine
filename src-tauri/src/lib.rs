@@ -1,6 +1,8 @@
 pub mod control;
 mod discovery;
 mod logger;
+#[cfg(test)]
+mod test_hygiene;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
