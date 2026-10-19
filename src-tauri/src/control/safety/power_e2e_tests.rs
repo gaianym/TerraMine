@@ -4,9 +4,10 @@
 //! asic-rs settings backend → per-firmware mocks.
 //!
 //! Firmwares with `supports_set_power_limit()` (Braiins, VNish, Whatsminer,
-//! Avalon, Proto, Sealminer, Auradine) take the write; stock Antminer,
-//! ePIC and Bitaxe have no power path and end `no_path` with every path
-//! tried, before anything is sent.
+//! Avalon, Proto, Sealminer, Auradine) take the write; stock Antminer and
+//! Bitaxe have no power path and end `no_path` with every path tried,
+//! before anything is sent. ePIC (no `set_power_limit`, power through
+//! `set_tuning_config`) is covered in `tuning_e2e_tests`.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -43,7 +44,7 @@ const POWER_CAPABLE: [NativeFirmware; 7] = [
     NativeFirmware::Sealminer2025,
     NativeFirmware::AuradineV1,
 ];
-const NO_POWER: [NativeFirmware; 2] = [NativeFirmware::AntminerStock, NativeFirmware::EpicV1];
+const NO_POWER: [NativeFirmware; 1] = [NativeFirmware::AntminerStock];
 
 pub(super) struct Rig {
     pub(super) miners: HashMap<NativeFirmware, Arc<MockNative>>,

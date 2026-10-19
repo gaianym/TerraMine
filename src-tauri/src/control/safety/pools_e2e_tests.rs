@@ -21,7 +21,7 @@ use super::mock_native::{NativeFirmware, MOCK_POOL, MOCK_WORKER};
 use super::policy::Confirmation;
 use super::pools::{apply_op, normalize_url, PoolGroupSpec, PoolOp, PoolSpec, Secret, REDACTED};
 use super::power_e2e_tests::{batch, ip_of, rig, Rig, AXE};
-use super::settings::Settings;
+use super::settings::{Settings, TuningMode};
 use super::snapshot::SnapshotStore;
 use crate::control::cache::{DeviceCache, Resolved, Resolver};
 use crate::control::mock_miner::{MockKind, MockMiner, MockMinerFactory};
@@ -177,6 +177,8 @@ async fn pool_request_checks() {
         (op(PoolOp::Add { pool: spec("new.example.com", "w", None) }), "needs a host and a port"),
         (op(PoolOp::Add { pool: spec(NEW, " ", None) }), "worker / user is empty"),
         (Settings { fan_pct: Some(50), ..replace0(None) }, "send a pool change on its own"),
+        // Merge of plans D + F: a tuning target never rides along with a pool change.
+        (Settings { tuning_mode: Some(TuningMode::Low), ..replace0(None) }, "send a pool change on its own"),
     ];
     for (change, want) in cases {
         let o = run_c(&r, vec![a], change.clone(), false, true).await;

@@ -35,6 +35,16 @@ export type SettingsSupportRow = {
   timezone?: FieldSupport;
   timezone_allowed?: boolean;
   current_timezone?: string | null;
+  /** Tuning targets (plan PR D). */
+  tuning_modes?: TuningMode[];
+  tuning_hashrate_ghs?: Range | null;
+  scaling_step?: Range | null;
+  scaling_min?: Range | null;
+  mode?: FieldSupport;
+  hashrate?: FieldSupport;
+  preset?: FieldSupport;
+  scaling?: FieldSupport;
+  presets?: string[];
 };
 
 export type PoolSpec = { url: string; user: string; password?: string | null };
@@ -43,6 +53,8 @@ export type PoolOp =
   | { op: "set"; groups: PoolGroup[] }
   | { op: "add"; pool: PoolSpec }
   | { op: "replace"; index: number; pool: PoolSpec };
+
+export type TuningMode = "low" | "normal" | "high";
 
 export type WriteOutcome = {
   ip: string;

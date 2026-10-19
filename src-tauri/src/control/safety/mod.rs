@@ -41,6 +41,8 @@ mod fan_e2e_tests;
 mod power_e2e_tests;
 #[cfg(test)]
 mod pools_e2e_tests;
+#[cfg(test)]
+mod tuning_e2e_tests;
 
 pub use audit::{AuditRecord, AuditSink, JsonlAudit, MemoryAudit, NullAudit};
 pub use engine::{SafeWriteRequest, SafetyEngine, SafetyOptions, Target, WriteOutcome, WriteStatus};

@@ -13,6 +13,12 @@ export type Settings = {
   pool_op?: import("./power").PoolOp | null;
   pools?: import("./power").PoolGroup[] | null;
   timezone?: string | null;
+  tuning_mode?: "low" | "normal" | "high" | null;
+  tuning_hashrate_ghs?: number | null;
+  tuning_preset?: string | null;
+  tuning_algorithm?: string | null;
+  scaling_step?: number | null;
+  scaling_min?: number | null;
 };
 
 export type FailureCause =
@@ -62,6 +68,11 @@ const FIELDS: Array<[keyof Settings, string]> = [
   ["temp_target_c", "°C target"],
   ["power_limit_w", "W"],
   ["tuning_pct", "% tuning"],
+  ["tuning_mode", "mode"],
+  ["tuning_hashrate_ghs", "GH/s target"],
+  ["tuning_preset", "preset"],
+  ["scaling_step", "scaling step"],
+  ["scaling_min", "scaling min"],
 ];
 
 function fieldValue(s: Settings | null, k: keyof Settings): string {
