@@ -262,14 +262,48 @@ impl SafetyEngine {
             Ok(e) => e.clone(),
             Err(v) => return self.finish(c, WriteStatus::Refused, Some(v.join("; "))),
         };
+        if let Err(v) = self.limits.check_pools(&t.profile, &req.change) {
+            return self.finish(c, WriteStatus::Refused, Some(v.join("; ")));
+        }
+        if req.change.touches_pools() && (req.change.pools.is_some() == req.change.pool_op.is_some() || {
+            let rest = Settings { pools: None, pool_op: None, ..req.change.clone() };
+            !rest.is_empty()
+        }) {
+            let msg = "send a pool change on its own: one pool operation (or one full list) and no other settings";
+            return self.finish(c, WriteStatus::Refused, Some(msg.into()));
+        }
+        if req.change.touches_pools() && !req.dry_run && !req.confirm.allow_pool_change {
+            let msg = "pool change needs an explicit OK (allow_pool_change): a wrong pool sends the hashrate elsewhere";
+            return self.finish(c, WriteStatus::Refused, Some(msg.into()));
+        }
+        // A pool operation (set / add / replace) resolves against this
+        // miner's current pools into the full new list.
+        let resolved;
+        let req_change = match &req.change.pool_op {
+            None => &req.change,
+            Some(op) => {
+                let cur = match timed(to, drv.read()).await {
+                    Ok(s) => s,
+                    Err(e) => return self.finish(c, WriteStatus::Failed, Some(format!("cannot read current pools: {e}"))),
+                };
+                let max = self.limits.pool_limit(&t.profile).map_or(0, |l| l.pools_max);
+                match super::pools::apply_op(cur.pools.as_deref().unwrap_or_default(), op, max) {
+                    Ok(p) => {
+                        resolved = Settings { pools: Some(p), pool_op: None, ..req.change.clone() };
+                        &resolved
+                    }
+                    Err(e) => return self.finish(c, WriteStatus::Refused, Some(e)),
+                }
+            }
+        };
         // Backend mapping (AxeOS power → frequency stand-in), limit-checked too.
-        let (change, note) = match tokio::time::timeout(to, drv.translate(&req.change)).await {
+        let (change, note) = match tokio::time::timeout(to, drv.translate(req_change)).await {
             Ok(Ok(x)) => x,
             Ok(Err(e)) => return self.finish(c, WriteStatus::Refused, Some(e)),
             Err(_) => return self.finish(c, WriteStatus::Refused, Some("timeout while mapping the request".into())),
         };
-        if change != req.change {
-            if let Err(v) = self.limits.check(&t.profile, &change) {
+        if change != *req_change {
+            if let Err(v) = self.limits.check(&t.profile, &change).map(|_| ()).and_then(|_| self.limits.check_pools(&t.profile, &change)) {
                 let msg = format!("{}; {}", note.unwrap_or_default(), v.join("; "));
                 return self.finish(c, WriteStatus::Refused, Some(msg));
             }
@@ -497,6 +531,8 @@ fn missing_fields(change: &Settings, snap: &Settings) -> Vec<String> {
             out.push(n.to_string());
         }
     };
+    f("pools", change.pools.is_some(), snap.pools.is_some());
+    f("timezone", change.timezone.is_some(), snap.timezone.is_some());
     f("frequency_mhz", change.frequency_mhz.is_some(), snap.frequency_mhz.is_some());
     f("core_voltage_mv", change.core_voltage_mv.is_some(), snap.core_voltage_mv.is_some());
     f("fan_pct", change.fan_pct.is_some(), snap.fan_pct.is_some());

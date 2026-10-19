@@ -16,5 +16,17 @@
     { "class": "proto", "model": "Rig", "power_w": [1000, 3500], "fan_pct": [30, 100], "temp_target_c": [40, 70], "max_temp_c": 85 },
     { "class": "sealminer", "model": "A2", "power_w": [1500, 3700], "max_temp_c": 85 },
     { "class": "auradine", "model": "AT1500", "power_w": [1500, 3500], "max_temp_c": 85 }
+  ],
+  "pools": [
+    { "class": "axe_os", "pools_max": 2 },
+    { "class": "antminer_stock", "pools_max": 3 },
+    { "class": "braiins_os", "pools_max": 3, "timezone": true },
+    { "class": "lux_os", "pools_max": 3 },
+    { "class": "vnish", "pools_max": 3, "timezone": true },
+    { "class": "whatsminer", "pools_max": 3 },
+    { "class": "epic", "pools_max": 3, "timezone": true },
+    { "class": "proto", "pools_max": 3 },
+    { "class": "sealminer", "pools_max": 3 },
+    { "class": "auradine", "pools_max": 3 }
   ]
 }

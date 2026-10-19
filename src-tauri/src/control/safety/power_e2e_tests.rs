@@ -27,9 +27,9 @@ use crate::control::cache::{DeviceCache, Resolver};
 use crate::control::driver::DriverFactory;
 use crate::control::mock_miner::{MockKind, MockMiner, MockMinerFactory};
 
-const AXE: [u8; 4] = [192, 0, 2, 90];
+pub(super) const AXE: [u8; 4] = [192, 0, 2, 90];
 
-fn ip_of(fw: NativeFirmware) -> IpAddr {
+pub(super) fn ip_of(fw: NativeFirmware) -> IpAddr {
     let i = NativeFirmware::ALL.iter().position(|f| *f == fw).unwrap() as u8;
     IpAddr::from([192, 0, 2, 100 + i])
 }
@@ -45,16 +45,16 @@ const POWER_CAPABLE: [NativeFirmware; 7] = [
 ];
 const NO_POWER: [NativeFirmware; 2] = [NativeFirmware::AntminerStock, NativeFirmware::EpicV1];
 
-struct Rig {
-    miners: HashMap<NativeFirmware, Arc<MockNative>>,
-    resolver: Arc<Resolver>,
-    audit: Arc<MemoryAudit>,
-    engine: Arc<SafetyEngine>,
-    axe: Option<MockMiner>,
+pub(super) struct Rig {
+    pub(super) miners: HashMap<NativeFirmware, Arc<MockNative>>,
+    pub(super) resolver: Arc<Resolver>,
+    pub(super) audit: Arc<MemoryAudit>,
+    pub(super) engine: Arc<SafetyEngine>,
+    pub(super) axe: Option<MockMiner>,
 }
 
 impl Rig {
-    fn m(&self, fw: NativeFirmware) -> &Arc<MockNative> {
+    pub(super) fn m(&self, fw: NativeFirmware) -> &Arc<MockNative> {
         &self.miners[&fw]
     }
 }
@@ -76,7 +76,7 @@ fn opts(allow_unconfirmed: bool) -> SafetyOptions {
     }
 }
 
-async fn rig(allow_unconfirmed: bool, with_bitaxe: bool) -> Rig {
+pub(super) async fn rig(allow_unconfirmed: bool, with_bitaxe: bool) -> Rig {
     let miners: HashMap<NativeFirmware, Arc<MockNative>> =
         NativeFirmware::ALL.into_iter().filter(|f| *f != NativeFirmware::BitaxeV214).map(|f| (f, MockNative::new(f))).collect();
     let (axe, other) = if with_bitaxe {
@@ -94,11 +94,11 @@ async fn rig(allow_unconfirmed: bool, with_bitaxe: bool) -> Rig {
     Rig { miners, resolver, audit, engine, axe }
 }
 
-fn batch(canary: Option<usize>) -> BatchOptions {
+pub(super) fn batch(canary: Option<usize>) -> BatchOptions {
     BatchOptions { concurrency: 4, stagger: Duration::from_millis(10), canary_size: canary, resolve_timeout: Duration::from_secs(2), ..Default::default() }
 }
 
-async fn run(r: &Rig, ips: Vec<IpAddr>, change: Settings, dry_run: bool, canary: Option<usize>) -> (HashMap<IpAddr, WriteOutcome>, Option<JobAlert>) {
+pub(super) async fn run(r: &Rig, ips: Vec<IpAddr>, change: Settings, dry_run: bool, canary: Option<usize>) -> (HashMap<IpAddr, WriteOutcome>, Option<JobAlert>) {
     let req = SafeWriteRequest { change, dry_run, confirm: Confirmation::default() };
     let (out, alert) =
         run_settings_job("power-run", ips, req, r.resolver.clone(), r.engine.clone(), batch(canary), CancellationToken::new(), Arc::new(|_| {})).await;
@@ -290,7 +290,7 @@ async fn settings_support_rows_show_limits_and_paths() {
                 Resolved::Ready { driver, .. } => Some(driver),
                 _ => None,
             };
-            crate::control::settings_support_row(&r.engine, ip, d)
+            crate::control::settings_support_row(&r.engine, ip, d).await
         }
     };
     let v = row(ip_of(NativeFirmware::Vnish13)).await;
@@ -307,7 +307,7 @@ async fn settings_support_rows_show_limits_and_paths() {
     assert_eq!((b.power.path.as_deref(), b.tuning.path.clone()), (Some("axeos-http"), None));
     assert_eq!(b.power_w, Some([0, 40]));
     assert!(b.tuning.tried.iter().any(|t| t.contains("tuning_pct has no AxeOS equivalent")), "{:?}", b.tuning.tried);
-    let missing = crate::control::settings_support_row(&r.engine, IpAddr::from([192, 0, 2, 254]), None);
+    let missing = crate::control::settings_support_row(&r.engine, IpAddr::from([192, 0, 2, 254]), None).await;
     assert!(!missing.found);
     let json = serde_json::to_value(&v).unwrap();
     assert_eq!(json["power"]["path"], "asic-rs");

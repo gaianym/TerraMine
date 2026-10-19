@@ -10,6 +10,9 @@ export type Settings = {
   auto_fan?: boolean | null;
   power_limit_w?: number | null;
   tuning_pct?: number | null;
+  pool_op?: import("./power").PoolOp | null;
+  pools?: import("./power").PoolGroup[] | null;
+  timezone?: string | null;
 };
 
 export type FailureCause =
@@ -75,6 +78,16 @@ export function describeChange(m: Pick<AlertMiner, "before" | "attempted" | "aft
   }
   if (m.attempted?.auto_fan !== null && m.attempted?.auto_fan !== undefined) {
     parts.push(`auto fan ${fieldValue(m.before, "auto_fan")} → ${m.attempted.auto_fan} → ${fieldValue(m.after, "auto_fan")}`);
+  }
+  if (m.attempted?.pools) {
+    const pl = (s: Settings | null) => {
+      const l = (s?.pools ?? []).flatMap((g) => g.pools).map((x) => `${x.url.replace(/^stratum\+tcp:\/\//, "")} ${x.user}`);
+      return s?.pools ? `[${l.join(", ")}]` : "?";
+    };
+    parts.push(`pools ${pl(m.before)} → ${pl(m.attempted)} → ${pl(m.after)}`);
+  }
+  if (m.attempted?.timezone) {
+    parts.push(`timezone ${fieldValue(m.before, "timezone")} → ${m.attempted.timezone} → ${fieldValue(m.after, "timezone")}`);
   }
   return parts.join(", ");
 }

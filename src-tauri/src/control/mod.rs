@@ -304,9 +304,17 @@ pub struct SettingsSupportRow {
     /// Auto fan with a target temperature (or plain auto where the firmware
     /// has no target, e.g. stock Antminer).
     pub fan_auto: FieldSupport,
+    /// Pools (plan PR F): path, most pools kept, and the current list
+    /// (URL + worker; passwords never leave the backend).
+    pub pools: FieldSupport,
+    pub pools_max: Option<usize>,
+    pub current_pools: Option<Vec<safety::pools::PoolGroupSpec>>,
+    pub timezone: FieldSupport,
+    pub timezone_allowed: bool,
+    pub current_timezone: Option<String>,
 }
 
-pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: Option<Arc<dyn driver::MinerDriver>>) -> SettingsSupportRow {
+pub async fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: Option<Arc<dyn driver::MinerDriver>>) -> SettingsSupportRow {
     let none = || FieldSupport { path: None, confirmed: false, tried: Vec::new() };
     let Some(d) = driver else {
         return SettingsSupportRow {
@@ -322,6 +330,12 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
             temp_target_c: None,
             fan: none(),
             fan_auto: none(),
+            pools: none(),
+            pools_max: None,
+            current_pools: None,
+            timezone: none(),
+            timezone_allowed: false,
+            current_timezone: None,
         };
     };
     let t = safety::Target::new(ip, d);
@@ -330,6 +344,23 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
         FieldSupport { confirmed: b.as_ref().is_some_and(|b| b.confirmed_for(&change)), path: b.map(|b| b.id().to_string()), tried }
     };
     let limits = engine.limits.lookup(&t.profile);
+    let pool_probe = safety::pools::PoolOp::Add {
+        pool: safety::pools::PoolSpec { url: "stratum+tcp://probe:1".into(), user: "probe".into(), password: Default::default() },
+    };
+    let pools = field(safety::settings::Settings { pool_op: Some(pool_probe), ..Default::default() });
+    let timezone = field(safety::settings::Settings { timezone: Some("UTC".into()), ..Default::default() });
+    let pool_limit = engine.limits.pool_limit(&t.profile);
+    // Current pools / timezone from the backend that would take the write.
+    let (mut current_pools, mut current_timezone) = (None, None);
+    if pools.path.is_some() || timezone.path.is_some() {
+        let id = pools.path.clone().or(timezone.path.clone());
+        if let Some(b) = t.driver.settings_backends().into_iter().find(|b| Some(b.id().to_string()) == id) {
+            if let Ok(Ok(cur)) = tokio::time::timeout(Duration::from_secs(5), b.read()).await {
+                current_pools = cur.pools.filter(|_| pools.path.is_some());
+                current_timezone = cur.timezone.filter(|_| timezone.path.is_some());
+            }
+        }
+    }
     SettingsSupportRow {
         ip: ip.to_string(),
         found: true,
@@ -351,6 +382,12 @@ pub fn settings_support_row(engine: &safety::SafetyEngine, ip: IpAddr, driver: O
                 if plain.path.is_some() { plain } else { with_target }
             }
         },
+        pools,
+        pools_max: pool_limit.map(|l| l.pools_max),
+        current_pools,
+        timezone,
+        timezone_allowed: pool_limit.is_some_and(|l| l.timezone),
+        current_timezone,
     }
 }
 
@@ -370,7 +407,7 @@ pub async fn settings_support(ips: Vec<String>) -> Result<Vec<SettingsSupportRow
             cache::Resolved::Ready { driver, .. } => Some(driver),
             _ => None,
         };
-        out.push(settings_support_row(&engine, ip, d));
+        out.push(settings_support_row(&engine, ip, d).await);
     }
     Ok(out)
 }

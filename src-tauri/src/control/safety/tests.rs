@@ -526,7 +526,7 @@ fn asic_rs_accepts_only_what_it_supports() {
     let power = Settings { power_limit_w: Some(3000), ..Default::default() };
     let pct = Settings { tuning_pct: Some(80), ..Default::default() };
     let fan = Settings { fan_pct: Some(70), ..Default::default() };
-    let all = F { power_limit: true, tuning_percent: true, fan: true, auto_target: true, temperature_config: false };
+    let all = F { pools: false, timezone: false, power_limit: true, tuning_percent: true, fan: true, auto_target: true, temperature_config: false };
     assert!(asic_accepts(&power, F { power_limit: true, ..F::default() }).is_ok());
     assert!(asic_accepts(&power, F { tuning_percent: true, fan: true, ..F::default() })
         .unwrap_err()

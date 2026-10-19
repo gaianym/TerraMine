@@ -4,9 +4,21 @@
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
+use super::pools::{PoolGroupSpec, PoolOp};
+
 /// A partial set of settings. `None` = not part of this change / unknown.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
+    /// Pools (plan PR F), the full list. A request usually carries
+    /// [`Self::pool_op`] instead; each backend resolves it to this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pools: Option<Vec<PoolGroupSpec>>,
+    /// Pool operation (set / add / replace), resolved per miner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_op: Option<PoolOp>,
+    /// IANA timezone, e.g. "America/Chicago" (asic-rs `TimezoneConfig`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frequency_mhz: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,6 +49,11 @@ impl Settings {
         *self == Self::default()
     }
 
+    /// A pool field (list or operation) is set.
+    pub fn touches_pools(&self) -> bool {
+        self.pools.is_some() || self.pool_op.is_some()
+    }
+
     /// Any fan field (manual %, auto, target temperature) is set.
     pub fn touches_fan(&self) -> bool {
         self.fan_pct.is_some() || self.auto_fan.is_some() || self.temp_target_c.is_some()
@@ -59,6 +76,10 @@ impl Settings {
     /// to restore for a given change).
     pub fn restrict_to(&self, mask: &Settings) -> Settings {
         Settings {
+            // A pool operation is restored as the full previous list.
+            pools: (mask.pools.is_some() || mask.pool_op.is_some()).then(|| self.pools.clone()).flatten(),
+            pool_op: None,
+            timezone: mask.timezone.as_ref().and(self.timezone.clone()),
             frequency_mhz: mask.frequency_mhz.and(self.frequency_mhz),
             core_voltage_mv: mask.core_voltage_mv.and(self.core_voltage_mv),
             fan_pct: mask.fan_pct.and(self.fan_pct),
@@ -81,6 +102,18 @@ impl Settings {
             }
         }
         let mut out = Vec::new();
+        if let Some(w) = &want.pools {
+            match &self.pools {
+                Some(g) if super::pools::same_pools(g, w) => {}
+                got => out.push(format!(
+                    "pools: got {}, want {}",
+                    got.as_deref().map_or("?".into(), super::pools::describe),
+                    super::pools::describe(w)
+                )),
+            }
+        }
+        let tz = |v: &Option<String>| v.as_ref().map(|t| t.trim().to_string());
+        cmp(&mut out, "timezone", tz(&self.timezone), tz(&want.timezone));
         cmp(&mut out, "frequency_mhz", self.frequency_mhz, want.frequency_mhz);
         cmp(&mut out, "core_voltage_mv", self.core_voltage_mv, want.core_voltage_mv);
         cmp(&mut out, "fan_pct", self.fan_pct, want.fan_pct);
@@ -102,6 +135,9 @@ impl Settings {
             }
         };
         let s = |v: Option<u32>| v.map(|x| x.to_string());
+        let pl = |v: &Option<Vec<PoolGroupSpec>>| v.as_deref().map(super::pools::describe);
+        f("pools", pl(&self.pools), pl(&to.pools));
+        f("timezone", self.timezone.clone(), to.timezone.clone());
         f("frequency_mhz", s(self.frequency_mhz), s(to.frequency_mhz));
         f("core_voltage_mv", s(self.core_voltage_mv), s(to.core_voltage_mv));
         f("fan_pct", s(self.fan_pct), s(to.fan_pct));

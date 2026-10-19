@@ -33,12 +33,25 @@ pub struct LimitEntry {
     pub max_temp_c: f64,
 }
 
+/// Pool / timezone limits per device class (firmware property, not model).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PoolLimit {
+    pub class: DeviceClass,
+    /// Most pools the firmware keeps (across groups).
+    pub pools_max: usize,
+    /// Timezone writes allowed.
+    #[serde(default)]
+    pub timezone: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitsTable {
     pub version: u32,
     #[serde(default)]
     pub note: String,
     pub entries: Vec<LimitEntry>,
+    #[serde(default)]
+    pub pools: Vec<PoolLimit>,
 }
 
 impl LimitsTable {
@@ -76,6 +89,29 @@ impl LimitsTable {
             }
         }
         of_class().find(|e| eq(&e.model, &p.model))
+    }
+
+    pub fn pool_limit(&self, p: &DeviceProfile) -> Option<&PoolLimit> {
+        self.pools.iter().find(|l| l.class == p.class)
+    }
+
+    /// Pool / timezone fields of `change` allowed for this device class.
+    pub fn check_pools(&self, p: &DeviceProfile, change: &Settings) -> Result<(), Vec<String>> {
+        let l = self.pool_limit(p);
+        let mut errs = Vec::new();
+        if change.touches_pools() && l.is_none() {
+            errs.push(format!("pools are not writable on {:?} (no pool limits)", p.class));
+        }
+        if change.timezone.is_some() && !l.is_some_and(|l| l.timezone) {
+            errs.push(format!("timezone is not writable on {:?}", p.class));
+        }
+        if let (Some(g), Some(l)) = (&change.pools, l) {
+            let n = super::pools::flatten(g).len();
+            if n > l.pools_max {
+                errs.push(format!("{n} pools; {:?} keeps at most {}", p.class, l.pools_max));
+            }
+        }
+        if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 
     /// Ok(entry) when every field in `change` is within its range.
