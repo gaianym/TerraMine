@@ -263,6 +263,12 @@ impl MinerDriver for S9RpcDriver {
     fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
         vec![Box::new(NoSettingsPath { id: "cgminer-rpc", reason: RPC_NO_SETTINGS })]
     }
+    fn admin_backends(&self) -> Vec<Box<dyn crate::control::admin::AdminBackend>> {
+        vec![Box::new(crate::control::admin::s9::BmminerBoards {
+            rpc: self.rpc.clone(),
+            model: "Antminer S9".into(),
+        })]
+    }
 }
 
 #[cfg(test)]

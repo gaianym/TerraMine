@@ -272,6 +272,16 @@ pub trait MinerDriver: Send + Sync {
     fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
         Vec::new()
     }
+    /// The asic-rs admin path (hashboards, logs, password, reset) when this
+    /// driver holds an asic-rs miner. `None` = use the miner cached at
+    /// discovery, if any.
+    fn native_admin(&self, _timeout: Duration) -> Option<Box<dyn super::admin::AdminBackend>> {
+        None
+    }
+    /// Override admin paths for what asic-rs lacks, in preference order.
+    fn admin_backends(&self) -> Vec<Box<dyn super::admin::AdminBackend>> {
+        Vec::new()
+    }
 }
 
 /// MAC + firmware as reported by the device right now.
@@ -403,6 +413,13 @@ impl MinerDriver for AsicRsDriver {
     fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
         vec![Box::new(super::safety::asic::AsicRsSettings::new(self.miner.clone()).with_profile(&self.profile()))]
     }
+    fn native_admin(&self, timeout: Duration) -> Option<Box<dyn super::admin::AdminBackend>> {
+        Some(Box::new(super::admin::asic::AsicRsAdmin::live(
+            self.ip,
+            self.miner.clone(),
+            timeout,
+        )))
+    }
 }
 
 pub struct AsicRsFactory {
@@ -498,6 +515,16 @@ impl MinerDriver for CompositeDriver {
     fn settings_backends(&self) -> Vec<Box<dyn SettingsDriver>> {
         let mut v = self.native.settings_backends();
         v.extend(self.fallback.settings_backends());
+        v
+    }
+    fn native_admin(&self, timeout: Duration) -> Option<Box<dyn super::admin::AdminBackend>> {
+        self.native
+            .native_admin(timeout)
+            .or_else(|| self.fallback.native_admin(timeout))
+    }
+    fn admin_backends(&self) -> Vec<Box<dyn super::admin::AdminBackend>> {
+        let mut v = self.native.admin_backends();
+        v.extend(self.fallback.admin_backends());
         v
     }
 }
