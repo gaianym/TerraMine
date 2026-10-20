@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { columns, firmwareKey, groupByFirmware, summarize, type MatrixCell, type MatrixRow } from "./matrix";
+import { GROUP_TEXT, columns, firmwareKey, groupByFirmware, summarize, type MatrixCell, type MatrixRow } from "./matrix";
 
 const cell = (action: string, status: MatrixCell["status"], path: string | null = null): MatrixCell => ({
   action, group: action === "light_on" ? "control" : "settings", label: action, status, path, paths_tried: [`tried ${action}`],
@@ -36,5 +36,16 @@ describe("capability matrix helpers", () => {
 
   it("summarizes totals and missing miners", () => {
     expect(summarize(rows)).toEqual({ confirmed: 1, dry_run_only: 3, unsupported: 2, miners: 3, missing: 1 });
+  });
+
+  it("keeps admin and fallback cells in their own groups", () => {
+    const r = row("192.0.2.4", "2018", [
+      { ...cell("factory_reset", "dry_run_only", "s9-cgi"), group: "admin" },
+      { ...cell("ssh_grant_api_write", "dry_run_only", "ssh (Antminer stock (bmminer))"), group: "fallback" },
+      { ...cell("pool_divert", "unsupported"), group: "fallback" },
+    ]);
+    expect(columns([r]).map((c) => c.group)).toEqual(["admin", "fallback", "fallback"]);
+    expect(summarize([r])).toEqual({ confirmed: 0, dry_run_only: 2, unsupported: 1, miners: 1, missing: 0 });
+    expect(Object.keys(GROUP_TEXT)).toEqual(["control", "settings", "admin", "fallback"]);
   });
 });

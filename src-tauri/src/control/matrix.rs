@@ -7,16 +7,24 @@
 //! `confirmed_for`), and the raw asic-rs `supports_*()` flags from the
 //! miner object discovery cached. The matrix is a read: nothing is written,
 //! and the only network I/O is the identity check the resolver already does.
+//!
+//! Admin actions (plan step G) come from the admin path gate
+//! ([`admin::support`]), SSH fallbacks (plan K2) from the SSH shell table
+//! ([`supports_model`] and `hw_confirmed`), and pool divert from the same
+//! pool-limit check and engine path selection the divert job runs.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::driver::{MinerAction, MinerDriver};
+use super::admin::{self, AdminAction};
+use super::driver::{MinerAction, MinerDriver, SharedMiner};
+use super::safety::divert::{divert_groups, DivertOp};
 use super::safety::pools::{PoolOp, PoolSpec};
 use super::safety::settings::{Settings, TuningMode};
 use super::safety::{DeviceClass, SafetyEngine, Target};
+use super::ssh::plan::{supports_model, SshAction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -307,6 +315,137 @@ pub fn settings_cells(engine: &SafetyEngine, t: &Target) -> Vec<MatrixCell> {
         .collect()
 }
 
+fn admin_label(a: AdminAction) -> &'static str {
+    match a {
+        AdminAction::Hashboards => "Hashboards",
+        AdminAction::ReadLogs => "Logs",
+        AdminAction::ChangePassword => "Password change",
+        AdminAction::FactoryReset => "Factory reset",
+    }
+}
+
+fn ssh_label(a: SshAction) -> &'static str {
+    match a {
+        SshAction::Restart => "SSH restart",
+        SshAction::ReadLogs => "SSH logs",
+        SshAction::GrantApiWrite => "Grant API write (S9)",
+    }
+}
+
+/// Admin cells (step G) from the admin path gate. Reads change nothing,
+/// so the gate lets them run live on any supporting path; writes are dry
+/// run only until their path is hardware-confirmed.
+pub fn admin_cells(d: &dyn MinerDriver, miner: Option<SharedMiner>, ip: IpAddr) -> Vec<MatrixCell> {
+    let backends = admin::backends_for(d, miner, ip, std::time::Duration::from_secs(10));
+    AdminAction::ALL
+        .into_iter()
+        .map(|a| {
+            let sup = admin::support(&backends, a);
+            let status = match (&sup.path, sup.confirmed) {
+                (None, _) => CellStatus::Unsupported,
+                (Some(_), true) => CellStatus::Confirmed,
+                (Some(_), false) => CellStatus::DryRunOnly,
+            };
+            let mut tried = sup.tried;
+            if a.is_read() && sup.path.is_some() {
+                tried.push("read only: runs live, changes nothing".into());
+            }
+            MatrixCell {
+                action: a.name(),
+                group: "admin",
+                label: admin_label(a),
+                status,
+                path: sup.path,
+                paths_tried: tried,
+            }
+        })
+        .collect()
+}
+
+/// SSH fallback cells (K2) from the shell table. Every SSH path, reads
+/// included, is dry run only until its shell is hardware-confirmed.
+pub fn ssh_cells(t: &Target) -> Vec<MatrixCell> {
+    let (class, model) = (t.profile.class, t.profile.model.as_str());
+    SshAction::ALL
+        .into_iter()
+        .map(|a| {
+            let (status, path, tried) = match supports_model(class, model, a) {
+                Err(why) => (
+                    CellStatus::Unsupported,
+                    None,
+                    vec![format!("ssh: skipped ({why})")],
+                ),
+                Ok(sh) => {
+                    let (status, note) = if sh.hw_confirmed {
+                        (CellStatus::Confirmed, "selected")
+                    } else {
+                        (
+                            CellStatus::DryRunOnly,
+                            "selected for dry run only (not yet confirmed on real hardware)",
+                        )
+                    };
+                    let mut tried = Vec::new();
+                    if a == SshAction::Restart && class == DeviceClass::AntminerStock {
+                        tried.push(
+                            "cgminer-rpc restart: tried first on a live run (needs API write access)"
+                                .to_string(),
+                        );
+                    }
+                    tried.push(format!("ssh ({}): {note}", sh.label));
+                    (status, Some(format!("ssh ({})", sh.label)), tried)
+                }
+            };
+            MatrixCell {
+                action: a.name(),
+                group: "fallback",
+                label: ssh_label(a),
+                status,
+                path,
+                paths_tried: tried,
+            }
+        })
+        .collect()
+}
+
+/// Pool divert (K2 stop fallback): the pool-limit check and engine path
+/// selection the divert job itself runs, for the divert pool list. Restore
+/// writes the saved pools back over the same path.
+pub fn divert_cell(engine: &SafetyEngine, t: &Target) -> MatrixCell {
+    let change = Settings {
+        pools: Some(divert_groups()),
+        ..Settings::default()
+    };
+    let mut tried = Vec::new();
+    if t.driver.caps().supports(MinerAction::Stop) {
+        tried.push("native stop available: divert not needed for this miner".to_string());
+    }
+    let (status, path) = match engine.limits.check_pools(&t.profile, &change) {
+        Err(v) => {
+            tried.push(format!("pool write: {}", v.join("; ")));
+            (CellStatus::Unsupported, None)
+        }
+        Ok(()) => {
+            let (b, sel) = engine.select(t, &change, true);
+            tried.extend(sel);
+            match &b {
+                None => (CellStatus::Unsupported, None),
+                Some(b) if b.confirmed_for(&change) || engine.opts.allow_unconfirmed_paths => {
+                    (CellStatus::Confirmed, Some(b.id().to_string()))
+                }
+                Some(b) => (CellStatus::DryRunOnly, Some(b.id().to_string())),
+            }
+        }
+    };
+    MatrixCell {
+        action: DivertOp::Divert.name(),
+        group: "fallback",
+        label: "Pool divert",
+        status,
+        path,
+        paths_tried: tried,
+    }
+}
+
 pub fn not_found(ip: IpAddr, error: Option<String>) -> MatrixRow {
     MatrixRow {
         ip: ip.to_string(),
@@ -326,11 +465,14 @@ pub fn matrix_row(
     engine: &SafetyEngine,
     ip: IpAddr,
     d: Arc<dyn MinerDriver>,
-    miner: Option<&dyn asic_rs_core::traits::miner::Miner>,
+    miner: Option<SharedMiner>,
 ) -> MatrixRow {
     let t = Target::new(ip, d.clone());
     let mut cells = control_cells(d.as_ref());
     cells.extend(settings_cells(engine, &t));
+    cells.extend(admin_cells(d.as_ref(), miner.clone(), ip));
+    cells.extend(ssh_cells(&t));
+    cells.push(divert_cell(engine, &t));
     MatrixRow {
         ip: ip.to_string(),
         found: true,
@@ -340,7 +482,7 @@ pub fn matrix_row(
         firmware: Some(t.profile.firmware.clone()),
         driver: Some(d.kind().label()),
         cells,
-        native: miner.map(native_flags).unwrap_or_default(),
+        native: miner.as_deref().map(native_flags).unwrap_or_default(),
         error: None,
     }
 }
