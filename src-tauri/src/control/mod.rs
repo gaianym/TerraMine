@@ -1,10 +1,13 @@
 //! Miner control: start (resume), stop (pause), reboot, fault light.
 
 pub mod admin;
+pub mod audit_view;
 pub mod cache;
 pub mod creds;
 pub mod driver;
+pub mod hardening_commands;
 pub mod job;
+pub mod matrix;
 pub mod overrides;
 pub mod safety;
 pub mod ssh;
@@ -25,6 +28,8 @@ pub mod mock_miner;
 mod verify_tests;
 #[cfg(test)]
 mod light_e2e_tests;
+#[cfg(test)]
+mod hardening_e2e_tests;
 
 use std::collections::HashMap;
 use std::net::IpAddr;

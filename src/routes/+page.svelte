@@ -40,6 +40,7 @@
   import AdminButton from "$lib/control/AdminButton.svelte";
   import AdminDialog from "$lib/control/AdminDialog.svelte";
   import TuningTargetButton from "$lib/control/TuningTargetButton.svelte";
+  import HardeningButtons from "$lib/control/HardeningButtons.svelte";
   import SshButton from "$lib/control/SshButton.svelte";
   import { formatEfficiency, formatGridValue } from "$lib/format";
   import { formatHashRateDelta, formatMetricDelta } from "$lib/deltaFormat";
@@ -3026,6 +3027,7 @@
       <PoolsButton {selectedIps} />
       <AdminButton {selectedIps} />
       <TuningTargetButton {selectedIps} />
+      <HardeningButtons {selectedIps} />
       <SshButton {selectedIps} />
     </div>
     <div class="relative min-h-0 w-full flex-1">
