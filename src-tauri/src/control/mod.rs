@@ -6,6 +6,8 @@ pub mod driver;
 pub mod job;
 pub mod overrides;
 pub mod safety;
+pub mod ssh;
+pub mod ssh_commands;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

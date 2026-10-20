@@ -19,6 +19,7 @@ pub mod asic;
 pub mod audit;
 pub mod axeos;
 pub mod batch;
+pub mod divert;
 pub mod engine;
 pub mod health;
 pub mod limits;
@@ -41,6 +42,8 @@ mod fan_e2e_tests;
 mod power_e2e_tests;
 #[cfg(test)]
 mod pools_e2e_tests;
+#[cfg(test)]
+mod divert_e2e_tests;
 #[cfg(test)]
 mod tuning_e2e_tests;
 

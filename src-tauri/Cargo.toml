@@ -38,6 +38,9 @@ diqwest = "3"
 semver = "1"
 md-5 = "0.10"
 hex = "0.4"
+# SSH fallbacks (plan K2). ring backend: no aws-lc / cmake / NASM on Windows.
+russh = { version = "0.64", default-features = false, features = ["ring", "rsa"] }
+base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

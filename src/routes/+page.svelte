@@ -38,6 +38,7 @@
   import PowerTuningButton from "$lib/control/PowerTuningButton.svelte";
   import PoolsButton from "$lib/control/PoolsButton.svelte";
   import TuningTargetButton from "$lib/control/TuningTargetButton.svelte";
+  import SshButton from "$lib/control/SshButton.svelte";
   import { formatEfficiency, formatGridValue } from "$lib/format";
   import { formatHashRateDelta, formatMetricDelta } from "$lib/deltaFormat";
   import { formatHashRateValue, getNormalizedHashRateDisplay, parseHashRateToHs } from "$lib/hashrate";
@@ -3009,6 +3010,7 @@
       <PowerTuningButton {selectedIps} />
       <PoolsButton {selectedIps} />
       <TuningTargetButton {selectedIps} />
+      <SshButton {selectedIps} />
     </div>
     <div class="relative min-h-0 w-full flex-1">
       <div
