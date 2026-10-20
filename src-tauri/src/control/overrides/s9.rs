@@ -189,6 +189,23 @@ impl MinerDriver for S9StockDriver {
         vec![Box::new(NoSettingsPath { id: "s9-cgi", reason: S9_NO_SETTINGS })]
     }
 
+    /// Kernel log over the digest CGI; hashboards from bmminer `stats`
+    /// (asic-rs's v2020 parser misses the S9's chain numbering).
+    fn admin_backends(&self) -> Vec<Box<dyn crate::control::admin::AdminBackend>> {
+        use crate::control::admin::s9::{BmminerBoards, S9CgiLogs};
+        vec![
+            Box::new(S9CgiLogs {
+                base: self.base.clone(),
+                client: self.client.clone(),
+                creds: self.creds.clone(),
+            }),
+            Box::new(BmminerBoards {
+                rpc: self.rpc(),
+                model: "Antminer S9".into(),
+            }),
+        ]
+    }
+
     /// `get_system_info.cgi` → MAC + firmware build (one digest read).
     fn observe(&self) -> BoxFuture<'_, anyhow::Result<Option<Observation>>> {
         Box::pin(async move {
