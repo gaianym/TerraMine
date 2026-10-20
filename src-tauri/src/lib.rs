@@ -27,6 +27,14 @@ pub fn run() {
             control::list_miner_credentials,
             control::set_miner_credentials,
             control::delete_miner_credentials,
+            control::ssh_commands::ssh_support,
+            control::ssh_commands::ssh_fetch_host_key,
+            control::ssh_commands::ssh_pin_host_key,
+            control::ssh_commands::ssh_unpin_host_key,
+            control::ssh_commands::set_ssh_login,
+            control::ssh_commands::delete_ssh_login,
+            control::ssh_commands::run_ssh_action,
+            control::ssh_commands::run_pool_divert,
         ])
         .run(tauri::generate_context!())
         .expect("error while running terra-mine");

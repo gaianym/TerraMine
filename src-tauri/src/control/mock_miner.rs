@@ -352,6 +352,27 @@ impl MockMiner {
         self.state.lock().unwrap().rpc_denied = v;
     }
     /// bmminer `restart` commands applied.
+    /// For the SSH mock: a bmminer restart that re-reads `bmminer.conf`.
+    /// The RPC then grants write only when the first api-allow rule is a
+    /// `W:` rule (cgminer matches the first rule), and mining uptime resets.
+    pub fn bmminer_restart_hook(&self) -> crate::control::ssh::mock_ssh::RestartHook {
+        let st = self.state.clone();
+        std::sync::Arc::new(move |conf: Option<&str>| {
+            let mut s = st.lock().unwrap();
+            if let Some(c) = conf {
+                // Tests connect from 127.0.0.1: write is granted when the
+                // first rule is `W:` and its range covers that address.
+                let first = serde_json::from_str::<serde_json::Value>(c)
+                    .ok()
+                    .and_then(|v| v.get("api-allow").and_then(|a| a.as_str()).map(|a| a.split(',').next().unwrap_or("").trim().to_string()))
+                    .unwrap_or_default();
+                s.rpc_denied = !first.strip_prefix("W:").map(covers_loopback).unwrap_or(false);
+            }
+            s.mining_restarts += 1;
+            s.boot_at = Instant::now();
+            s.uptime_offset = 0;
+        })
+    }
     pub fn mining_restarts(&self) -> u32 {
         self.state.lock().unwrap().mining_restarts
     }
@@ -426,6 +447,16 @@ impl MockMiner {
         };
         Ok(Self { kind, http, cgminer, creds, state, stop })
     }
+}
+
+fn covers_loopback(cidr: &str) -> bool {
+    if cidr == "0/0" {
+        return true;
+    }
+    let Some((ip, len)) = cidr.split_once('/') else { return cidr == "127.0.0.1" };
+    let (Ok(ip), Ok(len)) = (ip.parse::<std::net::Ipv4Addr>(), len.parse::<u32>()) else { return false };
+    let mask = if len == 0 { 0 } else { u32::MAX << (32 - len.min(32)) };
+    (u32::from(ip) & mask) == (u32::from(std::net::Ipv4Addr::LOCALHOST) & mask)
 }
 
 /// bmminer-style JSON-RPC: `summary`, `stats` (with bmminer's `}{`
