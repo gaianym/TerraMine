@@ -3,6 +3,8 @@
 //! - Start / stop / reboot keep their existing behaviour (dry run is
 //!   chosen by the caller; the UI defaults it on).
 //! - Every new write class defaults to dry run (fault light included).
+//! - Reads (hashboard detail, logs) change nothing, so they are not dry
+//!   run by default and never need a confirmation.
 //! - Irreversible actions (factory reset, firmware, password) are refused
 //!   unless the operator typed the action name exactly AND set
 //!   `allow_irreversible`, and only for one device at a time.
@@ -23,10 +25,14 @@ pub enum ActionKind {
     FactoryReset,
     FirmwareUpdate,
     ChangePassword,
+    /// Read-only: per-hashboard detail (asic-rs `get_data().hashboards`).
+    ReadHashboards,
+    /// Read-only: miner logs (asic-rs `read_logs`).
+    ReadLogs,
 }
 
 impl ActionKind {
-    pub const ALL: [ActionKind; 9] = [
+    pub const ALL: [ActionKind; 11] = [
         Self::Start,
         Self::Stop,
         Self::Reboot,
@@ -36,6 +42,8 @@ impl ActionKind {
         Self::FactoryReset,
         Self::FirmwareUpdate,
         Self::ChangePassword,
+        Self::ReadHashboards,
+        Self::ReadLogs,
     ];
 
     /// Also the exact text an operator must type to confirm.
@@ -50,6 +58,8 @@ impl ActionKind {
             Self::FactoryReset => "factory_reset",
             Self::FirmwareUpdate => "firmware_update",
             Self::ChangePassword => "change_password",
+            Self::ReadHashboards => "read_hashboards",
+            Self::ReadLogs => "read_logs",
         }
     }
 
@@ -62,10 +72,16 @@ impl ActionKind {
         matches!(self, Self::ApplySettings)
     }
 
+    /// Read-only: sends no change to the miner.
+    pub fn is_read(self) -> bool {
+        matches!(self, Self::ReadHashboards | Self::ReadLogs)
+    }
+
     /// Phase-1 actions keep the pre-existing request default (false);
-    /// everything newer is dry run unless explicitly turned off.
+    /// reads change nothing (false); every newer write class is dry run
+    /// unless explicitly turned off.
     pub fn default_dry_run(self) -> bool {
-        !matches!(self, Self::Start | Self::Stop | Self::Reboot)
+        !matches!(self, Self::Start | Self::Stop | Self::Reboot) && !self.is_read()
     }
 }
 
