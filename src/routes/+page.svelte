@@ -37,6 +37,8 @@
   import { refreshUntilSettled, type RefreshTarget } from "$lib/control/postActionRefresh";
   import PowerTuningButton from "$lib/control/PowerTuningButton.svelte";
   import PoolsButton from "$lib/control/PoolsButton.svelte";
+  import AdminButton from "$lib/control/AdminButton.svelte";
+  import AdminDialog from "$lib/control/AdminDialog.svelte";
   import TuningTargetButton from "$lib/control/TuningTargetButton.svelte";
   import SshButton from "$lib/control/SshButton.svelte";
   import { formatEfficiency, formatGridValue } from "$lib/format";
@@ -2360,6 +2362,8 @@
   const CONTROL_COL_ID = "tm_control";
   let selectedIps = $state<string[]>([]);
   let actionDialog = $state<{ ips: string[]; action: MinerAction } | null>(null);
+  /** Per-row Admin (hashboards, logs, password, factory reset). */
+  let adminDialog = $state<string[] | null>(null);
 
   function rowIp(row: GridRow | undefined): string | null {
     const ip = row?.ip;
@@ -2375,7 +2379,7 @@
     colId: CONTROL_COL_ID,
     headerName: "Control",
     pinned: "right",
-    width: 380,
+    width: 440,
     sortable: false,
     filter: false,
     cellRenderer: (params: ICellRendererParams<GridRow>) => {
@@ -2398,6 +2402,17 @@
         });
         wrap.appendChild(b);
       }
+      const admin = document.createElement("button");
+      admin.type = "button";
+      admin.className = "tm-control-btn";
+      admin.textContent = "Admin";
+      admin.title = `Hashboards, logs, password, factory reset for ${ip}`;
+      admin.dataset.testid = "tm-row-admin";
+      admin.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        adminDialog = [ip];
+      });
+      wrap.appendChild(admin);
       const row = control.rowByIp[ip];
       if (row) {
         const spec = statusChipSpec(row, control.refreshByIp[ip]);
@@ -3009,6 +3024,7 @@
       <ControlToolbar {selectedIps} onrequest={requestAction} />
       <PowerTuningButton {selectedIps} />
       <PoolsButton {selectedIps} />
+      <AdminButton {selectedIps} />
       <TuningTargetButton {selectedIps} />
       <SshButton {selectedIps} />
     </div>
@@ -3255,4 +3271,7 @@
 
 {#if actionDialog}
   <ActionDialog ips={actionDialog.ips} action={actionDialog.action} onclose={() => (actionDialog = null)} />
+{/if}
+{#if adminDialog}
+  <AdminDialog ips={adminDialog} onclose={() => (adminDialog = null)} />
 {/if}

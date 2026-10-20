@@ -21,6 +21,8 @@ pub fn run() {
             control::run_miner_action,
             control::run_settings_job,
             control::settings_support,
+            control::admin_support,
+            control::run_admin_action,
             control::cancel_action_run,
             control::list_miner_credentials,
             control::set_miner_credentials,

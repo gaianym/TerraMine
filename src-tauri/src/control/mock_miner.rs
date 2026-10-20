@@ -34,6 +34,14 @@
 //! Whatsminer): asic-rs hardcodes real ports, so the stand-in driver
 //! carries that backend's `supports_*()` flags and talks to this server on
 //! `/asic-rs/...` paths instead, which keeps every call countable.
+//!
+//! Admin (hashboards, logs, password, factory reset): asic-rs stand-ins
+//! serve `/asic-rs/boards|logs|passwd|reset`, gated by the backend's real
+//! `supports_read_logs/change_password/factory_reset()` values and an
+//! `x-mock-auth: user:pass` login (factory login `root` / `mock-pass`; a
+//! reset restores it). The S9 serves `get_kernel_log.cgi` and bmminer
+//! `stats` chains 6..8 (one degraded board); AxeOS serves its log stream
+//! on the `/api/ws` WebSocket (ANSI-coloured text frames, then close).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -95,6 +103,32 @@ pub enum MockFirmware {
 }
 
 impl MockFirmware {
+    /// asic-rs admin flags: `antminer/v2020` all three; `braiins/v25_07`
+    /// no factory reset; Whatsminer v1/v3 none.
+    pub fn admin_flags(self) -> super::admin::asic::NativeAdminFlags {
+        use super::admin::asic::NativeAdminFlags;
+        match self {
+            Self::AntminerV2020 => NativeAdminFlags {
+                read_logs: true,
+                change_password: true,
+                factory_reset: true,
+            },
+            Self::Braiins2507 => NativeAdminFlags {
+                read_logs: true,
+                change_password: true,
+                factory_reset: false,
+            },
+            Self::WhatsminerV3 | Self::WhatsminerV1 => NativeAdminFlags::default(),
+        }
+    }
+    /// asic-rs firmware family name (`DeviceInfo.firmware`).
+    pub fn family(self) -> &'static str {
+        match self {
+            Self::AntminerV2020 => "AntMiner Stock",
+            Self::Braiins2507 => "Braiins",
+            Self::WhatsminerV3 | Self::WhatsminerV1 => "WhatsMiner Stock",
+        }
+    }
     pub fn flags(self) -> super::driver::NativeFlags {
         use super::driver::NativeFlags;
         match self {
@@ -163,7 +197,14 @@ struct State {
     running_stratum: [(String, u16, String, String); 2],
     /// Raw PATCH bodies received (to prove what was sent).
     patches: Vec<String>,
+    /// asic-rs stand-in web login password (user `root`).
+    login_password: String,
+    password_changes: u32,
+    factory_resets: u32,
 }
+
+/// Factory login of every asic-rs stand-in.
+pub const MOCK_LOGIN: (&str, &str) = ("root", "mock-pass");
 
 /// Stratum every AxeOS mock starts on.
 pub fn mock_stratum() -> [(String, u16, String, String); 2] {
@@ -339,6 +380,16 @@ impl MockMiner {
     pub fn identifying(&self) -> bool {
         self.state.lock().unwrap().identify_until.is_some_and(|t| Instant::now() < t)
     }
+    /// Current asic-rs stand-in login password.
+    pub fn login_password(&self) -> String {
+        self.state.lock().unwrap().login_password.clone()
+    }
+    pub fn password_changes(&self) -> u32 {
+        self.state.lock().unwrap().password_changes
+    }
+    pub fn factory_resets(&self) -> u32 {
+        self.state.lock().unwrap().factory_resets
+    }
     /// Count of setting writes (PATCH) received.
     pub fn writes(&self) -> usize {
         self.requests().iter().filter(|r| r.starts_with("PATCH ")).count()
@@ -377,6 +428,9 @@ impl MockMiner {
             stratum: mock_stratum(),
             running_stratum: mock_stratum(),
             patches: Vec::new(),
+            login_password: MOCK_LOGIN.1.into(),
+            password_changes: 0,
+            factory_resets: 0,
         }));
         let stop = CancellationToken::new();
         let l = TcpListener::bind("127.0.0.1:0").await?;
@@ -435,7 +489,12 @@ async fn serve_cgminer(l: TcpListener, st: Arc<Mutex<State>>, stop: Cancellation
                         let ghs = if s.outage || s.paused { "0" } else { "13500" };
                         format!(r#"{{"STATUS":{ok},"SUMMARY":[{{"Elapsed":{},"GHS 5s":"{ghs}"}}],"id":1}}"#, s.uptime())
                     }
-                    "stats" => format!(r#"{{"STATUS":{ok},"STATS":[{{"BMMiner":"2.0.0"}}{{"temp6":58,"temp7":60,"temp8":0,"temp2_6":"72","temp2_7":75,"temp2_8":0}}],"id":1}}"#),
+                    "stats" => {
+                        let (r6, r7) = if s.outage || s.paused { ("0.00", "0.00") } else { ("4610.52", "2122.70") };
+                        let full = " oooooooo oooooooo oooooooo oooooooo oooooooo oooooooo oooooooo ooooooo";
+                        let part = " oooooooo oooooooo oooooooo ooooo";
+                        format!(r#"{{"STATUS":{ok},"STATS":[{{"BMMiner":"2.0.0"}}{{"temp6":58,"temp7":60,"temp8":0,"temp2_6":"72","temp2_7":75,"temp2_8":0,"chain_acn6":63,"chain_acn7":29,"chain_acn8":63,"chain_acs6":"{full}","chain_acs7":"{part}","chain_acs8":"{full}","chain_rate6":"{r6}","chain_rate7":"{r7}","chain_rate8":"{r6}"}}],"id":1}}"#)
+                    }
                     "pools" => format!(r#"{{"STATUS":{ok},"POOLS":[{{"POOL":0,"URL":"stratum+tcp://pool.example.com:3333","Status":"Alive","Priority":0}}],"id":1}}"#),
                     "version" => format!(r#"{{"STATUS":{ok},"VERSION":[{{"BMMiner":"2.0.0","API":"3.1","Type":"Antminer S9"}}],"id":1}}"#),
                     "privileged" | "restart" if s.rpc_denied => r#"{"STATUS":[{"STATUS":"E","Code":45,"Msg":"Access denied to 'privileged' command"}],"id":1}"#.to_string(),
@@ -469,16 +528,65 @@ async fn serve_http(l: TcpListener, st: Arc<Mutex<State>>, creds: DigestCredenti
                 st.lock().unwrap().requests.push("unparsed".into());
                 return;
             };
+            if let Some(bytes) = axeos_ws(&req, &st) {
+                let _ = sock.write_all(&bytes).await;
+                // Wait (briefly) for the client's close frame, as ESP-Miner does.
+                let mut tmp = [0u8; 64];
+                let _ = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut tmp)).await;
+                return;
+            }
             let resp = handle(&req, &st, &creds);
             let _ = sock.write_all(resp.as_bytes()).await;
         });
     }
 }
 
+/// ESP-Miner's log WebSocket (`GET /api/ws`) on AxeOS mocks: the 101
+/// upgrade, three ANSI-coloured text frames (one with a 16-bit length),
+/// then a close frame.
+fn axeos_ws(req: &Req, st: &Arc<Mutex<State>>) -> Option<Vec<u8>> {
+    let mut s = st.lock().unwrap();
+    if !matches!(s.kind, MockKind::AxeOs210 | MockKind::AxeOs215)
+        || req.method != "GET"
+        || req.path != "/api/ws"
+    {
+        return None;
+    }
+    s.requests.push("GET /api/ws".into());
+    s.settle();
+    if !s.online() {
+        return Some(http("503 Service Unavailable", "", "{}").into_bytes());
+    }
+    let mut out = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: mock\r\n\r\n".to_vec();
+    let long = format!(
+        "\x1b[0;32mI (1200) asic_result: {}\x1b[0m\n",
+        "Ver: 20000000 Nonce 1A2B3C4D diff 512.3 of 256. ".repeat(4)
+    );
+    for line in [
+        "\x1b[0;32mI (1000) bm1370Module: ASIC 1 detected\x1b[0m\n".to_string(),
+        long,
+        "\x1b[0;33mW (1300) power_management: fan ramp\x1b[0m\n".to_string(),
+    ] {
+        let b = line.as_bytes();
+        out.push(0x81);
+        if b.len() < 126 {
+            out.push(b.len() as u8);
+        } else {
+            out.push(126);
+            out.extend_from_slice(&(b.len() as u16).to_be_bytes());
+        }
+        out.extend_from_slice(b);
+    }
+    out.extend_from_slice(&[0x88, 0x00]);
+    Some(out)
+}
+
 struct Req {
     method: String,
     path: String,
     auth: Option<String>,
+    /// `x-mock-auth` (asic-rs stand-in login).
+    mock_auth: Option<String>,
     body: String,
 }
 
@@ -510,8 +618,12 @@ async fn read_request(sock: &mut tokio::net::TcpStream) -> Option<Req> {
                 .lines()
                 .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
                 .map(|l| l[14..].trim().to_string());
+            let mock_auth = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("x-mock-auth:"))
+                .map(|l| l[12..].trim().to_string());
             let body = String::from_utf8_lossy(&buf[end + 4..]).to_string();
-            return Some(Req { method: first.first()?.to_string(), path: first.get(1)?.to_string(), auth, body });
+            return Some(Req { method: first.first()?.to_string(), path: first.get(1)?.to_string(), auth, mock_auth, body });
         }
     }
     None
@@ -714,6 +826,10 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
                     http("200 OK", "", r#"{"code":"B000"}"#)
                 }
                 "/cgi-bin/get_blink_status.cgi" => http("200 OK", "", &format!(r#"{{"blink":{}}}"#, s.light)),
+                "/cgi-bin/get_kernel_log.cgi" => {
+                    let log = "[    0.000000] Booting Linux on physical CPU 0x0\n[   12.345678] bmminer: chain 6 63 chips\n[   12.345900] bmminer: chain 7 29 chips (expected 63)\n";
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{log}", log.len())
+                }
                 "/cgi-bin/set_miner_conf.cgi" if miner_mode && m == "POST" => {
                     // {"miner-mode":"1"} = sleep, "0" = normal.
                     let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -730,7 +846,7 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
         MockKind::AsicRs(fw) => match (m, p) {
             ("GET", "/asic-rs/data") => {
                 let hr = if s.paused || s.outage { 0.0 } else { 100_000.0 };
-                http("200 OK", "", &format!(r#"{{"light":{},"paused":{},"uptime":{},"hashrate_ghs":{hr}}}"#, s.light, s.paused, s.uptime()))
+                http("200 OK", "", &format!(r#"{{"light":{},"paused":{},"uptime":{},"hashrate_ghs":{hr},"mac":"{}"}}"#, s.light, s.paused, s.uptime(), s.mac))
             }
             ("POST", "/asic-rs/fault_light") if fw.flags().fault_light => {
                 let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
@@ -749,6 +865,52 @@ fn handle(req: &Req, st: &Arc<Mutex<State>>, creds: &DigestCredentials) -> Strin
             ("POST", "/asic-rs/restart") if fw.flags().restart => {
                 s.reboot();
                 http("200 OK", "", "{}")
+            }
+            ("GET", "/asic-rs/boards") => {
+                let hr = if s.paused || s.outage { 0.0 } else { 33_000.0 };
+                http(
+                    "200 OK",
+                    "",
+                    &format!(
+                        r#"[{{"hr":{hr},"chips":76,"temp":61}},{{"hr":{},"chips":70,"temp":63}},{{"hr":{hr},"chips":76,"temp":60}}]"#,
+                        hr * 0.9
+                    ),
+                )
+            }
+            ("GET" | "POST", "/asic-rs/logs" | "/asic-rs/passwd" | "/asic-rs/reset") => {
+                let f = fw.admin_flags();
+                let allowed = match p {
+                    "/asic-rs/logs" => f.read_logs && m == "GET",
+                    "/asic-rs/passwd" => f.change_password && m == "POST",
+                    _ => f.factory_reset && m == "POST",
+                };
+                if !allowed {
+                    return http("404 Not Found", "", "{}");
+                }
+                let login = format!("{}:{}", MOCK_LOGIN.0, s.login_password);
+                if req.mock_auth.as_deref() != Some(login.as_str()) {
+                    return http("401 Unauthorized", "", "{}");
+                }
+                match p {
+                    "/asic-rs/logs" => http("200 OK", "", "2026-01-01 00:00:00 cgminer started\n2026-01-01 00:00:05 chain 1: 70/76 chips\n"),
+                    "/asic-rs/passwd" => {
+                        let v: serde_json::Value = serde_json::from_str(&req.body).unwrap_or_default();
+                        let Some(new) = v.get("new").and_then(|x| x.as_str()).filter(|x| !x.is_empty()) else {
+                            return http("400 Bad Request", "", "{}");
+                        };
+                        s.login_password = new.to_string();
+                        s.password_changes += 1;
+                        http("200 OK", "", "{}")
+                    }
+                    _ => {
+                        s.factory_resets += 1;
+                        s.login_password = MOCK_LOGIN.1.into();
+                        s.light = false;
+                        s.paused = false;
+                        s.reboot();
+                        http("200 OK", "", "{}")
+                    }
+                }
             }
             _ => http("404 Not Found", "", "{}"),
         },
@@ -812,6 +974,163 @@ impl MinerDriver for MockAsicRs {
         let (make, model, fw) = self.fw.identity();
         vec![format!("{} on {make} {model} ({fw})", self.fw.flags().explain(action))]
     }
+    /// MAC as asic-rs `get_mac()` reports it (per-device keychain key).
+    fn observe(&self) -> BoxFuture<'_, anyhow::Result<Option<super::driver::Observation>>> {
+        Box::pin(async move {
+            let d = self.data().await?;
+            let mac = d["mac"].as_str().map(str::to_string);
+            Ok(Some(super::driver::Observation {
+                status: None,
+                identity: Identity {
+                    mac,
+                    firmware: Some(self.fw.identity().2.into()),
+                },
+            }))
+        })
+    }
+    fn native_admin(&self, _timeout: Duration) -> Option<Box<dyn super::admin::AdminBackend>> {
+        let n = MockAdminNative {
+            fw: Some(self.fw),
+            base: self.base.clone(),
+            client: self.client.clone(),
+        };
+        Some(Box::new(super::admin::asic::AsicRsAdmin::new(Arc::new(n))))
+    }
+}
+
+/// asic-rs admin calls of a mock: an asic-rs stand-in (`fw`) or the
+/// Bitaxe backend (`None`: all three admin flags false; boards from
+/// `/api/system/info`, as asic-rs's Bitaxe `get_data` does).
+pub struct MockAdminNative {
+    fw: Option<MockFirmware>,
+    base: String,
+    client: reqwest::Client,
+}
+
+impl MockAdminNative {
+    fn auth(login: Option<&asic_rs_core::traits::miner::MinerAuth>) -> String {
+        match login {
+            Some(a) => format!("{}:{}", a.username(), a.password()),
+            None => format!("{}:{}", MOCK_LOGIN.0, MOCK_LOGIN.1),
+        }
+    }
+    async fn post(
+        &self,
+        path: &str,
+        login: Option<&asic_rs_core::traits::miner::MinerAuth>,
+        body: serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        let r = self
+            .client
+            .post(format!("{}/asic-rs/{path}", self.base))
+            .header("x-mock-auth", Self::auth(login))
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(r.status().is_success(), "{path}: {}", r.status());
+        Ok(true)
+    }
+}
+
+impl super::admin::asic::NativeAdmin for MockAdminNative {
+    fn flags(&self) -> super::admin::asic::NativeAdminFlags {
+        self.fw.map(MockFirmware::admin_flags).unwrap_or_default()
+    }
+    fn label(&self) -> String {
+        match self.fw {
+            Some(f) => {
+                let (make, model, fw) = f.identity();
+                format!("{make} {model} ({fw})")
+            }
+            None => "Bitaxe (AxeOS 2.15.3)".into(),
+        }
+    }
+    fn firmware(&self) -> String {
+        self.fw.map_or("ESP-Miner", MockFirmware::family).into()
+    }
+    fn boards(&self) -> BoxFuture<'_, anyhow::Result<Vec<asic_rs_core::data::board::BoardData>>> {
+        use asic_rs_core::data::board::BoardData;
+        use asic_rs_core::data::device::HashAlgorithm;
+        use asic_rs_core::data::hashrate::{HashRate, HashRateUnit};
+        let hr = |g: f64| {
+            Some(HashRate {
+                value: g,
+                unit: HashRateUnit::GigaHash,
+                algo: HashAlgorithm::SHA256,
+            })
+        };
+        Box::pin(async move {
+            if self.fw.is_none() {
+                let v: serde_json::Value = self
+                    .client
+                    .get(format!("{}/api/system/info", self.base))
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                let mut b = BoardData::new(0, Some(1));
+                b.hashrate = hr(v["hashRate"].as_f64().unwrap_or(0.0));
+                b.board_temperature = v["temp"]
+                    .as_f64()
+                    .map(measurements::Temperature::from_celsius);
+                b.working_chips = Some(1);
+                b.active = Some(true);
+                return Ok(vec![b]);
+            }
+            let v: serde_json::Value = self
+                .client
+                .get(format!("{}/asic-rs/boards", self.base))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok(v.as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(i, x)| {
+                    let mut b = BoardData::new(i as u8, Some(76));
+                    b.hashrate = hr(x["hr"].as_f64().unwrap_or(0.0));
+                    b.working_chips = x["chips"].as_u64().map(|c| c as u16);
+                    b.board_temperature = x["temp"]
+                        .as_f64()
+                        .map(measurements::Temperature::from_celsius);
+                    b.active = Some(true);
+                    b
+                })
+                .collect())
+        })
+    }
+    fn read_logs<'a>(
+        &'a self,
+        login: Option<&'a asic_rs_core::traits::miner::MinerAuth>,
+    ) -> BoxFuture<'a, anyhow::Result<String>> {
+        Box::pin(async move {
+            let r = self
+                .client
+                .get(format!("{}/asic-rs/logs", self.base))
+                .header("x-mock-auth", Self::auth(login))
+                .send()
+                .await?;
+            anyhow::ensure!(r.status().is_success(), "logs: {}", r.status());
+            Ok(r.text().await?)
+        })
+    }
+    fn change_password<'a>(
+        &'a self,
+        login: Option<&'a asic_rs_core::traits::miner::MinerAuth>,
+        new_password: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(self.post("passwd", login, serde_json::json!({ "new": new_password })))
+    }
+    fn factory_reset<'a>(
+        &'a self,
+        login: Option<&'a asic_rs_core::traits::miner::MinerAuth>,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(self.post("reset", login, serde_json::json!({})))
+    }
 }
 
 /// Stand-in for the asic-rs 0.8.6 `v2_14_0` Bitaxe backend on a mock.
@@ -848,6 +1167,14 @@ impl MinerDriver for MockNativeBitaxe {
             self.client.post(format!("{}/api/{path}", self.base)).send().await?.error_for_status()?;
             Ok(true)
         })
+    }
+    fn native_admin(&self, _timeout: Duration) -> Option<Box<dyn super::admin::AdminBackend>> {
+        let n = MockAdminNative {
+            fw: None,
+            base: self.base.clone(),
+            client: self.client.clone(),
+        };
+        Some(Box::new(super::admin::asic::AsicRsAdmin::new(Arc::new(n))))
     }
 }
 
