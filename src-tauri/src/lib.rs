@@ -25,6 +25,9 @@ pub fn run() {
             control::list_miner_credentials,
             control::set_miner_credentials,
             control::delete_miner_credentials,
+            control::hardening_commands::capability_matrix,
+            control::hardening_commands::audit_query,
+            control::hardening_commands::audit_export,
         ])
         .run(tauri::generate_context!())
         .expect("error while running terra-mine");
