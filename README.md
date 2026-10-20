@@ -33,8 +33,11 @@ means TerraMine will plan and log the action but refuses to send it.
 | Frequency, fan (manual/auto) | AxeOS HTTP | AxeOS 2.15.x: **hardware-confirmed** · other lines: dry run only |
 | Core voltage, fan target temp | AxeOS HTTP | dry run only |
 | Power limit, tuning (percent/mode/hashrate/preset), scaling, pools, timezone | asic-rs native (`supports_*` gated) | dry run only (no asic-rs settings backend is hardware-confirmed yet) |
-| Hashboards, logs, change password, factory reset | asic-rs native | in review (PR #17) — irreversible ones need typed confirmation |
-| SSH fallbacks, pool divert | SSH (known shells) · pool divert | in review (PR #18) — dry run only until hardware-confirmed |
+| Hashboards, logs (reads) | asic-rs native · logs: AxeOS log stream, S9 stock CGI · hashboards: S9 bmminer RPC `stats` | live where a path supports them (reads change nothing) |
+| Change password, factory reset | asic-rs native (`supports_*` gated) | dry run only until hardware-confirmed; irreversible ones need typed confirmation |
+| SSH restart, SSH logs | SSH (Braiins OS, stock Antminer S9/T9/L3/S7) · S9 restart tries cgminer RPC first | dry run only until hardware-confirmed |
+| Grant API write (stock S9) | SSH `api-allow` edit with backup, validate, restart, rollback | dry run only until hardware-confirmed |
+| Pool divert (stop fallback) | pool write via the settings path selection | follows the pool path: dry run only today |
 
 The table summarizes the code at the time of writing; the in-app matrix is the
 source of truth.

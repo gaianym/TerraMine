@@ -5,9 +5,19 @@
  */
 
 export type CellStatus = "confirmed" | "dry_run_only" | "unsupported";
+/** control = start/stop/reboot/light; settings = safety-engine writes;
+ * admin = hashboards, logs, password, factory reset (step G);
+ * fallback = SSH restart/logs, S9 API write grant, pool divert (K2). */
+export type MatrixGroup = "control" | "settings" | "admin" | "fallback";
+export const GROUP_TEXT: Record<MatrixGroup, string> = {
+  control: "Control",
+  settings: "Settings",
+  admin: "Admin",
+  fallback: "Fallbacks (SSH, divert)",
+};
 export type MatrixCell = {
   action: string;
-  group: "control" | "settings";
+  group: MatrixGroup;
   label: string;
   status: CellStatus;
   path: string | null;

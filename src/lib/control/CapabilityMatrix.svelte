@@ -2,8 +2,8 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount, untrack } from "svelte";
   import {
-    STATUS_TEXT, cellClass, cellGlyph, columns, groupByFirmware, summarize,
-    type MatrixCell, type MatrixRow,
+    GROUP_TEXT, STATUS_TEXT, cellClass, cellGlyph, columns, groupByFirmware, summarize,
+    type MatrixCell, type MatrixGroup, type MatrixRow,
   } from "./matrix";
 
   let {
@@ -14,7 +14,7 @@
 
   let rows = $state<MatrixRow[] | null>(untrack(() => initialRows));
   let view = $state<"miner" | "firmware">("miner");
-  let group = $state<"all" | "control" | "settings">("all");
+  let group = $state<"all" | MatrixGroup>("all");
   let loading = $state(false);
   let error = $state<string | null>(null);
   /** Paths-tried drawer. */
@@ -57,8 +57,9 @@
       </div>
       <select class="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs" bind:value={group}>
         <option value="all">All actions</option>
-        <option value="control">Control</option>
-        <option value="settings">Settings</option>
+        {#each Object.entries(GROUP_TEXT) as [value, text] (value)}
+          <option {value}>{text}</option>
+        {/each}
       </select>
       <button type="button" class="rounded border border-zinc-700 px-2 py-1 text-xs hover:bg-zinc-800 disabled:opacity-40" onclick={load} disabled={loading}>{loading ? "Reading…" : "Refresh"}</button>
       {#if rows}

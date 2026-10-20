@@ -9,6 +9,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::admin::{self, AdminAction};
 use super::audit_view::{self, AuditFilter, ExportFormat};
 use super::cache::{DeviceCache, Resolved, Resolver};
 use super::driver::{DriverFactory, MinerAction};
@@ -16,11 +17,13 @@ use super::hardening_commands::matrix_for;
 use super::matrix::{self, settings_probes, CellStatus, MatrixRow};
 use super::mock_miner::{MockFirmware, MockKind, MockMiner, MockMinerFactory};
 use super::safety::audit::{AuditRecord, AuditSink, JsonlAudit};
+use super::safety::divert::divert_groups;
 use super::safety::engine::{SafeWriteRequest, SafetyEngine, SafetyOptions, Target};
 use super::safety::mock_native::{MockNative, MockNativeDriver, NativeFirmware};
 use super::safety::settings::Settings;
 use super::safety::snapshot::SnapshotStore;
 use super::safety::{Confirmation, DeviceClass, NullAudit};
+use super::ssh::plan::{supports_model, SshAction};
 
 const AXE210: [u8; 4] = [192, 0, 2, 1];
 const AXE215: [u8; 4] = [192, 0, 2, 2];
@@ -71,7 +74,11 @@ async fn matrix_over_every_http_mock_matches_the_gates_and_writes_nothing() {
     let cache = Arc::new(DeviceCache::default());
     let resolver = Resolver::new(factory, cache.clone());
     let eng = engine();
-    let n_cells = MinerAction::ALL.len() + settings_probes().len();
+    let n_cells = MinerAction::ALL.len()
+        + settings_probes().len()
+        + AdminAction::ALL.len()
+        + SshAction::ALL.len()
+        + 1;
 
     let mut rows = HashMap::new();
     for (ip, _) in kinds {
@@ -115,7 +122,105 @@ async fn matrix_over_every_http_mock_matches_the_gates_and_writes_nothing() {
                 "{ip4} {id}"
             );
         }
+        // Admin cells (step G) = the admin path gate, exactly.
+        let backends = admin::backends_for(
+            driver.as_ref(),
+            cache.get(ip4).and_then(|c| c.miner),
+            ip4,
+            Duration::from_secs(2),
+        );
+        for a in AdminAction::ALL {
+            let sup = admin::support(&backends, a);
+            let c = cell(&row, a.name());
+            assert_eq!(c.group, "admin");
+            assert_eq!(c.path, sup.path, "{ip4} {}", a.name());
+            assert_eq!(c.status == CellStatus::Unsupported, sup.path.is_none());
+            assert_eq!(
+                c.status == CellStatus::Confirmed,
+                sup.path.is_some() && sup.confirmed,
+                "{ip4} {}",
+                a.name()
+            );
+            if !a.is_read() {
+                assert_ne!(
+                    c.status,
+                    CellStatus::Confirmed,
+                    "{ip4} {}: writes unconfirmed",
+                    a.name()
+                );
+            }
+            assert!(!c.paths_tried.is_empty(), "{ip4} {}", a.name());
+        }
+        // SSH cells (K2) = the shell table; never live until confirmed.
+        for a in SshAction::ALL {
+            let c = cell(&row, a.name());
+            assert_eq!(c.group, "fallback");
+            match supports_model(t.profile.class, &t.profile.model, a) {
+                Err(_) => assert_eq!(c.status, CellStatus::Unsupported, "{ip4} {}", a.name()),
+                Ok(sh) => assert_eq!(
+                    c.status,
+                    if sh.hw_confirmed {
+                        CellStatus::Confirmed
+                    } else {
+                        CellStatus::DryRunOnly
+                    },
+                    "{ip4} {}",
+                    a.name()
+                ),
+            }
+            assert!(!c.paths_tried.is_empty(), "{ip4} {}", a.name());
+        }
+        // Pool divert = the divert job's own limit check + path selection.
+        let change = Settings {
+            pools: Some(divert_groups()),
+            ..Default::default()
+        };
+        let want = if eng.limits.check_pools(&t.profile, &change).is_err() {
+            None
+        } else {
+            eng.select(&t, &change, true).0
+        };
+        let c = cell(&row, "pool_divert");
+        assert_eq!(
+            c.path,
+            want.as_ref().map(|b| b.id().to_string()),
+            "{ip4} divert"
+        );
+        assert_eq!(
+            c.status == CellStatus::Confirmed,
+            want.is_some_and(|b| b.confirmed_for(&change)),
+            "{ip4} divert"
+        );
         rows.insert(ip, row);
+    }
+
+    // Step G / K2 spot checks.
+    let s9 = &rows[&S9];
+    assert_eq!(
+        cell(s9, "ssh_grant_api_write").status,
+        CellStatus::DryRunOnly
+    );
+    assert_eq!(cell(s9, "ssh_restart").status, CellStatus::DryRunOnly);
+    assert!(cell(s9, "ssh_restart")
+        .paths_tried
+        .iter()
+        .any(|p| p.starts_with("cgminer-rpc restart")));
+    let axe = &rows[&AXE215];
+    for id in ["ssh_restart", "ssh_read_logs", "ssh_grant_api_write"] {
+        assert_eq!(cell(axe, id).status, CellStatus::Unsupported, "AxeOS {id}");
+    }
+    assert_eq!(
+        cell(&rows[&BRAIINS], "ssh_restart").status,
+        CellStatus::DryRunOnly
+    );
+    assert_eq!(
+        cell(&rows[&BRAIINS], "ssh_grant_api_write").status,
+        CellStatus::Unsupported
+    );
+    for (ip, r) in &rows {
+        for id in ["change_password", "factory_reset"] {
+            assert_ne!(cell(r, id).status, CellStatus::Confirmed, "{ip:?} {id}");
+        }
     }
 
     // Spot checks against what each gate is known to say.

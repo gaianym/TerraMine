@@ -57,7 +57,7 @@ pub async fn matrix_for(
     match resolver.resolve(ip, Duration::from_secs(5)).await {
         Resolved::Ready { driver, .. } => {
             let miner = cache.get(ip).and_then(|c| c.miner);
-            matrix::matrix_row(engine, ip, driver, miner.as_deref())
+            matrix::matrix_row(engine, ip, driver, miner)
         }
         Resolved::Changed(m) | Resolved::Failed(m) => matrix::not_found(ip, Some(m)),
         Resolved::NotFound(m) => matrix::not_found(ip, m),
