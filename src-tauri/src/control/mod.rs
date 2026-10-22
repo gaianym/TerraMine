@@ -1,11 +1,17 @@
 //! Miner control: start (resume), stop (pause), reboot, fault light.
 
+pub mod admin;
+pub mod audit_view;
 pub mod cache;
 pub mod creds;
 pub mod driver;
+pub mod hardening_commands;
 pub mod job;
+pub mod matrix;
 pub mod overrides;
 pub mod safety;
+pub mod ssh;
+pub mod ssh_commands;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -22,6 +28,8 @@ pub mod mock_miner;
 mod verify_tests;
 #[cfg(test)]
 mod light_e2e_tests;
+#[cfg(test)]
+mod hardening_e2e_tests;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -41,6 +49,8 @@ pub const EVENT_SAFETY_ROW: &str = "safety:row";
 pub const EVENT_SAFETY_DONE: &str = "safety:done";
 pub const EVENT_SAFETY_ALERT: &str = "safety:alert";
 pub const EVENT_DONE: &str = "control:done";
+pub const EVENT_ADMIN_ROW: &str = "admin:row";
+pub const EVENT_ADMIN_DONE: &str = "admin:done";
 const MAX_CONCURRENCY: usize = 64;
 
 #[derive(Clone, Default)]
@@ -486,6 +496,96 @@ pub async fn run_settings_job(app: AppHandle, req: SettingsJobRequest) -> Result
             let _ = app.emit(EVENT_SAFETY_ALERT, a);
         }
         let _ = app.emit(EVENT_SAFETY_DONE, SettingsDoneEvent { run_id: rid, results });
+    });
+    Ok(run_id)
+}
+
+// ---------------- admin: hashboards, logs, password, factory reset ----------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminDoneEvent {
+    pub run_id: String,
+    pub results: Vec<admin::AdminOutcome>,
+}
+
+/// Which admin paths each device has (cache-first; no writes).
+#[tauri::command]
+pub async fn admin_support(ips: Vec<String>) -> Result<Vec<admin::AdminSupportRow>, String> {
+    let ips = parse_ips(&ips)?;
+    let f: Arc<dyn DriverFactory> = Arc::new(OverlayFactory::with_store(
+        Duration::from_secs(5),
+        &creds::KeyringStore,
+    ));
+    let cache = cache::DeviceCache::global();
+    let resolver = cache::Resolver::new(f, cache.clone());
+    let mut out = Vec::new();
+    for ip in ips {
+        let r = match resolver.resolve(ip, Duration::from_secs(5)).await {
+            cache::Resolved::Ready { driver, obs } => {
+                let cached = cache.get(ip);
+                let mac = obs
+                    .and_then(|o| o.identity.mac)
+                    .or_else(|| cached.as_ref().and_then(|d| d.identity.mac.clone()));
+                Some((driver, cached.and_then(|d| d.miner), mac))
+            }
+            _ => None,
+        };
+        out.push(admin::support_row(ip, r, &creds::KeyringStore).await);
+    }
+    Ok(out)
+}
+
+/// Fleetwide admin action. Rows arrive as `admin:row`, the end as
+/// `admin:done`; cancel with `cancel_action_run`. Password change and
+/// factory reset are dry runs unless `dry_run: false` plus the typed
+/// confirmation; live sends on paths not yet hardware-confirmed are
+/// refused.
+#[tauri::command]
+pub async fn run_admin_action(
+    app: AppHandle,
+    state: State<'_, ControlState>,
+    req: admin::AdminRequest,
+) -> Result<String, String> {
+    let ips = parse_ips(&req.ips)?;
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let cancel = CancellationToken::new();
+    state
+        .runs
+        .lock()
+        .await
+        .insert(run_id.clone(), cancel.clone());
+    let runs = state.runs.clone();
+    let rid = run_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let timeout = Duration::from_secs(req.timeout_sec.clamp(1, 120));
+        let factory: Arc<dyn DriverFactory> =
+            Arc::new(OverlayFactory::with_store(timeout, &creds::KeyringStore));
+        let resolver = Arc::new(cache::Resolver::new(factory, cache::DeviceCache::global()));
+        let app2 = app.clone();
+        let sink: admin::AdminSink = Arc::new(move |o| {
+            let _ = app2.emit(EVENT_ADMIN_ROW, o);
+        });
+        let store: Arc<dyn creds::CredentialStore> = Arc::new(creds::KeyringStore);
+        let results = admin::run_admin_job(
+            &rid,
+            ips,
+            req,
+            resolver,
+            store,
+            audit_sink(&app),
+            admin::AdminOptions::default(),
+            cancel,
+            sink,
+        )
+        .await;
+        runs.lock().await.remove(&rid);
+        let _ = app.emit(
+            EVENT_ADMIN_DONE,
+            AdminDoneEvent {
+                run_id: rid,
+                results,
+            },
+        );
     });
     Ok(run_id)
 }

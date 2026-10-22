@@ -118,3 +118,48 @@ describe("fault light (PR B)", () => {
     expect(body).toContain("Light off");
   });
 });
+
+describe("AdminDialog (plan step G)", async () => {
+  const { default: AdminDialog } = await import("./AdminDialog.svelte");
+  const { default: AdminButton } = await import("./AdminButton.svelte");
+  const { ADMIN_ACTIONS } = await import("./admin");
+  type Row = import("./admin").AdminSupportRow;
+  const row = (ip: string, path: string | null): Row => ({
+    ip,
+    found: true,
+    class: "AntminerStock",
+    model: "Antminer S19",
+    firmware: "AntMiner Stock",
+    device_login: false,
+    actions: Object.fromEntries(ADMIN_ACTIONS.map((a) => [a, { path, confirmed: a === "hashboards" || a === "read_logs", tried: [] }])),
+  });
+
+  for (const action of ["change_password", "factory_reset"] as const) {
+    it(`${action} opens with Dry run checked, no typed box, no password fields`, () => {
+      const { body } = render(AdminDialog, {
+        props: { ips: ["192.0.2.60", "192.0.2.61"], initialAction: action, initialSupport: [row("192.0.2.60", "asic-rs"), row("192.0.2.61", null)], onclose: () => {} },
+      });
+      const m = body.match(/<input[^>]*data-testid="tm-admin-dry-run"[^>]*>/);
+      expect(m?.[0]).toMatch(/\schecked(\s|=|>|\/)/);
+      expect(body).not.toContain('data-testid="tm-admin-typed"');
+      expect(body).not.toContain('data-testid="tm-admin-password"');
+      expect(body).toMatch(/data-testid="tm-admin-send"[^>]*>(\s|<!--[^>]*-->)*Dry run(\s|<!--[^>]*-->)*<\/button>/);
+      expect(body).toContain("not yet confirmed on real hardware");
+      expect(body).toContain("not supported");
+    });
+  }
+
+  it("reads have no dry-run box and run on every supported miner", () => {
+    const { body } = render(AdminDialog, {
+      props: { ips: ["192.0.2.62"], initialAction: "read_logs", initialSupport: [row("192.0.2.62", "asic-rs")], onclose: () => {} },
+    });
+    expect(body).not.toContain('data-testid="tm-admin-dry-run"');
+    expect(body).toMatch(/Read logs (<!--[^>]*-->)?\((<!--[^>]*-->)?1(<!--[^>]*-->)?\)/);
+    expect(body).toContain("never written to the audit log");
+  });
+
+  it("toolbar button needs a selection", () => {
+    expect(render(AdminButton, { props: { selectedIps: [] } }).body).toMatch(/data-testid="tm-admin-open"[^>]*disabled|disabled[^>]*data-testid="tm-admin-open"/);
+    expect(render(AdminButton, { props: { selectedIps: ["192.0.2.63"] } }).body).toContain("Admin…");
+  });
+});

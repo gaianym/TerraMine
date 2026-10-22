@@ -226,6 +226,13 @@ impl MinerDriver for BitaxeDriver {
         vec![Box::new(AxeOsSettings::new(self.base.clone(), self.client.clone()).with_version(self.version.clone()))]
     }
 
+    /// Log stream over `/api/ws` (asic-rs has no Bitaxe log read).
+    fn admin_backends(&self) -> Vec<Box<dyn crate::control::admin::AdminBackend>> {
+        vec![Box::new(crate::control::admin::axeos::AxeOsAdmin::new(
+            self.base.clone(),
+        ))]
+    }
+
     fn profile(&self) -> DeviceProfile {
         let fw = match &self.version {
             Some(v) => format!("AxeOS {v}"),

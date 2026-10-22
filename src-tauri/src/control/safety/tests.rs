@@ -103,7 +103,12 @@ fn phase1_actions_are_never_refused_and_keep_dry_run_default() {
 #[test]
 fn new_write_classes_default_to_dry_run() {
     for k in ActionKind::ALL {
-        if !matches!(k, ActionKind::Start | ActionKind::Stop | ActionKind::Reboot) {
+        if k.is_read() {
+            assert!(
+                !k.default_dry_run() && !k.irreversible(),
+                "{k:?}: reads change nothing"
+            );
+        } else if !matches!(k, ActionKind::Start | ActionKind::Stop | ActionKind::Reboot) {
             assert!(k.default_dry_run(), "{k:?}");
         }
     }
